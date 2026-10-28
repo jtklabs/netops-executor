@@ -4,6 +4,7 @@ import socket
 import threading
 import uuid
 
+from .cipher_scan import CipherScanRunner
 from .config import Settings
 from .engine import Runner
 from .execution import ExecutionRunner
@@ -25,7 +26,9 @@ def process(settings, store, job, worker):
     thread.start()
     try:
         runner = (
-            SnmpRunner
+            CipherScanRunner
+            if job["kind"] == "cipher_scan"
+            else SnmpRunner
             if job["kind"] == "snmp_walk"
             else ExecutionRunner
             if job["kind"] in ("ssh", "http")

@@ -3,7 +3,7 @@
 A standalone remote for a central controller, with a versioned API, web console,
 CLI and durable SQLite queue. It runs F5 upgrades over **SSH/SFTP only**, arbitrary
 SSH commands, HTTPS requests (including Panorama requests targeting a firewall),
-and asynchronous SNMP v3 walks. It has no NetBox dependency.
+asynchronous SNMP v3 walks, and Nmap SSH/HTTPS cipher scans. It has no NetBox dependency.
 
 The main application submits jobs and polls their results. F5 upgrade sequencing,
 reconnection, HA checks, backups, validation and rollback live on the remote.
@@ -34,6 +34,8 @@ keeps the token only in tab memory and uses the same API.
 | POST | `/api/v1/ssh/jobs` | Queue one or more SSH commands |
 | POST | `/api/v1/http/jobs` | Queue one or more HTTPS requests |
 | GET | `/api/v1/http/targets` | Configured HTTP targets |
+| POST | `/api/v1/cipher-scans` | Queue a single-IP SSH/HTTPS cipher scan |
+| GET | `/api/v1/cipher-scans/{id}` | Scan status, structured cipher data and readable output |
 | POST | `/api/v1/snmp/walks` | Queue SNMP v3 OID subtree walks |
 | GET | `/api/v1/snmp/walks/{id}` | Walk status and per-root progress |
 | GET | `/api/v1/snmp/walks/{id}/results?after=0&limit=500` | Paginated partial/final rows |
@@ -67,6 +69,99 @@ Terminal job states are `succeeded`, `completed_with_warnings`, `failed`,
 `queued` and `running` need continued polling. A terminal state may still hold
 reservations: inspect `lock_held`. Batch `needs_attention` requires action on its
 items; `completed` means every item passed its wave barrier.
+
+## SSH and HTTPS cipher scans
+
+Submit `POST /api/v1/cipher-scans` with the usual bearer token and an optional
+`Idempotency-Key`. The API returns `202` with a job ID immediately. Workers run
+Nmap locally on the remote; no device login or credential profile is needed.
+
+HTTPS on a nonstandard port, optionally selecting a TLS virtual host:
+
+```json
+{
+  "device_ip": "192.0.2.10",
+  "protocol": "https",
+  "port": 8443,
+  "server_name": "management.example.com",
+  "job_timeout": 300
+}
+```
+
+SSH with the default port:
+
+```json
+{"device_ip": "192.0.2.10", "protocol": "ssh"}
+```
+
+`device_ip` accepts one IPv4 or IPv6 address. Hostnames, ranges, arbitrary Nmap
+arguments and scripts are not accepted. `protocol` is `ssh` or `https`; omitted
+or null `port` becomes 22 or 443 respectively. Any explicit TCP port from 1 to
+65535 is allowed for either protocol. `job_timeout` defaults to 300 seconds and
+is bounded to 1–3600 seconds. `server_name` is optional and HTTPS-only; it sends
+TLS SNI without changing or resolving the target IP. Use ASCII/punycode DNS names.
+
+Poll `GET /api/v1/cipher-scans/{id}` or the generic `GET /api/v1/jobs/{id}`.
+While `queued` or `running`, continue polling. The dedicated response schema,
+request fields and interactive requests are available under **Cipher scans** in
+`/docs`. A successful HTTPS result has this shape (illustrative, abbreviated):
+
+```json
+{
+  "id": "<job-id>",
+  "kind": "cipher_scan",
+  "status": "succeeded",
+  "result": {
+    "nmap_version": "7.95",
+    "script": "ssl-enum-ciphers",
+    "port_state": "open",
+    "data": {
+      "TLSv1.2": {
+        "ciphers": [
+          {"name": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", "strength": "A"}
+        ],
+        "cipher preference": "server"
+      },
+      "least strength": "A"
+    },
+    "output": "Human-readable NSE output including any warnings",
+    "exit_code": 0,
+    "error_code": null,
+    "error": null
+  }
+}
+```
+
+`result.data` preserves Nmap's structured script output: SSH algorithm categories
+map to arrays, including encryption ciphers, key exchanges, host keys, MACs and
+compression. Direction-specific categories remain separate when Nmap reports
+different client/server lists. HTTPS results contain protocol-version tables,
+cipher objects, preference and any warnings reported by Nmap. Fields and protocol
+coverage depend on the installed Nmap version; missing data is not proof that a
+protocol or cipher is disabled. Grades come from Nmap, not an application
+compliance policy. The main application can evaluate the structured results.
+
+Closed/filtered ports, missing cipher data, tool errors, timeouts and excessive
+output produce `failed` with an `error_code` and `error`; they never become a
+successful empty assessment. `result.stderr`, `exit_code`, port state and readable
+output are retained when available. `succeeded` means enumeration returned cipher
+data, not that the configuration is secure or the enumeration is exhaustive.
+Cancel with `POST /api/v1/jobs/{id}/cancel`; workers terminate the Nmap process
+group. Events use the existing `/api/v1/jobs/{id}/events` endpoint. Scan jobs on
+the same IP/port are serialized; different targets can use multiple workers.
+A stale scan worker becomes `failed`, releases its scan reservation and is not
+automatically retried. Nmap's own host/script deadlines also bound a scan if its
+worker is killed abruptly.
+
+Scans use unprivileged TCP connect mode and only the selected
+[`ssh2-enum-algos`](https://nmap.org/nsedoc/scripts/ssh2-enum-algos.html) or
+[`ssl-enum-ciphers`](https://nmap.org/nsedoc/scripts/ssl-enum-ciphers.html) script.
+The script is explicitly forced on the requested port, so a nonstandard port
+works without relying on service-name detection. HTTPS cipher enumeration makes
+multiple TLS connections. Total captured Nmap output is limited to 4 MiB.
+Docker and the Ubuntu 24/RHEL 9 Ansible playbook install the OS `nmap` package
+including its NSE scripts; manual installations must install it on every worker.
+No root user, raw-socket capability or privileged container is needed.
 
 ## Upgrade payload
 

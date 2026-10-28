@@ -19,15 +19,15 @@
           - executor_workers | int > 0
       no_log: true
   tasks:
-    - name: Install Python on Ubuntu
+    - name: Install Python and Nmap on Ubuntu
       ansible.builtin.apt:
-        name: [python3, python3-venv, python3-pip]
+        name: [python3, python3-venv, python3-pip, nmap]
         state: present
         update_cache: true
       when: ansible_facts.os_family == 'Debian'
-    - name: Install Python on RHEL 9
+    - name: Install Python and Nmap on RHEL 9
       ansible.builtin.dnf:
-        name: [python3.11, python3.11-pip]
+        name: [python3.11, python3.11-pip, nmap]
         state: present
       when: ansible_facts.os_family == 'RedHat'
     - name: Create service account

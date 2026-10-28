@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import Field
 
 from . import __version__
+from .cipher_models import CipherScanRequest, CipherScanResult
 from .config import Settings, under
 from .credentials import Credential, Vault
 from .execution_models import Batch, HTTPJob, ManualCompletion, SSHJob, ValidationDecision
@@ -25,7 +26,7 @@ class JobResponse(Model):
     device: str
     lock_key: str
     lock_held: bool
-    kind: Literal["upgrade", "rollback", "snmp_walk", "ssh", "http"]
+    kind: Literal["upgrade", "rollback", "snmp_walk", "ssh", "http", "cipher_scan"]
     parent: str | None
     request: dict
     status: Literal[
@@ -50,6 +51,11 @@ class JobResponse(Model):
     credential_summary: dict = Field(default_factory=dict)
     control: dict = Field(default_factory=dict)
     validation_gates: list[dict] = Field(default_factory=list)
+
+
+class CipherScanJobResponse(JobResponse):
+    request: CipherScanRequest
+    result: CipherScanResult
 
 
 class BatchItem(Model):
@@ -184,6 +190,41 @@ def create_app(settings=None):
     ):
         p = planned(request)
         return store.submit(request.model_dump(), p.lock_key, idempotency_key)
+
+    @app.post(
+        "/api/v1/cipher-scans",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=CipherScanJobResponse,
+        tags=["Cipher scans"],
+        summary="Queue an SSH or HTTPS cipher scan",
+        description="Runs Nmap on one IP and TCP port without device credentials. Defaults to port 22 for SSH or 443 for HTTPS. Returns a job ID immediately; poll GET /api/v1/cipher-scans/{job_id}. Results include structured NSE data and readable output. Supports Idempotency-Key. HTTPS enumeration makes multiple TLS connections; this is not a compliance verdict. Cancel through POST /api/v1/jobs/{job_id}/cancel.",
+    )
+    def submit_cipher_scan(
+        request: CipherScanRequest,
+        idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
+    ):
+        return store.submit(
+            request.model_dump(mode="json"),
+            f"cipher:{request.device_ip}:{request.port}",
+            idempotency_key,
+            kind="cipher_scan",
+        )
+
+    @app.get(
+        "/api/v1/cipher-scans/{job_id}",
+        dependencies=authenticated,
+        response_model=CipherScanJobResponse,
+        tags=["Cipher scans"],
+        summary="Read cipher scan status and results",
+        description="Poll while queued or running. The result contains Nmap version, port state, structured data, readable output and errors. A failed or empty scan is never reported as a clean cipher assessment. Generic job polling and events endpoints also support these jobs.",
+    )
+    def cipher_scan(job_id: str):
+        store.reap(settings.stale_seconds)
+        result = store.get(job_id)
+        if result["kind"] != "cipher_scan":
+            raise HTTPException(404, "cipher scan job not found")
+        return result
 
     @app.post("/api/v1/snmp/walks", dependencies=authenticated, status_code=202, response_model=JobResponse)
     def submit_walk(

@@ -325,12 +325,14 @@ class Store:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             stale = db.execute(
-                "SELECT id,result FROM jobs WHERE kind='snmp_walk' AND status='running' AND heartbeat<?",
+                "SELECT id,kind,result FROM jobs WHERE kind IN ('snmp_walk','cipher_scan') AND status='running' AND heartbeat<?",
                 (time.time() - seconds,),
             ).fetchall()
             for row in stale:
                 result = json.loads(row["result"])
                 result["error"] = "SNMP worker heartbeat expired; partial results retained"
+                if row["kind"] == "cipher_scan":
+                    result.update(error_code="worker_lost", error="cipher scan worker heartbeat expired")
                 for item in result.get("oids", []):
                     if item["status"] in ("pending", "running"):
                         item.update(status="failed", error="worker heartbeat expired")
@@ -343,7 +345,7 @@ class Store:
             # Locks deliberately survive stale SSH workers: do not run a second job on an ambiguous device.
             db.execute(
                 """UPDATE jobs SET status='recovery_required',updated=?
-                WHERE status='running' AND kind!='snmp_walk' AND heartbeat<?""",
+                WHERE status='running' AND kind NOT IN ('snmp_walk','cipher_scan') AND heartbeat<?""",
                 (time.time(), time.time() - seconds),
             )
 
