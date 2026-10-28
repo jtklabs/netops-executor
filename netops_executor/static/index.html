@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>NetOps Executor</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <div>
+        <span class="eyebrow">NETWORK OPERATIONS</span>
+        <h1>NetOps Executor</h1>
+        <p>F5 upgrades, SSH commands, HTTP requests and SNMP v3 walks.</p>
+      </div>
+      <a href="/docs">API reference ↗</a>
+    </header>
+    <main>
+      <section id="login">
+        <h2>Connect</h2>
+        <form id="auth">
+          <label
+            >Bearer token
+            <input
+              id="token"
+              type="password"
+              required
+              autocomplete="off"
+              minlength="32" /></label
+          ><button>Connect</button>
+        </form>
+        <p class="hint">
+          The token stays in this tab’s memory. Configure credentials and SSH
+          host keys on the server.
+        </p>
+      </section>
+      <p id="message" role="status" aria-live="polite"></p>
+      <div id="workspace" hidden>
+        <div class="columns">
+          <section>
+            <h2>New job</h2>
+            <form id="new-job">
+              <label
+                >Device
+                <input
+                  id="device"
+                  list="inventory"
+                  required
+                  placeholder="Inventory ID or device IP" /><datalist
+                  id="inventory"
+                ></datalist
+              ></label>
+              <label
+                >SSH credential profiles (optional, comma separated)
+                <input
+                  id="credential_profiles"
+                  placeholder="Automatically try eligible profiles"
+              /></label>
+              <div class="checks">
+                <label
+                  ><input type="checkbox" id="transfer" /> Transfer
+                  images</label
+                ><label
+                  ><input type="checkbox" id="install" /> Install
+                  software</label
+                ><label
+                  ><input type="checkbox" id="reboot" /> Reboot into target
+                  volume</label
+                ><label
+                  ><input type="checkbox" id="create_ucs" /> Create UCS
+                  backup</label
+                ><label
+                  ><input type="checkbox" id="ucs_unencrypted" /> Create UCS
+                  without encryption</label
+                ><label
+                  ><input type="checkbox" id="images_on_device" /> Images
+                  already on device</label
+                ><label
+                  ><input type="checkbox" id="drain" /> Drain virtual addresses
+                  before reboot</label
+                >
+              </div>
+              <label
+                >Target boot volume
+                <input
+                  id="target_volume"
+                  placeholder="Automatic when omitted" /></label
+              ><label
+                >Allowed source versions (comma separated)
+                <input
+                  id="allowed_source_versions"
+                  placeholder="16.1.5, 17.1.1" /></label
+              ><label
+                >Images (ordered JSON array)
+                <textarea id="images" rows="6" spellcheck="false">[]</textarea>
+              </label>
+              <p class="hint">
+                Each image needs name, sha256, version, build, and kind (image
+                or hotfix). Install implies transfer and UCS backup.
+              </p>
+              <details>
+                <summary>Backup, drain and verification options</summary>
+                <label
+                  >Backup directory under server backup root
+                  <input
+                    id="backup_directory"
+                    placeholder="Uses device ID by default" /></label
+                ><label
+                  >Expected version (required for reboot without install)
+                  <input id="expected_version" /></label
+                ><label>Expected build <input id="expected_build" /></label>
+                <div class="pair">
+                  <label
+                    >Drain to connection count
+                    <input
+                      id="drain_connections"
+                      type="number"
+                      min="0"
+                      placeholder="0 by default" /></label
+                  ><label
+                    >Or percent to drain
+                    <input
+                      id="drain_percent"
+                      type="number"
+                      min="0"
+                      max="100"
+                      step="any"
+                      placeholder="90 = remove 90%"
+                  /></label>
+                </div>
+                <label
+                  >Drain timeout, seconds
+                  <input
+                    id="drain_timeout"
+                    type="number"
+                    min="0"
+                    value="300" /></label
+                ><label
+                  ><input id="reboot_on_drain_timeout" type="checkbox" /> Reboot
+                  even if drain times out</label
+                ><label
+                  >Install timeout, seconds
+                  <input
+                    id="install_timeout"
+                    type="number"
+                    min="60"
+                    value="3600" /></label
+                ><label
+                  >Reboot timeout, seconds
+                  <input
+                    id="reboot_timeout"
+                    type="number"
+                    min="60"
+                    value="900" /></label
+                ><label
+                  >Validation timeout, seconds
+                  <input
+                    id="validation_timeout"
+                    type="number"
+                    min="0"
+                    value="600"
+                /></label>
+              </details>
+              <div class="actions">
+                <button type="button" id="preview">Preview steps</button
+                ><button type="submit">Queue job</button>
+              </div>
+            </form>
+            <pre id="plan" aria-live="polite"></pre>
+          </section>
+          <section>
+            <div class="heading">
+              <h2>Jobs</h2>
+              <button id="refresh" type="button">Refresh</button>
+            </div>
+            <p class="hint">
+              Updates every five seconds · one job per device or HA lock group
+            </p>
+            <div id="jobs"></div>
+          </section>
+        </div>
+        <section>
+          <h2>API job submission</h2>
+          <p class="hint">
+            Use JSON to submit waves, commands, HTTP requests or SNMP walks.
+            Authentication stays in server-side credential profiles.
+          </p>
+          <form id="json-submit">
+            <label
+              >Job type
+              <select id="json-kind">
+                <option value="upgrade-batches">Upgrade batch</option>
+                <option value="ssh/jobs">SSH commands</option>
+                <option value="http/jobs">HTTP requests</option>
+                <option value="snmp/walks">SNMP v3 walks</option>
+              </select></label
+            >
+            <button type="button" id="json-example">Load example</button>
+            <label
+              >Request JSON
+              <textarea
+                id="json-body"
+                rows="12"
+                spellcheck="false"
+                required
+              ></textarea>
+            </label>
+            <button>Submit job</button>
+          </form>
+          <pre id="json-result"></pre>
+          <h3>Batches</h3>
+          <div id="batches"></div>
+          <pre id="batch-report"></pre>
+          <details>
+            <summary>Workers and credential profiles</summary>
+            <pre id="workers"></pre>
+            <pre id="credentials"></pre>
+          </details>
+        </section>
+        <section id="detail" hidden>
+          <div class="heading">
+            <h2 id="detail-title">Job</h2>
+            <div class="actions">
+              <button id="cancel">Request cancellation</button
+              ><button id="rollback">Roll back to previous volume</button
+              ><button id="backup">Download UCS</button>
+            </div>
+          </div>
+          <p id="detail-status"></p>
+          <p id="credential-summary"></p>
+          <form id="operator-controls">
+            <div class="pair">
+              <label>Operator <input id="operator" required /></label>
+              <label>Reason <input id="reason" required minlength="5" /></label>
+            </div>
+            <p id="gate-summary"></p>
+            <div class="actions">
+              <button type="button" id="accept-validation">
+                Accept validation
+              </button>
+              <button type="button" id="retry-validation">
+                Retry validation
+              </button>
+              <button type="button" id="mark-done">Mark item done</button>
+            </div>
+            <label
+              ><input type="checkbox" id="worker-stopped" /> I have stopped the
+              previous worker and inspected the device</label
+            >
+            <button type="button" id="resolve">
+              Release recovery reservation
+            </button>
+          </form>
+          <div id="counts"></div>
+          <h3>Execution events</h3>
+          <pre id="events"></pre>
+          <details>
+            <summary>Full job report</summary>
+            <pre id="report"></pre>
+          </details>
+          <p class="hint">
+            Recovery required means the device remains locked. Stop the owning
+            worker, inspect the device and restore any drained addresses before
+            using the API recovery resolution endpoint.
+          </p>
+        </section>
+      </div>
+    </main>
+  </body>
+</html>

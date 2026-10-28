@@ -1,0 +1,9 @@
+[
+  {
+    "id": "panorama",
+    "base_url": "https://panorama.example.net",
+    "auth_probe_path": "/api/",
+    "auth_probe_method": "GET",
+    "auth_probe_params": {"type": "version"}
+  }
+]

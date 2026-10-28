@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!pyproject.toml
+!requirements.lock
+!netops_executor/
+!netops_executor/**
+**/__pycache__
+*.pyc

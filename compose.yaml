@@ -1,0 +1,41 @@
+# Preserve existing default named volumes across the directory rename.
+name: ${NETOPS_COMPOSE_PROJECT:-f5-upgrade}
+x-service: &service
+  build: .
+  image: netops-executor:local
+  init: true
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    NETOPS_DATA_DIR: /data
+    NETOPS_BACKUP_ROOT: /backups
+    NETOPS_IMAGE_ROOT: /images
+    NETOPS_DEVICES_FILE: /config/devices.json
+    NETOPS_KNOWN_HOSTS: /config/known_hosts
+  volumes:
+    - data:/data
+    - backups:/backups
+    - ./images:/images:z
+    - ./config:/config:ro,z
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+services:
+  api:
+    <<: *service
+    ports:
+      - "${NETOPS_BIND_ADDRESS:-${F5_BIND_ADDRESS:-127.0.0.1}}:${NETOPS_PORT:-${F5_PORT:-8080}}:8080"
+    command: ["netops-executor", "serve", "--host", "0.0.0.0"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  worker:
+    <<: *service
+    command: ["netops-executor", "worker"]
+    stop_grace_period: 2h
+volumes:
+  data:
+  backups:

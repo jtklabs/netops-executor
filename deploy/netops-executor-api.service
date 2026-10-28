@@ -1,0 +1,21 @@
+[Unit]
+Description=NetOps Executor API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=netopsexecutor
+Group=netopsexecutor
+WorkingDirectory=/opt/netops-executor
+EnvironmentFile=/etc/netops-executor/service.env
+ExecStart=/opt/netops-executor/.venv/bin/netops-executor serve --host 127.0.0.1 --port 8080
+Restart=on-failure
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/netops-executor /var/backups/netops-executor
+
+[Install]
+WantedBy=multi-user.target

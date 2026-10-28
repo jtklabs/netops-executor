@@ -1,0 +1,31 @@
+[
+  {
+    "id": "bigip-a",
+    "host": "192.0.2.10",
+    "port": 22,
+    "username": "root",
+    "key_file": "/config/ssh/id_ed25519",
+    "ucs_passphrase_env": "NETOPS_UCS_PASSPHRASE",
+    "lock_group": "pair-a",
+    "device_type": "f5"
+  },
+  {
+    "id": "bigip-b",
+    "host": "192.0.2.11",
+    "port": 22,
+    "username": "root",
+    "key_file": "/config/ssh/id_ed25519",
+    "ucs_passphrase_env": "NETOPS_UCS_PASSPHRASE",
+    "lock_group": "pair-a",
+    "device_type": "f5"
+  },
+  {
+    "id": "switch-a",
+    "host": "192.0.2.30",
+    "device_type": "cisco_ios",
+    "credential_profiles": [
+      "network-tacacs",
+      "network-local"
+    ]
+  }
+]

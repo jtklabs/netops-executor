@@ -1,0 +1,202 @@
+---
+- name: Deploy remote execution service
+  hosts: execution_remotes
+  become: true
+  vars:
+    executor_source: "{{ playbook_dir }}/../.."
+    executor_workers: 2
+    executor_devices: []
+    executor_http_targets: []
+    executor_credentials: {}
+    executor_known_hosts: ""
+    executor_python: "{{ 'python3.11' if ansible_facts.os_family == 'RedHat' else 'python3' }}"
+  pre_tasks:
+    - name: Validate supported OS and required secret
+      ansible.builtin.assert:
+        that:
+          - (ansible_facts.distribution == 'Ubuntu' and ansible_facts.distribution_version is version('24.04', '>=')) or (ansible_facts.os_family == 'RedHat' and ansible_facts.distribution_major_version == '9')
+          - executor_api_token | default('') is match('^[A-Za-z0-9_.~-]{32,}$')
+          - executor_workers | int > 0
+      no_log: true
+  tasks:
+    - name: Install Python on Ubuntu
+      ansible.builtin.apt:
+        name: [python3, python3-venv, python3-pip]
+        state: present
+        update_cache: true
+      when: ansible_facts.os_family == 'Debian'
+    - name: Install Python on RHEL 9
+      ansible.builtin.dnf:
+        name: [python3.11, python3.11-pip]
+        state: present
+      when: ansible_facts.os_family == 'RedHat'
+    - name: Create service account
+      ansible.builtin.user:
+        name: netopsexecutor
+        system: true
+        create_home: false
+        shell: /usr/sbin/nologin
+    - name: Inspect existing services
+      ansible.builtin.service_facts:
+    - name: Drain existing and legacy workers before updating code
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop: "{{ ansible_facts.services.keys() | select('match', '^(netops-executor|f5-upgrade)-worker@.*\\.service$') | list }}"
+    - name: Stop and disable existing and legacy APIs
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop: [netops-executor-api.service, f5-upgrade-api.service]
+      when: item in ansible_facts.services
+    - name: Inspect legacy persistent directories
+      ansible.builtin.stat:
+        path: "{{ item }}/f5-upgrade"
+        follow: false
+      loop: [/etc, /var/lib, /var/backups]
+      register: legacy_directories
+    - name: Inspect new persistent directories
+      ansible.builtin.stat:
+        path: "{{ item }}/netops-executor"
+      loop: [/etc, /var/lib, /var/backups]
+      register: new_directories
+    - name: Refuse to merge two independent data or key stores
+      ansible.builtin.assert:
+        that:
+          - not (item.0.stat.isdir | default(false) and item.1.stat.exists)
+        fail_msg: "Both old and new stores exist. Reconcile them before deployment; no data has been overwritten."
+      loop: "{{ legacy_directories.results | zip(new_directories.results) | list }}"
+    - name: Move legacy database backups and keyring without replacing contents
+      ansible.builtin.command:
+        argv: [mv, "{{ item.item }}/f5-upgrade", "{{ item.item }}/netops-executor"]
+      loop: "{{ legacy_directories.results }}"
+      when: item.stat.isdir | default(false)
+    - name: Create private directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: netopsexecutor
+        group: netopsexecutor
+        mode: "0700"
+      loop: [/opt/netops-executor, /etc/netops-executor, /var/lib/netops-executor, /var/backups/netops-executor, /srv/f5-images]
+    - name: Preserve legacy inventory key paths
+      ansible.builtin.file:
+        src: /etc/netops-executor
+        dest: /etc/f5-upgrade
+        state: link
+    - name: Enforce state and cached image ownership including interrupted migrations
+      ansible.builtin.file:
+        path: "{{ item }}"
+        owner: netopsexecutor
+        group: netopsexecutor
+        recurse: true
+      loop: [/etc/netops-executor, /var/lib/netops-executor, /var/backups/netops-executor, /srv/f5-images]
+    - name: Copy application source and pinned dependencies
+      ansible.builtin.copy:
+        src: "{{ executor_source }}/{{ item }}"
+        dest: /opt/netops-executor/
+        owner: root
+        group: netopsexecutor
+        mode: preserve
+      loop: [netops_executor, pyproject.toml, requirements.lock]
+    - name: Create virtual environment
+      ansible.builtin.command:
+        argv: ["{{ executor_python }}", -m, venv, /opt/netops-executor/.venv]
+        creates: /opt/netops-executor/.venv/bin/python
+    - name: Install pinned dependencies and application
+      ansible.builtin.pip:
+        requirements: /opt/netops-executor/requirements.lock
+        virtualenv: /opt/netops-executor/.venv
+    - name: Install application package
+      ansible.builtin.pip:
+        name: /opt/netops-executor
+        extra_args: --no-deps --force-reinstall
+        virtualenv: /opt/netops-executor/.venv
+    - name: Generate credential encryption key once
+      become_user: netopsexecutor
+      ansible.builtin.command:
+        argv:
+          [
+            /opt/netops-executor/.venv/bin/netops-executor,
+            init-key,
+            /etc/netops-executor/credentials.key,
+          ]
+        creates: /etc/netops-executor/credentials.key
+      no_log: true
+    - name: Enforce encryption key ownership
+      ansible.builtin.file:
+        path: /etc/netops-executor/credentials.key
+        owner: netopsexecutor
+        group: netopsexecutor
+        mode: "0600"
+    - name: Configure service environment
+      ansible.builtin.copy:
+        dest: /etc/netops-executor/service.env
+        owner: netopsexecutor
+        group: netopsexecutor
+        mode: "0600"
+        content: |
+          NETOPS_API_TOKEN={{ executor_api_token }}
+          NETOPS_CREDENTIAL_KEY_FILE=/etc/netops-executor/credentials.key
+          NETOPS_DATA_DIR=/var/lib/netops-executor
+          NETOPS_BACKUP_ROOT=/var/backups/netops-executor
+          NETOPS_IMAGE_ROOT=/srv/f5-images
+          NETOPS_DEVICES_FILE=/etc/netops-executor/devices.json
+          NETOPS_HTTP_TARGETS_FILE=/etc/netops-executor/http-targets.json
+          NETOPS_KNOWN_HOSTS=/etc/netops-executor/known_hosts
+      no_log: true
+    - name: Configure inventories
+      ansible.builtin.copy:
+        dest: "/etc/netops-executor/{{ item.name }}"
+        content: "{{ item.content }}"
+        owner: netopsexecutor
+        group: netopsexecutor
+        mode: "0600"
+      loop:
+        - name: devices.json
+          content: "{{ executor_devices | to_nice_json }}"
+        - name: http-targets.json
+          content: "{{ executor_http_targets | to_nice_json }}"
+        - name: known_hosts
+          content: "{{ executor_known_hosts }}"
+    - name: Install service units
+      ansible.builtin.copy:
+        src: "{{ executor_source }}/deploy/{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: [netops-executor-api.service, "netops-executor-worker@.service"]
+    - name: Start API on loopback
+      ansible.builtin.systemd_service:
+        name: netops-executor-api
+        enabled: true
+        state: started
+        daemon_reload: true
+    - name: Wait for local API
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8080/healthz
+        status_code: 200
+      register: health
+      retries: 30
+      delay: 2
+      until: health.status == 200
+    - name: Upsert encrypted credentials with stable IDs
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:8080/api/v1/credentials/{{ item.key }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ executor_api_token }}"
+        body_format: json
+        body: "{{ item.value }}"
+        status_code: 200
+      loop: "{{ executor_credentials | dict2items }}"
+      no_log: true
+    - name: Start workers
+      ansible.builtin.systemd_service:
+        name: "netops-executor-worker@{{ item }}"
+        enabled: true
+        state: started
+      loop: "{{ range(1, executor_workers | int + 1) | list }}"
