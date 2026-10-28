@@ -35,3 +35,4 @@ pygments==2.21.0
 scp==0.16.2
 textfsm==2.1.0
 PyYAML==6.0.3
+passlib==1.7.4

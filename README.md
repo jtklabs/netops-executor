@@ -85,6 +85,7 @@ items; `completed` means every item passed its wave barrier.
       "sha256": "REPLACE_WITH_64_CHARACTER_SHA256"
     }],
     "backup_directory": "Change123",
+    "admin_password": {"credential_profile": "f5-admin-standard"},
     "standalone_drain": {
       "enabled": true,
       "remaining_connections": 100,
@@ -165,6 +166,82 @@ require SHA-256, verified TLS and no redirects or embedded credentials. A downlo
 is limited to 30 GiB/two hours and committed atomically. SFTP uses a temporary
 remote filename and verifies it before rename. Transfer progress includes bytes
 and percentage. Installer cleanup never deletes boot volumes.
+
+### Verify and enforce the local admin password
+
+Enable this step by adding `admin_password` to an upgrade request, or to batch
+`defaults`. Existing requests that omit this field keep their existing behavior.
+Create the expected password profile first through
+`PUT /api/v1/credentials/f5-admin-standard`:
+
+```json
+{
+  "kind": "f5_admin",
+  "password": "REPLACE_WITH_EXPECTED_PASSWORD",
+  "targets": ["192.0.2.10", "192.0.2.11", "192.0.2.12"]
+}
+```
+
+This credential is encrypted in the local vault. It is separate from SSH login
+profiles and is never tried as a connection credential. Provision or update it
+using the existing Ansible credential PUT task with `no_log:true`.
+
+Add the following to your upgrade payload:
+
+```json
+{
+  "admin_password": {
+    "credential_profile": "f5-admin-standard",
+    "remediate": true,
+    "before": true,
+    "after": true
+  }
+}
+```
+
+`remediate`, `before`, and `after` all default to true. Set `remediate:false` for
+verification only. At least one stage must be enabled. With `admin_password:{}`,
+the highest-priority eligible `f5_admin` profile defines the expected password.
+The selected profile ID stays fixed for the job; each check records its current
+revision, so an intentional credential update is visible. `targets` restricts
+selection to the requested device's inventory ID or address. The expected
+password itself is never accepted in an upgrade job payload.
+
+Before an upgrade, check the local `admin` password after device prechecks and
+before backup/install/draining. After an upgrade, check again after validation,
+traffic restoration and any HA sync. No-reboot jobs check the current runtime
+before and after their requested work. Each check reads the local account hash
+through SSH and compares it on the worker. A matching password causes no write.
+For a confirmed mismatch, set the expected password through tmsh stdin, save the
+configuration, then read back and verify. This avoids process-argument exposure
+and does not require enabling SSH access for the admin account.
+
+The SSH account must be permitted to view and modify local user accounts.
+If the worker logs in as `admin`, keep its separate SSH login profile aligned
+with the expected password so it can reconnect after a reset or reboot.
+Supported hashes are SHA-256 Crypt (`$5$`) and SHA-512 Crypt (`$6$`), up to one
+million rounds. Missing profiles/accounts, inaccessible hashes and unsupported
+formats open a `needs_review` gate without a blind reset. A mismatch remaining
+after reset also opens a gate. An interrupted password write or save requires
+recovery inspection and is never automatically replayed.
+
+Poll the normal job endpoint. `result.admin_password` includes account, selected
+profile, and a chronological `checks` list with stage, timestamp, profile revision,
+`status`, `initial_match`, `reset_attempted` and `remediated`. Statuses include `matched`, `mismatch`,
+`unavailable`, `unverifiable`, and in-progress `checking` / `remediating`. Passwords
+and hashes are excluded from results and events. A successful reset has
+`status:matched`, `initial_match:false`, `reset_attempted:true`, and
+`remediated:true`. A reset attempt that cannot be verified never reports
+`remediated:true`.
+
+The existing validation-decision endpoint handles gates named
+`admin_password_before` and `admin_password_after`. `retry` rechecks the password
+and may remediate; `accept` records a manual waiver. A post-upgrade retry does not
+repeat install, reboot, restoration or sync. A manually accepted mismatch remains
+visible in the report and completes with warnings. This verifies the configured
+local password; lockout, expiry and GUI/SSH login availability are separate checks.
+
+F5 command reference: [auth user](https://clouddocs.f5.com/cli/tmsh-reference/latest/modules/auth/auth_user.html).
 
 ### Drain and HA behavior
 
@@ -469,6 +546,10 @@ executor_credentials:
   ucs:
     kind: ucs
     passphrase: REPLACE_WITH_SECRET
+  f5-admin-standard:
+    kind: f5_admin
+    password: REPLACE_WITH_EXPECTED_ADMIN_PASSWORD
+    targets: [192.0.2.10, 192.0.2.11, 192.0.2.12]
 ```
 
 ```bash

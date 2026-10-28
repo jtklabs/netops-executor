@@ -5,13 +5,14 @@ import re
 import time
 from datetime import datetime, timezone
 
+from .admin_password import PasswordCheckUnavailable, matches_admin_password, reset_admin_password
 from .config import under
 from .credentials import Vault
 from .device import BigIP, differences, matches, name
 from .image_cache import cached_image
 from .models import JobRequest
 from .ssh import SSH, DeviceError, digest
-from .store import CancelRequested, Deferred, LostOwnership, NeedsReview
+from .store import CancelRequested, Conflict, Deferred, LostOwnership, NeedsReview
 
 
 class Runner:
@@ -19,7 +20,14 @@ class Runner:
         self.settings, self.store, self.job, self.worker = settings, store, job, worker
         self.sleep, self.clock = sleep, clock
         self.result = job["result"]
-        self.changed = bool(self.result.get("inherited_lock") or job.get("control", {}).get("continuation"))
+        continuation = job.get("control", {}).get("continuation")
+        admin = self.result.get("admin_password", {})
+        self.changed = bool(
+            self.result.get("inherited_lock")
+            or (continuation and continuation != "admin_password_before")
+            or admin.get("reset_in_progress")
+            or any(check.get("reset_attempted") for check in admin.get("checks", []))
+        )
         self.changed_addresses = (
             []
             if self.result.get("drain", {}).get("restored")
@@ -609,6 +617,92 @@ class Runner:
         self.result["validation_differences"] = differences(self.result["pre_validation"], snapshot)
         self.event("post_restore_snapshot_completed")
 
+    def check_admin_password(self, request, stage):
+        policy = request.admin_password
+        if not policy or not getattr(policy, stage):
+            return
+        self.checkpoint()
+        state = self.result.setdefault("admin_password", {"account": "admin", "checks": []})
+        report = {
+            "stage": stage,
+            "status": "checking",
+            "checked_at": time.time(),
+            "reset_attempted": False,
+            "remediated": False,
+        }
+        state["checks"].append(report)
+
+        def review(message):
+            report["reason"] = message
+            self.event("admin_password_check_failed", stage=stage, status=report["status"])
+            self.store.open_gate(
+                self.job["id"],
+                self.worker,
+                "admin_password_" + stage,
+                {"critical": [message], "account": "admin", "stage": stage},
+                self.result,
+            )
+
+        d = self.settings.device(request.device)
+        selected_name = state.get("profile") or policy.credential_profile
+        try:
+            profiles = Vault(self.store, self.settings.credential_key_file).candidates(
+                "f5_admin", [selected_name] if selected_name else None, (d.host, d.id)
+            )
+        except Conflict:
+            profiles = []
+        if not profiles:
+            report["status"] = "unavailable"
+            review("expected admin password profile is unavailable for this device")
+        selected = profiles[0]
+        state["profile"] = selected["id"]
+        report.update(profile=selected["id"], revision=selected["revision"])
+        password = selected["password"]
+        # Add the separate expected password to transport redaction as well.
+        if hasattr(self.ssh, "selector"):
+            self.ssh.selector.secrets.add(password)
+        self.event("admin_password_check_started", stage=stage)
+        try:
+            matched = matches_admin_password(self.ssh, password)
+        except PasswordCheckUnavailable:
+            report["status"] = "unverifiable"
+            review("local admin password could not be verified; check permissions and hash format")
+        report["initial_match"] = matched
+        if not matched and policy.remediate:
+            self.checkpoint()
+            state["reset_in_progress"] = True
+            report["status"] = "remediating"
+            report["reset_attempted"] = True
+            self.intent(
+                "admin_password_reset", stage=stage, profile=selected["id"], revision=selected["revision"]
+            )
+            reset_admin_password(self.ssh, password)
+            self.checkpoint()
+            self.intent("admin_password_save", stage=stage)
+            self.ssh.tmsh("save /sys config", timeout=180)
+            state["reset_in_progress"] = False
+            try:
+                matched = matches_admin_password(self.ssh, password)
+            except PasswordCheckUnavailable:
+                report["status"] = "unverifiable"
+                review("admin password reset was saved but readback could not be verified")
+        report["status"] = "matched" if matched else "mismatch"
+        report["remediated"] = bool(matched and report["reset_attempted"])
+        self.audit(
+            {
+                "profile": selected["id"],
+                "revision": selected["revision"],
+                "transport": "ssh",
+                "target": d.host,
+                "purpose": "expected_admin_password",
+                "stage": stage,
+                "outcome": "password_verified" if matched else "password_mismatch",
+            }
+        )
+        if not matched:
+            review("local admin password does not match the configured expected password")
+        self.event("admin_password_check_completed", stage=stage, remediated=report["remediated"])
+
     def complete_upgrade(self, request):
         restored = bool(self.changed_addresses)
         self.restore_addresses()
@@ -617,6 +711,7 @@ class Runner:
         self.checkpoint()
         self.waf_requests(request)
         self.sync_pair(request)
+        self.check_admin_password(request, "after")
 
     def sync_pair(self, request):
         if not self.topology["cluster"] or not request.ha_policy.sync_after_upgrade:
@@ -657,27 +752,38 @@ class Runner:
         self.reserve()
         self.checkpoint()
         decision = self.store.apply_decision(self.job["id"], self.worker)
-        if decision:
+        before_review = decision and decision["phase"] == "admin_password_before"
+        if decision and decision["decision"]["action"] == "accept":
+            self.result.setdefault("manual_validations", []).append(decision["decision"])
+            self.event("manual_validation_applied", gate_id=decision["id"])
+        if decision and not before_review:
             r.target_volume = self.result.get("target_volume")
             baseline = self.result["pre_validation"]
-            if decision["decision"]["action"] == "accept":
-                self.result.setdefault("manual_validations", []).append(decision["decision"])
-                self.event("manual_validation_applied", gate_id=decision["id"])
-            if decision["phase"] == "post_validation":
+            if decision["phase"] == "admin_password_after":
+                if decision["decision"]["action"] == "retry":
+                    self.check_admin_password(r, "after")
+            elif decision["phase"] == "post_validation":
                 if decision["decision"]["action"] == "retry":
                     self.postvalidate(baseline, r)
-                self.complete_upgrade(r)
+                if r.reboot:
+                    self.complete_upgrade(r)
+                else:
+                    self.check_admin_password(r, "after")
             elif decision["phase"] == "post_restore_snapshot":
                 if decision["decision"]["action"] == "retry":
                     self.capture_restored()
                 self.waf_requests(r)
                 self.sync_pair(r)
+                self.check_admin_password(r, "after")
             elif decision["phase"] == "waf_requests":
                 if decision["decision"]["action"] == "retry":
                     self.waf_requests(r)
                 self.sync_pair(r)
-            elif decision["phase"] == "config_sync" and decision["decision"]["action"] == "retry":
-                self.sync_pair(r)
+                self.check_admin_password(r, "after")
+            elif decision["phase"] == "config_sync":
+                if decision["decision"]["action"] == "retry":
+                    self.sync_pair(r)
+                self.check_admin_password(r, "after")
             return
         self.result["plan"] = r.plan()
         before = self.device.snapshot()
@@ -702,6 +808,8 @@ class Runner:
             }
             self.event("rollback_recorded")
             self.ha_health(r, before=True)
+        if not (before_review and decision["decision"]["action"] == "accept"):
+            self.check_admin_password(r, "before")
         if r.drain and not self.topology["cluster"]:
             self.device.check_drain()
             self.device.address_states()
@@ -729,6 +837,8 @@ class Runner:
         self.postvalidate(before, r if r.reboot else r.model_copy(update={"validation_timeout": 0}))
         if r.reboot:
             self.complete_upgrade(r)
+        else:
+            self.check_admin_password(r, "after")
 
     def rollback(self):
         source = self.store.get(self.job["parent"])
@@ -794,7 +904,11 @@ class Runner:
                     self.restore_addresses()
                 self.result["cancelled_at"] = self.phase
                 self.event("cancel_acknowledged")
-                unsafe = bool(self.changed_addresses) or self.boot_attempted
+                unsafe = (
+                    bool(self.changed_addresses)
+                    or self.boot_attempted
+                    or self.result.get("admin_password", {}).get("reset_in_progress", False)
+                )
                 self.store.finish(self.job["id"], self.worker, "recovery_required" if unsafe else "cancelled")
             except LostOwnership:
                 pass

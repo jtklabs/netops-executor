@@ -73,7 +73,7 @@ class BatchResponse(Model):
 
 class CredentialMetadata(Model):
     id: str
-    kind: Literal["ssh", "http", "snmp", "ucs"]
+    kind: Literal["ssh", "http", "snmp", "ucs", "f5_admin"]
     priority: int
     enabled: bool
     revision: int

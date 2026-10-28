@@ -45,10 +45,24 @@ class StandaloneDrain(Model):
     reboot_on_timeout: bool = False
 
 
+class AdminPasswordPolicy(Model):
+    credential_profile: Name | None = None
+    remediate: bool = True
+    before: bool = True
+    after: bool = True
+
+    @model_validator(mode="after")
+    def enabled_stage(self):
+        if not self.before and not self.after:
+            raise ValueError("admin password policy requires at least one check stage")
+        return self
+
+
 class JobRequest(Model):
     device: str = Field(min_length=1, max_length=253)
     credential_profiles: list[Name] | None = Field(default=None, min_length=1, max_length=10)
     ucs_credential: Name | None = None
+    admin_password: AdminPasswordPolicy | None = None
     validation_policy: ValidationPolicy = Field(default_factory=ValidationPolicy)
     ha_policy: HAPolicy = Field(default_factory=HAPolicy)
     standalone_drain: StandaloneDrain | None = None
@@ -120,6 +134,8 @@ class JobRequest(Model):
 
     def plan(self):
         steps = ["prevalidate"]
+        if self.admin_password and self.admin_password.before:
+            steps += ["verify_admin_password_before"]
         if self.create_ucs or self.ucs_unencrypted or self.backup_directory or self.install or self.reboot:
             steps += ["save_config", "create_ucs", "copy_ucs"]
         if self.transfer or (self.install and not self.images_on_device):
@@ -136,6 +152,8 @@ class JobRequest(Model):
             steps += ["reboot", "postvalidate", "restore_virtual_addresses"]
         else:
             steps += ["postvalidate_no_reboot"]
+        if self.admin_password and self.admin_password.after:
+            steps += ["verify_admin_password_after"]
         return steps
 
 

@@ -14,7 +14,7 @@ from .store import Conflict
 
 
 class Credential(Model):
-    kind: Literal["ssh", "snmp", "http", "ucs"]
+    kind: Literal["ssh", "snmp", "http", "ucs", "f5_admin"]
     username: str = Field(default="", max_length=128)
     password: SecretStr | None = None
     private_key: SecretStr | None = None
@@ -57,6 +57,13 @@ class Credential(Model):
             self.username and self.password if self.scheme == "basic" else self.token
         ):
             raise ValueError("HTTP requires credentials for the selected scheme")
+        if self.kind == "f5_admin":
+            if self.username not in ("", "admin") or not self.password:
+                raise ValueError("f5_admin requires the local admin account password")
+            self.username = "admin"
+            value = self.password.get_secret_value()
+            if len(value.encode()) > 1024 or any(c in value for c in "\r\n\x00"):
+                raise ValueError("admin password must be at most 1024 bytes without newline or NUL")
         if self.kind == "ucs" and not self.passphrase:
             raise ValueError("UCS requires passphrase")
         if self.kind == "snmp":
