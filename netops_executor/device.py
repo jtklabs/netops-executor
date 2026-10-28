@@ -14,47 +14,85 @@ def name(value):
     return value
 
 
+class Body(list):
+    """Object tokens. line_starts marks tokens that begin a line of multi-line tmsh output."""
+
+    line_starts = frozenset()
+
+
 def blocks(text, prefix):
-    lexer = shlex.shlex(text, posix=True, punctuation_chars="{}")
+    lexer = shlex.shlex(text, posix=True, punctuation_chars="{}\n")
+    lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     lexer.commenters = ""
     tokens = list(lexer)
-    # shlex groups adjacent brace punctuation.
-    tokens = [part for t in tokens for part in (list(t) if t and set(t) <= {"{", "}"} else [t])]
+    # shlex groups adjacent punctuation.
+    tokens = [part for t in tokens for part in (list(t) if t and set(t) <= {"{", "}", "\n"} else [t])]
     expected, result, i = prefix.split(), {}, 0
     while i < len(tokens):
+        if tokens[i] == "\n":
+            i += 1
+            continue
         if tokens[i : i + len(expected)] != expected:
             raise DeviceError("unrecognized tmsh object output")
         i += len(expected)
         if i + 1 >= len(tokens) or tokens[i + 1] != "{":
             raise DeviceError("malformed tmsh object header")
-        key, i, depth, body = tokens[i], i + 2, 1, []
+        key, i, depth, body, starts, line_start = tokens[i], i + 2, 1, Body(), set(), False
         while i < len(tokens) and depth:
             t = tokens[i]
+            i += 1
+            if t == "\n":
+                line_start = True
+                continue
             depth += (t == "{") - (t == "}")
             if depth:
+                if line_start:
+                    starts.add(len(body))
                 body.append(t)
-            i += 1
+            line_start = False
         if depth or key in result:
             raise DeviceError("incomplete or duplicate tmsh object")
+        body.line_starts = frozenset(starts)
         result[key] = body
     return result
 
 
-def field(tokens, key, default=None):
+def _property(tokens, key):
     # Only inspect this object's own properties. Member/profile statistics can
     # occur before parent statistics and must never supply a pool's health.
+    # Multi-line output names a property only at a line start; a value such as
+    # "arp enabled" must never be read as the "enabled" property.
+    starts = getattr(tokens, "line_starts", None)
     depth = 0
     for i, token in enumerate(tokens):
         if token == "{":
             depth += 1
         elif token == "}":
             depth -= 1
-        elif depth == 0 and token == key:
-            if i + 1 >= len(tokens) or tokens[i + 1] in ("{", "}"):
-                raise DeviceError("missing tmsh field value")
-            return tokens[i + 1]
-    return default
+        elif depth == 0 and token == key and (not starts or i in starts):
+            ends = i + 1 >= len(tokens) or tokens[i + 1] in ("{", "}") or bool(starts and i + 1 in starts)
+            return None if ends else tokens[i + 1]
+    raise KeyError(key)
+
+
+def field(tokens, key, default=None):
+    try:
+        value = _property(tokens, key)
+    except KeyError:
+        return default
+    if value is None:
+        raise DeviceError("missing tmsh field value")
+    return value
+
+
+def flag(tokens, key):
+    # tmsh prints a set boolean property as a bare keyword (volume "active") and omits it otherwise.
+    try:
+        value = _property(tokens, key)
+    except KeyError:
+        return False
+    return value in ("yes", "true") if value in ("yes", "no", "true", "false") else True
 
 
 def required(tokens, key):
@@ -107,8 +145,8 @@ class BigIP:
                 "build": field(body, "build"),
                 "basebuild": field(body, "basebuild"),
                 "status": required(body, "status"),
-                "active": required(body, "active") == "yes",
-                "active_requested": field(body, "active-requested", "no") == "yes",
+                "active": flag(body, "active"),
+                "active_requested": flag(body, "active-requested"),
             }
         # The status table reports the installed build, including a hotfix. Do not
         # accept a basebuild match as proof that the requested hotfix is installed.
@@ -200,7 +238,10 @@ class BigIP:
             "collection_errors": errors,
             "asm_ready": ready,
             "waf_policy_attributes": {
-                key: {k: field(body, k) for k in ("active", "enforcement-mode", "type")}
+                key: {
+                    "active": flag(body, "active"),
+                    **{k: field(body, k) for k in ("enforcement-mode", "type")},
+                }
                 for key, body in policies.items()
             },
             "active": active,
@@ -250,9 +291,16 @@ class BigIP:
         return sum(v["connections"] for v in self.stats("virtual")["objects"].values())
 
     def check_drain(self):
+        from . import f5_operations as ops
+
         groups = blocks(self.ssh.tmsh("list /cm device-group all-properties"), "cm device-group")
-        if any(field(g, "auto-sync") == "enabled" for g in groups.values()):
-            raise DeviceError("virtual-address drain is not permitted with automatic config sync enabled")
+        for key, group in groups.items():
+            # Every BIG-IP has auto-syncing trust and ASM datasync groups; they carry no LTM objects.
+            short = key.rsplit("/", 1)[-1]
+            if short == "device_trust_group" or short.startswith("datasync-"):
+                continue
+            if field(group, "auto-sync") == "enabled" and len(ops.children(group, "devices")) > 1:
+                raise DeviceError("virtual-address drain is not permitted with automatic config sync enabled")
 
     def address_states(self):
         objects = blocks(
@@ -268,7 +316,9 @@ class BigIP:
         return result
 
     def set_enabled(self, address, enabled):
-        self.ssh.tmsh(f"modify /ltm virtual-address {name(address)} enabled {'yes' if enabled else 'no'}")
+        # Recursive listings from "/" print Common/x; tmsh -c starts in /Common, so make the path absolute.
+        path = address if address.startswith("/") else "/" + address
+        self.ssh.tmsh(f"modify /ltm virtual-address {name(path)} enabled {'yes' if enabled else 'no'}")
 
     def reboot(self, volume):
         self.ssh.tmsh("reboot volume " + name(volume), timeout=45)

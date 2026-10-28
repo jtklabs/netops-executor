@@ -98,7 +98,12 @@ def topology(device):
 
 
 def owners(device):
-    rows = blocks(device.ssh.tmsh("show /cm traffic-group field-fmt"), "cm traffic-group-device")
+    text = device.ssh.tmsh("show /cm traffic-group field-fmt")
+    try:
+        # BIG-IP 17.5 prints "cm traffic-group <group>:<device>" rows.
+        rows = blocks(text, "cm traffic-group")
+    except DeviceError:
+        rows = blocks(text, "cm traffic-group-device")
     groups = {}
     for _, row in rows.items():
         group = qualified(required(row, "traffic-group"))
@@ -124,7 +129,8 @@ def details(device):
     specs = {
         "vlans": ("net vlan", "tag"),
         "self_ips": ("net self", "address vlan traffic-group"),
-        "routes": ("net route", "network gw"),
+        # BIG-IP 17.5 rejects "gw" as a list property; all-properties includes it.
+        "routes": ("net route", "all-properties"),
         "management_routes": ("sys management-route", "network gateway"),
         "management_ip": ("sys management-ip", ""),
         "trunks": ("net trunk", "interfaces"),
@@ -136,13 +142,14 @@ def details(device):
         try:
             recursive = (
                 "recursive "
-                if kind not in ("sys provision", "sys management-ip", "sys management-route")
+                if kind not in ("sys provision", "sys management-ip", "sys management-route", "net trunk")
                 else ""
             )
             result[label] = blocks(ssh.tmsh(f"cd /; list /{kind} {recursive}{properties}".strip()), kind)
         except DeviceError:
             errors[label] = "collection unavailable"
-    for label, command, kind in [("irules", "cd /; list /ltm rule recursive one-line", "ltm rule")]:
+    # iRule names only: rule bodies are arbitrary Tcl, and 17.5 rejects "one-line" for rules.
+    for label, command, kind in [("irules", "cd /; list /ltm rule recursive app-service", "ltm rule")]:
         try:
             result[label] = sorted(blocks(ssh.tmsh(command), kind))
         except DeviceError:

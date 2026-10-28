@@ -764,15 +764,18 @@ class Store:
     def validated_peer(self, current, cluster, active, peer_name):
         with self.connect() as db:
             rows = db.execute(
-                "SELECT result FROM jobs WHERE kind='upgrade' AND id!=? AND status IN ('succeeded','completed_with_warnings','manually_completed') AND NOT EXISTS(SELECT 1 FROM locks WHERE job=jobs.id) ORDER BY updated DESC",
+                "SELECT status,result FROM jobs WHERE kind='upgrade' AND id!=? AND status IN ('succeeded','completed_with_warnings','manually_completed') AND NOT EXISTS(SELECT 1 FROM locks WHERE job=jobs.id) ORDER BY updated DESC",
                 (current,),
             ).fetchall()
             for row in rows:
-                result = json.loads(row[0])
+                result = json.loads(row["result"])
                 if (
                     result.get("ha", {}).get("cluster") == cluster
                     and result.get("ha", {}).get("self") == peer_name
                 ):
+                    # Manual completion advances a wave; it does not prove the peer passed validation.
+                    if row["status"] == "manually_completed" and not result.get("validation_accepted"):
+                        continue
                     verified = result.get("boot_verified", {})
                     if not verified:
                         continue

@@ -109,7 +109,7 @@ class Runner:
             )
         return self.peer
 
-    def ha_health(self, request, before=False):
+    def ha_health(self, request, before=False, rollback_target=None):
         local = self.device.topology()
         if not local["cluster"]:
             if local["role"] != "active":
@@ -150,7 +150,14 @@ class Runner:
         if before and same_version and (local["sync"] != "in sync" or other["sync"] != "in sync"):
             raise DeviceError("HA configuration is not in sync")
         if before and not same_version:
-            if not self.store.validated_peer(
+            if rollback_target is not None:
+                # Rolling back onto the peer's running software: that peer is the known-good original.
+                if (health["active"]["version"], health["active"]["build"]) != (
+                    rollback_target["version"],
+                    rollback_target["build"],
+                ):
+                    raise DeviceError("mixed-version rollback requires the peer to run the rollback target")
+            elif not self.store.validated_peer(
                 self.job["id"], local["cluster"], health["active"], other["self"]
             ):
                 raise DeviceError("mixed-version peer needs a completed upgrade validation before continuing")
@@ -164,9 +171,9 @@ class Runner:
         if before and local["role"] == "active" and not request.ha_policy.allow_active_first:
             raise DeviceError("active-first upgrade is disabled by this request")
 
-    def failover(self, request):
+    def failover(self, request, rollback_target=None):
         self.phase = "ha_failover"
-        self.ha_health(request, before=True)
+        self.ha_health(request, before=True, rollback_target=rollback_target)
         local = self.device.topology()
         if local["role"] == "active":
             self.checkpoint()
@@ -668,7 +675,11 @@ class Runner:
             report["status"] = "unverifiable"
             review("local admin password could not be verified; check permissions and hash format")
         report["initial_match"] = matched
+        clustered = bool(self.topology and self.topology["cluster"])
+        sync_before = None
         if not matched and policy.remediate:
+            if clustered:
+                sync_before = self.device.topology()["sync"]
             self.checkpoint()
             state["reset_in_progress"] = True
             report["status"] = "remediating"
@@ -701,7 +712,33 @@ class Runner:
         )
         if not matched:
             review("local admin password does not match the configured expected password")
+        if report["remediated"] and clustered:
+            self.sync_password_reset(report, sync_before)
         self.event("admin_password_check_completed", stage=stage, remediated=report["remediated"])
+
+    def sync_password_reset(self, report, sync_before):
+        # The local admin account is synchronized configuration: a reset leaves the pair "changes pending".
+        peer = self.peer_device()
+        local, other = self.device.active(), peer.active()
+        if (local["version"], local["build"]) != (other["version"], other["build"]):
+            report["config_sync"] = "deferred until both members run the same version/build"
+            self.event("admin_password_config_sync_deferred")
+            return
+        if sync_before != "in sync":
+            # Never push unrelated pending changes from this member.
+            report["config_sync"] = "skipped; the pair was not in sync before the reset"
+            self.event("admin_password_config_sync_skipped", sync_before=sync_before)
+            return
+        for group in self.topology["groups"]:
+            self.intent("admin_password_config_sync", group=group)
+            self.ssh.tmsh("run /cm config-sync to-group " + name(group), timeout=180)
+        deadline = self.clock() + 120
+        while self.device.topology()["sync"] != "in sync" or peer.topology()["sync"] != "in sync":
+            if self.clock() >= deadline:
+                raise DeviceError("HA sync after the admin password reset did not complete")
+            self.wait(5)
+        report["config_sync"] = "in sync"
+        self.event("admin_password_config_sync_completed")
 
     def complete_upgrade(self, request):
         restored = bool(self.changed_addresses)
@@ -874,7 +911,7 @@ class Runner:
         ):
             raise DeviceError("device no longer runs the source job's target; rollback refused")
         if self.topology["cluster"]:
-            self.failover(r)
+            self.failover(r, rollback_target=saved)
         self.changed_addresses = source["result"].get("drain", {}).get("changed_addresses", [])[:]
         self.result["drain"] = {"changed_addresses": self.changed_addresses[:], "restored": False}
         self.reboot(saved["volume"], saved["version"], saved["build"], r.reboot_timeout)

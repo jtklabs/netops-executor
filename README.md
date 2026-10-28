@@ -401,6 +401,13 @@ formats open a `needs_review` gate without a blind reset. A mismatch remaining
 after reset also opens a gate. An interrupted password write or save requires
 recovery inspection and is never automatically replayed.
 
+The local admin account is synchronized HA configuration, so a reset leaves the
+pair `Changes Pending`. When both members run the same version/build and the
+pair was in sync before the reset, the job syncs from the reset member and waits
+for `In Sync` before failover or completion. Otherwise the check records
+`config_sync` as deferred (mixed versions; the post-upgrade sync carries it) or
+skipped (other changes were already pending).
+
 Poll the normal job endpoint. `result.admin_password` includes account, selected
 profile, and a chronological `checks` list with stage, timestamp, profile revision,
 `status`, `initial_match`, `reset_attempted` and `remediated`. Statuses include `matched`, `mismatch`,
@@ -446,7 +453,7 @@ verify healthy peer/traffic ownership, explicitly fail over to it, confirm the
 handoff, then reboot. HA jobs **do not disable shared virtual addresses**.
 Before upgrading the second member, verify that the upgraded peer has completed
 validation and can carry traffic. Mixed-version handoffs need that saved peer
-validation. Sync is deferred while versions/builds differ; when equal, use the
+validation; a manually completed peer counts only if its post-upgrade validation passed. Sync is deferred while versions/builds differ; when equal, use the
 active member as the sync source and verify completion. Unknown topology,
 active-active groups, unhealthy peers and changing ownership stop the operation.
 
@@ -526,7 +533,8 @@ request logging and incoming traffic must exist for automatic proof.
 The original active volume/version/build is saved before mutation. Submit `{}`
 to `/jobs/{id}/rollback` with its own idempotency key. The linked job checks that
 the device still runs the upgrade target and the original volume is intact,
-performs a healthy HA handoff when needed, reboots to the original volume,
+performs a healthy HA handoff when needed (if only this member was upgraded, the
+peer must run the recorded rollback version/build), reboots to the original volume,
 restores tracked drain state and validates. An uncertain source job holding a
 reservation requires `{"worker_stopped":true}`; ownership transfers atomically
 to the rollback job. A staged-only job must actually boot its target first.
@@ -854,6 +862,9 @@ ruff format --check .
 node --check netops_executor/static/app.js
 ```
 
+Prevalidation, HA discovery and reservations, traffic ownership, peer health,
+validation sampling and virtual-address disable/enable were exercised against
+BIG-IP VE 17.5.1.9/17.5.1.10 lab units. Installation, reboot and rollback were not.
 Real-appliance acceptance on your exact TMOS versions is still required. Supported
 scope is single-system BIG-IP appliances/VE and verified two-member active/standby
 pairs. F5OS, VIPRION slot orchestration, vCMP hosts, active-active traffic groups
