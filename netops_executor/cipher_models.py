@@ -5,10 +5,10 @@ from typing import Literal
 
 from pydantic import ConfigDict, Field, IPvAnyAddress, field_validator, model_validator
 
-from .models import Model
+from .models import Model, ScheduledRequest
 
 
-class CipherScanRequest(Model):
+class CipherScanRequest(ScheduledRequest):
     model_config = ConfigDict(
         json_schema_extra={
             "examples": [

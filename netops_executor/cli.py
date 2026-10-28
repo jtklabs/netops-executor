@@ -53,6 +53,8 @@ def parser():
         if command == "rollback":
             sub.add_argument("--idempotency-key")
             sub.add_argument("--worker-stopped", action="store_true")
+            sub.add_argument("--start-at")
+            sub.add_argument("--latest-start-at")
         if command == "resolve":
             sub.add_argument("--worker-stopped", required=True, action="store_true")
             sub.add_argument("--device-inspected", required=True, action="store_true")
@@ -60,6 +62,8 @@ def parser():
     for command in ("plan", "submit"):
         sub = commands.add_parser(command)
         sub.add_argument("--device", required=True)
+        sub.add_argument("--start-at", help="Earliest start, ISO 8601 with timezone")
+        sub.add_argument("--latest-start-at", help="Latest allowed start, ISO 8601 with timezone")
         sub.add_argument("--credential-profile", action="append", dest="credential_profiles")
         sub.add_argument("--ucs-credential")
         sub.add_argument("--images", type=Path, help="JSON array of image name, sha256, version, build, kind")
@@ -170,6 +174,7 @@ def main():
                 method, body = "POST", {}
             if args.command == "rollback":
                 body["worker_stopped"] = args.worker_stopped
+                body.update(start_at=args.start_at, latest_start_at=args.latest_start_at)
             if args.command == "resolve":
                 body = {
                     "worker_stopped": args.worker_stopped,

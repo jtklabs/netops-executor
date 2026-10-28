@@ -5,6 +5,9 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
+
+from .models import ScheduledRequest
 
 
 class Conflict(Exception):
@@ -75,6 +78,59 @@ class Store:
                 CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(status, created);
             """)
 
+            # Serialize additive migration so concurrent API/worker starts cannot race ALTER TABLE.
+            db.execute("BEGIN IMMEDIATE")
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}
+            for column in ("start_at", "latest_start_at", "started_at"):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE jobs ADD COLUMN {column} REAL")
+            if "started_at" not in columns:
+                # Legacy jobs have no start window. Preserve continuations as already started.
+                db.execute("""UPDATE jobs SET started_at=created WHERE status!='queued' OR worker IS NOT NULL
+                    OR EXISTS(SELECT 1 FROM gates WHERE gates.job=jobs.id)""")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_start_window ON jobs(status,started_at,latest_start_at)"
+            )
+
+    @staticmethod
+    def scheduled_request(request):
+        request = dict(request)
+        window = ScheduledRequest.model_validate(
+            {key: request.get(key) for key in ("start_at", "latest_start_at")}
+        )
+        for key, value in window.model_dump().items():
+            if value is None:
+                request.pop(key, None)
+            else:
+                request[key] = value
+        return (
+            request,
+            window.start_at.timestamp() if window.start_at is not None else None,
+            window.latest_start_at.timestamp() if window.latest_start_at is not None else None,
+        )
+
+    @staticmethod
+    def expire_pending(db, now):
+        # Only unstarted jobs expire. Active operations and manual-review continuations keep their locks.
+        rows = db.execute(
+            """SELECT id,result FROM jobs WHERE status='queued' AND started_at IS NULL
+            AND latest_start_at < ?""",
+            (now,),
+        ).fetchall()
+        for row in rows:
+            result = json.loads(row["result"])
+            result.update(
+                error_code="start_window_expired", error="latest_start_at passed before the job could start"
+            )
+            db.execute(
+                "UPDATE jobs SET status='expired',result=?,updated=? WHERE id=?",
+                (json.dumps(result), now, row["id"]),
+            )
+            db.execute(
+                "INSERT INTO events(job,time,step,data) VALUES (?,?,?,?)",
+                (row["id"], now, "start_window_expired", json.dumps({"latest_start_at_passed": True})),
+            )
+
     @contextmanager
     def connect(self):
         db = sqlite3.connect(self.path, timeout=30)
@@ -87,10 +143,17 @@ class Store:
             db.close()
 
     @staticmethod
+    def schedule_metadata(item):
+        for key in ("start_at", "latest_start_at"):
+            if item.get(key) is not None:
+                item[key] = datetime.fromtimestamp(item[key], timezone.utc).isoformat().replace("+00:00", "Z")
+        return item
+
+    @staticmethod
     def decode(row):
         if row is None:
             raise KeyError("job not found")
-        item = dict(row)
+        item = Store.schedule_metadata(dict(row))
         item["lock_held"] = bool(item.get("lock_held", False))
         for field in ("request", "result"):
             item[field] = json.loads(item[field])
@@ -148,9 +211,11 @@ class Store:
             ]
 
     def submit(self, request, lock_key, key=None, kind="upgrade", parent=None):
+        request, start_at, latest_start_at = self.scheduled_request(request)
         payload = json.dumps(request, sort_keys=True)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self.expire_pending(db, time.time())
             if key:
                 existing = db.execute(
                     "SELECT jobs.*, EXISTS(SELECT 1 FROM locks WHERE job=jobs.id) AS lock_held FROM jobs WHERE idempotency_key=?",
@@ -183,8 +248,8 @@ class Store:
             now, job_id = time.time(), str(uuid.uuid4())
             db.execute(
                 """INSERT INTO jobs
-                (id,device,lock_key,kind,parent,request,status,created,updated,idempotency_key)
-                VALUES (?,?,?,?,?,?,'queued',?,?,?)""",
+                (id,device,lock_key,kind,parent,request,status,created,updated,idempotency_key,start_at,latest_start_at)
+                VALUES (?,?,?,?,?,?,'queued',?,?,?,?,?)""",
                 (
                     job_id,
                     request.get("device", request.get("device_ip")),
@@ -195,14 +260,25 @@ class Store:
                     now,
                     now,
                     key,
+                    start_at,
+                    latest_start_at,
                 ),
             )
+            self.expire_pending(db, now)
         return self.get(job_id)
 
     def claim(self, worker):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self.expire_pending(db, time.time())
             for row in db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created,id").fetchall():
+                now = time.time()
+                if row["started_at"] is None:
+                    if row["latest_start_at"] is not None and row["latest_start_at"] < now:
+                        self.expire_pending(db, now)
+                        continue
+                    if row["start_at"] is not None and row["start_at"] > now:
+                        continue
                 control = db.execute("SELECT * FROM controls WHERE job=?", (row["id"],)).fetchone()
                 if control and control["next_attempt"] > time.time():
                     continue
@@ -238,6 +314,14 @@ class Store:
                 takeover = row["kind"] == "rollback" and held and held[0] == row["parent"]
                 if held and held[0] != row["id"] and not takeover:
                     continue
+                now = time.time()
+                if (
+                    row["started_at"] is None
+                    and row["latest_start_at"] is not None
+                    and row["latest_start_at"] < now
+                ):
+                    self.expire_pending(db, now)
+                    continue
                 if takeover:
                     source = db.execute("SELECT status FROM jobs WHERE id=?", (row["parent"],)).fetchone()
                     if source[0] not in ("failed", "recovery_required", "manually_completed"):
@@ -255,8 +339,8 @@ class Store:
                     )
                 db.execute("INSERT OR REPLACE INTO locks VALUES (?,?)", (row["lock_key"], row["id"]))
                 db.execute(
-                    "UPDATE jobs SET status='running',worker=?,heartbeat=?,updated=? WHERE id=?",
-                    (worker, time.time(), time.time(), row["id"]),
+                    "UPDATE jobs SET status='running',worker=?,heartbeat=?,updated=?,started_at=coalesce(started_at,?) WHERE id=?",
+                    (worker, now, now, now, row["id"]),
                 )
                 chosen = row["id"]
                 break
@@ -300,7 +384,13 @@ class Store:
                 "INSERT INTO controls(job,next_attempt) VALUES (?,?) ON CONFLICT(job) DO UPDATE SET next_attempt=excluded.next_attempt",
                 (job, time.time() + 3 + (int(uuid.UUID(job)) % 3000) / 1000),
             )
-            db.execute("UPDATE jobs SET status='queued',worker=NULL,heartbeat=NULL WHERE id=?", (job,))
+            # A reservation-only attempt has not begun work. Keep the original start on review continuations.
+            db.execute(
+                """UPDATE jobs SET status='queued',worker=NULL,heartbeat=NULL,
+                started_at=CASE WHEN EXISTS(SELECT 1 FROM controls WHERE job=? AND continuation IS NOT NULL)
+                THEN started_at ELSE NULL END WHERE id=?""",
+                (job, job),
+            )
             db.execute("DELETE FROM locks WHERE job=?", (job,))
             db.execute("DELETE FROM resources WHERE job=?", (job,))
         raise Deferred()
@@ -324,6 +414,7 @@ class Store:
     def reap(self, seconds):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self.expire_pending(db, time.time())
             stale = db.execute(
                 "SELECT id,kind,result FROM jobs WHERE kind IN ('snmp_walk','cipher_scan') AND status='running' AND heartbeat<?",
                 (time.time() - seconds,),
@@ -493,9 +584,12 @@ class Store:
             )
 
     def create_batch(self, batch, key, lock_key):
-        payload = batch.model_dump_json()
+        payload = batch.model_dump_json(
+            exclude={key for key in ("start_at", "latest_start_at") if getattr(batch, key) is None}
+        )
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self.expire_pending(db, time.time())
             if key:
                 old = db.execute("SELECT * FROM batches WHERE key=?", (key,)).fetchone()
                 if old:
@@ -508,16 +602,28 @@ class Store:
             ordinal = 0
             for wave in batch.waves:
                 for ip in wave.ips:
-                    request = batch.request_for(ip).model_dump(mode="json")
+                    request, start_at, latest_start_at = self.scheduled_request(
+                        batch.request_for(ip).model_dump(mode="json")
+                    )
                     job = str(uuid.uuid4())
                     db.execute(
-                        "INSERT INTO jobs(id,device,lock_key,kind,request,status,created,updated) VALUES (?,?,?,'upgrade',?,'queued',?,?)",
-                        (job, ip, lock_key(ip), json.dumps(request), now + ordinal * 0.000001, now),
+                        "INSERT INTO jobs(id,device,lock_key,kind,request,status,created,updated,start_at,latest_start_at) VALUES (?,?,?,'upgrade',?,'queued',?,?,?,?)",
+                        (
+                            job,
+                            ip,
+                            lock_key(ip),
+                            json.dumps(request),
+                            now + ordinal * 0.000001,
+                            now,
+                            start_at,
+                            latest_start_at,
+                        ),
                     )
                     db.execute(
                         "INSERT INTO batch_members VALUES (?,?,?,?)", (job, batch_id, wave.wave, ordinal)
                     )
                     ordinal += 1
+            self.expire_pending(db, now)
             return self._batch(db, batch_id)
 
     def _batch(self, db, batch):
@@ -527,11 +633,12 @@ class Store:
         jobs = [
             dict(r)
             for r in db.execute(
-                "SELECT j.id,j.device,j.status,j.result,m.wave,m.ordinal FROM jobs j JOIN batch_members m ON m.job=j.id WHERE m.batch=? ORDER BY m.ordinal",
+                "SELECT j.id,j.device,j.status,j.result,j.start_at,j.latest_start_at,j.started_at,m.wave,m.ordinal FROM jobs j JOIN batch_members m ON m.job=j.id WHERE m.batch=? ORDER BY m.ordinal",
                 (batch,),
             )
         ]
         for job in jobs:
+            self.schedule_metadata(job)
             job["result"] = json.loads(job["result"])
         done = all(
             j["status"] in ("succeeded", "completed_with_warnings", "manually_completed") for j in jobs
@@ -555,12 +662,15 @@ class Store:
             "waves": waves,
             "id": batch,
             "name": json.loads(row["request"])["name"],
+            "start_at": json.loads(row["request"]).get("start_at"),
+            "latest_start_at": json.loads(row["request"]).get("latest_start_at"),
             "status": "completed"
             if done
             else (
                 "needs_attention"
                 if any(
-                    j["status"] in ("needs_review", "failed", "recovery_required", "cancelled", "resolved")
+                    j["status"]
+                    in ("needs_review", "failed", "recovery_required", "cancelled", "resolved", "expired")
                     for j in jobs
                 )
                 else "in_progress"

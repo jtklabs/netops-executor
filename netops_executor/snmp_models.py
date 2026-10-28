@@ -4,7 +4,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, IPvAnyAddress, field_validator, model_validator
 
-from .models import Model, Name
+from .models import Model, Name, ScheduledRequest
 
 EnvName = Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$", max_length=128)]
 
@@ -30,7 +30,7 @@ class SnmpProfile(Model):
         return self
 
 
-class SnmpWalkRequest(Model):
+class SnmpWalkRequest(ScheduledRequest):
     device_ip: IPvAnyAddress
     oids: list[str] = Field(min_length=1, max_length=64)
     profile: Name | None = None

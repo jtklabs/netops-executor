@@ -64,11 +64,92 @@ A conflicting reuse returns `409`. Invalid input is `422`, missing resources
 values so malformed credential requests do not echo passwords.
 
 Terminal job states are `succeeded`, `completed_with_warnings`, `failed`,
-`cancelled`, `recovery_required`, `resolved` and `manually_completed`.
+`cancelled`, `expired`, `recovery_required`, `resolved` and `manually_completed`.
 `needs_review` waits for an operator decision; it is not completion.
 `queued` and `running` need continued polling. A terminal state may still hold
 reservations: inspect `lock_held`. Batch `needs_attention` requires action on its
 items; `completed` means every item passed its wave barrier.
+
+## Job start windows
+
+Every job submission accepts optional `start_at` and `latest_start_at`, including
+F5 jobs, rollback requests, SSH commands, HTTP requests, SNMP walks and cipher
+scans. For example, `POST /api/v1/cipher-scans`:
+
+```json
+{
+  "device_ip": "192.0.2.10",
+  "protocol": "https",
+  "port": 8443,
+  "start_at": "2026-11-01T02:00:00Z",
+  "latest_start_at": "2026-11-01T04:00:00Z"
+}
+```
+
+- `start_at` is the earliest allowed start. Omitted, null or in the past means
+  eligible as soon as a worker and the required resources are available.
+- `latest_start_at` is the latest allowed start, inclusive. Omitted or null means
+  no start deadline. If an unstarted job misses it, the job becomes `expired`,
+  with `result.error_code: "start_window_expired"` and an event of the same name.
+  A request with an already-past deadline is accepted as an expired job and never
+  dispatched. Past `start_at` alone does not expire a job.
+- Use ISO 8601 timestamps with `Z` or an explicit UTC offset, such as
+  `2026-11-01T02:00:00-05:00`. The API normalizes them to UTC. Dates without a time,
+  timezone-free timestamps and numeric Unix inputs are rejected. If both are
+  supplied, `latest_start_at` must be at or after `start_at`; otherwise `422`.
+
+These are queue admission windows, not execution or completion deadlines.
+Workers poll for eligible jobs; exact-time dispatch is not guaranteed. A future
+job stays `queued`, holds no device reservation and does not block other ready
+jobs. At claim, the worker admits the job and records `started_at` as Unix
+seconds, matching the existing `created`/`updated` format. Jobs also expose the
+normalized `start_at` and `latest_start_at` at the response top level. Start
+windows are checked atomically with worker claims and persist across restarts.
+A reservation attempt that defers before work clears `started_at` and is subject
+to the window again. F5 HA discovery can occur during that attempt. Actual
+commands and reboot may occur later within an admitted workflow.
+
+Once started, crossing `latest_start_at` does not cancel or interrupt a job.
+An operator's manual-validation continuation retains the original start and can
+resume after the deadline. Runtime timeout and cancellation controls continue to
+apply separately. An expired job can be marked manually done using the existing
+endpoint; to actually run it, submit a new job/window with a new idempotency key.
+Repeating the original request/key returns its original job, including expiry.
+
+For an upgrade batch, put a shared window at the top level:
+
+```json
+{
+  "name": "maintenance-window",
+  "start_at": "2026-11-01T02:00:00Z",
+  "latest_start_at": "2026-11-01T06:00:00Z",
+  "defaults": {"create_ucs": true},
+  "overrides": {
+    "192.0.2.20": {"start_at": "2026-11-01T03:00:00Z"}
+  },
+  "waves": [
+    {"wave": 1, "upgrade_at_a_time": 1, "ips": ["192.0.2.10"]},
+    {"wave": 2, "upgrade_at_a_time": 1, "ips": ["192.0.2.20"]}
+  ]
+}
+```
+
+The shared window applies to **each device job**, including later waves.
+`defaults` and per-IP `overrides` can set individual windows, but cannot widen
+the batch window: the effective earliest start is the later time and the
+effective deadline is the earlier time. Empty intersections are rejected.
+The normal wave barriers, concurrency limits and HA reservations still apply.
+An expired item makes the batch `needs_attention` and blocks later waves until
+that item is explicitly marked done; expiry never silently counts as success.
+
+Swagger includes the fields on each submission schema. The CLI `plan`, `submit`
+and `rollback` commands accept `--start-at` and `--latest-start-at`; JSON requests
+use the same fields. Upgrading from an older release adds nullable scheduling
+columns without replacing jobs or credentials. Unscheduled jobs keep their
+existing behavior. For legacy jobs already started or completed, `started_at`
+is backfilled from `created` because the exact historical start was not stored.
+Deploy API and workers together using the existing stop/drain deployment flow;
+older workers do not enforce start windows.
 
 ## SSH and HTTPS cipher scans
 

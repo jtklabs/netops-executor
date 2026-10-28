@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from .models import JobRequest, Model, Name
+from .models import JobRequest, Model, Name, ScheduledRequest
 from .platforms import DeviceType
 
 
@@ -14,7 +14,7 @@ class SSHCommand(Model):
     timeout_seconds: int = Field(default=120, ge=1, le=7200)
 
 
-class SSHJob(Model):
+class SSHJob(ScheduledRequest):
     device_type: DeviceType | None = None
     enable: bool = False
     job_timeout: int = Field(default=7200, ge=1, le=86400)
@@ -56,7 +56,7 @@ class HTTPRequest(Model):
         return self
 
 
-class HTTPJob(Model):
+class HTTPJob(ScheduledRequest):
     job_timeout: int = Field(default=7200, ge=1, le=86400)
     parent_job_id: str | None = Field(default=None, max_length=36)
     target: Name
@@ -76,7 +76,7 @@ class Wave(Model):
         return [str(ip_address(v)) for v in values]
 
 
-class Batch(Model):
+class Batch(ScheduledRequest):
     name: str = Field(min_length=1, max_length=160)
     defaults: dict = Field(default_factory=dict)
     overrides: dict[str, dict] = Field(default_factory=dict)
@@ -98,7 +98,16 @@ class Batch(Model):
         return self
 
     def request_for(self, ip):
-        return JobRequest.model_validate({**self.defaults, **self.overrides.get(ip, {}), "device": ip})
+        request = JobRequest.model_validate({**self.defaults, **self.overrides.get(ip, {}), "device": ip})
+        starts = [value for value in (self.start_at, request.start_at) if value is not None]
+        deadlines = [value for value in (self.latest_start_at, request.latest_start_at) if value is not None]
+        return JobRequest.model_validate(
+            {
+                **request.model_dump(),
+                "start_at": max(starts) if starts else None,
+                "latest_start_at": min(deadlines) if deadlines else None,
+            }
+        )
 
 
 class ValidationDecision(Model):

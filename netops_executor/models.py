@@ -1,7 +1,16 @@
+from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 Name = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$")]
 Version = Annotated[str, Field(pattern=r"^\d+(?:\.\d+){1,5}$")]
@@ -10,6 +19,49 @@ Volume = Annotated[str, Field(pattern=r"^(?:HD|MD)\d+\.\d+$")]
 
 class Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class ScheduledRequest(Model):
+    start_at: AwareDatetime | None = Field(
+        default=None,
+        description="Earliest start (ISO 8601 with Z or a UTC offset). Omitted, null or past means eligible immediately; normal queue and resource limits still apply.",
+        examples=["2026-11-01T02:00:00Z"],
+    )
+    latest_start_at: AwareDatetime | None = Field(
+        default=None,
+        description="Latest allowed start, inclusive (ISO 8601 with timezone). An unstarted queued job past this time becomes expired. Does not interrupt a started job or its manual-validation continuation.",
+        examples=["2026-11-01T04:00:00Z"],
+    )
+
+    @field_validator("start_at", "latest_start_at", mode="before")
+    @classmethod
+    def explicit_timestamp(cls, value):
+        if value is not None and not isinstance(value, datetime):
+            if not isinstance(value, str) or "T" not in value.upper():
+                raise ValueError("use an ISO 8601 timestamp with time and timezone")
+        return value
+
+    @field_validator("start_at", "latest_start_at")
+    @classmethod
+    def utc_timestamp(cls, value):
+        try:
+            return value.astimezone(timezone.utc) if value is not None else None
+        except (OverflowError, ValueError):
+            raise ValueError("timestamp is outside the supported UTC range") from None
+
+    @field_serializer("start_at", "latest_start_at")
+    def serialize_timestamp(self, value):
+        return value.isoformat().replace("+00:00", "Z") if value is not None else None
+
+    @model_validator(mode="after")
+    def ordered_window(self):
+        if (
+            self.start_at is not None
+            and self.latest_start_at is not None
+            and self.start_at > self.latest_start_at
+        ):
+            raise ValueError("latest_start_at must be at or after start_at")
+        return self
 
 
 class Image(Model):
@@ -58,7 +110,7 @@ class AdminPasswordPolicy(Model):
         return self
 
 
-class JobRequest(Model):
+class JobRequest(ScheduledRequest):
     device: str = Field(min_length=1, max_length=253)
     credential_profiles: list[Name] | None = Field(default=None, min_length=1, max_length=10)
     ucs_credential: Name | None = None
@@ -157,7 +209,7 @@ class JobRequest(Model):
         return steps
 
 
-class RollbackRequest(Model):
+class RollbackRequest(ScheduledRequest):
     worker_stopped: bool = False
     reboot_timeout: int = Field(default=900, ge=60, le=7200)
     validation_timeout: int = Field(default=600, ge=0, le=86400)

@@ -8,7 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from pydantic import Field
+from pydantic import AwareDatetime, Field
 
 from . import __version__
 from .cipher_models import CipherScanRequest, CipherScanResult
@@ -31,6 +31,7 @@ class JobResponse(Model):
     request: dict
     status: Literal[
         "queued",
+        "expired",
         "running",
         "succeeded",
         "failed",
@@ -45,6 +46,12 @@ class JobResponse(Model):
     updated: float
     worker: str | None
     heartbeat: float | None
+    start_at: AwareDatetime | None = None
+    latest_start_at: AwareDatetime | None = None
+    started_at: float | None = Field(
+        default=None,
+        description="First admitted worker start as Unix seconds; null while not started. Resource deferral before work clears it; continuations preserve it.",
+    )
     result: dict
     idempotency_key: str | None
     credential_usage: list[dict] = Field(default_factory=list)
@@ -65,6 +72,9 @@ class BatchItem(Model):
     result: dict
     wave: int
     ordinal: int
+    start_at: AwareDatetime | None = None
+    latest_start_at: AwareDatetime | None = None
+    started_at: float | None = None
 
 
 class BatchResponse(Model):
@@ -75,6 +85,8 @@ class BatchResponse(Model):
     jobs: list[BatchItem]
     waves: list[dict]
     status_url: str
+    start_at: AwareDatetime | None = None
+    latest_start_at: AwareDatetime | None = None
 
 
 class CredentialMetadata(Model):
@@ -400,6 +412,7 @@ def create_app(settings=None):
 
     @app.get("/api/v1/upgrade-batches", dependencies=authenticated, response_model=list[BatchResponse])
     def batches(limit: int = Query(default=50, ge=1, le=500)):
+        store.reap(settings.stale_seconds)
         with store.connect() as db:
             return [
                 store._batch(db, row[0])
