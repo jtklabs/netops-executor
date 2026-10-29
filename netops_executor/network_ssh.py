@@ -19,6 +19,10 @@ CLI_ERROR = re.compile(
     r"(?im)^\s*(?:%\s*(?:invalid|incomplete|ambiguous|error|unknown|unrecognized|"
     r"authorization|access denied)|(?:syntax error|error:|invalid command))"
 )
+# A question the CLI is waiting on; dialogue() answers only the ones it was given.
+QUESTION = re.compile(
+    r"(?:\[y/n(?:/q)?\]|\[confirm\]|\[yes/no[^\]]*\]|\[[^\]\r\n]*\]\?|[Pp]assword:|[Uu]sername:)\s*[:?]?\s*$"
+)
 
 
 class GuardedChannel(SSHChannel):
@@ -127,6 +131,63 @@ class NetworkSSH(SSH):
             raise
         finally:
             self.operation_deadline = None
+
+    def dialogue(self, command, replies, timeout, *, progress=None, disconnect_ok=False):
+        """Send one command and answer only recognized questions until the prompt returns.
+
+        `replies` pairs a pattern for a question at the end of the unanswered output with
+        its answer; any other question stops the dialogue. With disconnect_ok a dropped
+        session (a reload) ends it, and the caller verifies the outcome from fresh reads.
+        Returns (output, disconnected). The command is sent once and never retried.
+        """
+        driver = self.connect()
+        self.output_bytes = 0
+        self.operation_deadline = time.monotonic() + timeout
+        output, answered, disconnected = "", 0, False
+        try:
+            self.check()
+            driver.enable()
+            driver.exit_config_mode()
+            prompt = driver.find_prompt().strip()
+            driver.write_channel(command + driver.RETURN)
+            while True:
+                try:
+                    chunk = driver.read_channel()
+                except (OSError, EOFError):
+                    chunk = None
+                if chunk is None or (not chunk and not self.alive()):
+                    if not disconnect_ok:
+                        raise DeviceError("network CLI session disconnected during " + command.split()[0])
+                    disconnected = True
+                    break
+                output += chunk
+                tail = output[answered:]
+                if chunk and progress:
+                    lines = [line.strip() for line in output.splitlines() if line.strip()]
+                    progress(self.selector.redact(lines[-1])[:200] if lines else "")
+                reply = next((answer for pattern, answer in replies if pattern.search(tail)), None)
+                if reply is not None:
+                    driver.write_channel(reply + driver.RETURN)
+                    answered = len(output)
+                elif QUESTION.search(tail):
+                    raise DeviceError("unrecognized prompt during " + command.split()[0])
+                elif re.search(r"\n" + re.escape(prompt) + r"\s*$", output):
+                    break
+                elif not chunk:
+                    time.sleep(0.5)
+        except Exception:
+            self.close()
+            raise
+        finally:
+            self.operation_deadline = None
+        if disconnected:
+            self.close()
+        return self.selector.redact(output), disconnected
+
+    def alive(self):
+        transport = self.client.get_transport() if self.client else None
+        channel = self.driver.remote_conn if self.driver else None
+        return bool(transport and transport.is_active() and channel is not None and not channel.closed)
 
     def close(self):
         driver, self.driver = self.driver, None

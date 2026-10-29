@@ -27,25 +27,35 @@ RESTORED = {
 }
 
 
-def compare(baseline, current, policy):
-    """Critical failures, reportable differences and metrics for two traffic snapshots."""
+def compare(baseline, current, policy, restored=RESTORED, counts=COUNTS, informational=()):
+    """Critical failures, reportable differences and metrics for two traffic snapshots.
+
+    Count categories must stay at their policy minimum, restored categories must bring back
+    every object that carried traffic, informational ones only report changes, and every
+    other category is compared object by object.
+    """
     critical, findings, metrics = [], [], {}
     skipped = set(baseline.get("gaps", []))
-    for category in ("interfaces", "lldp", "bgp_peers", "ospf_neighbors", "port_channels", *COUNTS):
+    for category in [c for c in baseline if c != "gaps"]:
         if category in skipped:
             continue
         if category in current.get("gaps", []):
             critical.append(category + " could not be collected after the upgrade")
             continue
         before, after = baseline[category], current[category]
-        if category in COUNTS:
-            minimum = getattr(policy, COUNTS[category])
+        if category in counts:
+            minimum = getattr(policy, counts[category])
             percent = 100 * after / before if before else 100
             metrics[category + "_percent"] = round(percent, 1)
             if minimum is not None and percent < minimum:
                 critical.append(f"{category} count {after} is below {minimum}% of {before}")
             continue
-        up = RESTORED.get(category)
+        if category in informational:
+            changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+            if changed:
+                findings.append({"category": category, "change": "state changed", "objects": changed[:100]})
+            continue
+        up = restored.get(category)
 
         def lost_object(key, value):
             if up:

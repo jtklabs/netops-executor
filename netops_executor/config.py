@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from ipaddress import ip_address
 from pathlib import Path
@@ -86,6 +87,8 @@ class Settings:
     firewall_ca_file: Path | None = None
     # "pin" trusts an SSH host key missing from known_hosts on first use, then only that key.
     ssh_host_keys: str = "known_hosts"
+    # Path prefix a reverse proxy publishes the API under, such as /netops-executor.
+    root_path: str = ""
 
     def device(self, identifier):
         if identifier in self.devices:
@@ -122,6 +125,9 @@ class Settings:
             if len({p.id for p in profiles}) != len(profiles):
                 raise ValueError("duplicate SNMP profile IDs")
             result.snmp_profiles = {p.id: p for p in profiles}
+        result.root_path = env("NETOPS_ROOT_PATH", "").rstrip("/")
+        if result.root_path and not re.fullmatch(r"(?:/[A-Za-z0-9._~-]+)+", result.root_path):
+            raise ValueError("NETOPS_ROOT_PATH must be a path such as /netops-executor")
         result.ssh_host_keys = env("NETOPS_SSH_HOST_KEYS", "known_hosts")
         if result.ssh_host_keys not in ("known_hosts", "pin"):
             raise ValueError("NETOPS_SSH_HOST_KEYS must be known_hosts or pin")

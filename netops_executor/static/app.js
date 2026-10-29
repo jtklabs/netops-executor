@@ -36,7 +36,7 @@ async function api(path, method = "GET", body, key) {
     "Content-Type": "application/json",
   };
   if (key) headers["Idempotency-Key"] = key;
-  const r = await fetch("/api/v1/" + path, {
+  const r = await fetch("api/v1/" + path, {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -305,7 +305,7 @@ $("rollback").onclick = async () => {
 };
 $("backup").onclick = async () => {
   try {
-    const r = await fetch("/api/v1/jobs/" + selected + "/backup", {
+    const r = await fetch("api/v1/jobs/" + selected + "/backup", {
       headers: { Authorization: "Bearer " + token },
     });
     if (!r.ok) throw new Error("Backup download failed");
@@ -392,6 +392,37 @@ const examples = {
     target_version: "4.32.2F",
     allowed_source_versions: ["4.30.5M"],
     image: { name: "EOS-4.32.2F.swi", sha256: "REPLACE_WITH_SHA256" },
+  },
+  "iosxe/upgrade-batches": {
+    name: "Change790",
+    defaults: {
+      target_version: "17.12.6",
+      allowed_source_versions: ["17.9.5", "17.12.4"],
+      image: {
+        name: "cat9k_iosxe.17.12.06.SPA.bin",
+        sha256: "REPLACE_WITH_SHA256",
+      },
+      config_policy: {
+        ignore: [{ name: "site-exec-banner", line: "^banner exec " }],
+        removed: "warn",
+      },
+    },
+    overrides: { "192.0.2.41": { peers: ["192.0.2.42"] } },
+    waves: [
+      { wave: 1, upgrade_at_a_time: 1, devices: ["192.0.2.41"] },
+      { wave: 2, upgrade_at_a_time: 10, devices: ["192.0.2.42", "192.0.2.43"] },
+    ],
+  },
+  "iosxe/jobs": {
+    device: "192.0.2.41",
+    target_version: "17.12.6",
+    allowed_source_versions: ["17.9.5"],
+    image: { name: "cat9k_iosxe.17.12.06.SPA.bin", sha256: "REPLACE_WITH_SHA256" },
+  },
+  "iosxe/config-compare": {
+    before: "PASTE show running-config FROM BEFORE THE UPGRADE",
+    after: "PASTE show running-config FROM AFTER THE UPGRADE",
+    config_policy: { ignore: [], rewrite: [] },
   },
   "ssh/jobs": {
     device: "192.0.2.10",

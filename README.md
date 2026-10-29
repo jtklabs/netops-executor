@@ -2,8 +2,9 @@
 
 A standalone remote for a central controller, with a versioned API, web console,
 CLI and durable SQLite queue. It runs F5 upgrades over **SSH/SFTP only**, PAN-OS
-firewall upgrades through **Panorama's XML API**, Arista EOS switch upgrades over
-**SSH**, arbitrary SSH commands, HTTPS
+firewall upgrades through **Panorama's XML API**, Arista EOS and Cisco IOS XE
+(Catalyst 9300, 9350, 3650 and 3850) switch upgrades over **SSH**, arbitrary SSH
+commands, HTTPS
 requests (including Panorama requests targeting a firewall), asynchronous SNMP v3
 walks, and Nmap SSH/HTTPS cipher scans. It has no NetBox dependency.
 
@@ -39,6 +40,10 @@ keeps the token only in tab memory and uses the same API.
 | POST | `/api/v1/eos/plan` | Normalize an Arista EOS upgrade and show its steps without device access |
 | POST | `/api/v1/eos/jobs` | Queue one Arista EOS switch upgrade |
 | POST | `/api/v1/eos/upgrade-batches` | Queue ordered EOS waves by inventory ID or IP with per-wave concurrency |
+| POST | `/api/v1/iosxe/plan` | Normalize a Cisco IOS XE upgrade and show its steps without device access |
+| POST | `/api/v1/iosxe/jobs` | Queue one Cisco IOS XE switch or stack upgrade |
+| POST | `/api/v1/iosxe/upgrade-batches` | Queue ordered IOS XE waves by inventory ID or IP with per-wave concurrency |
+| POST | `/api/v1/iosxe/config-compare` | Compare two running configurations the way IOS XE validation does |
 | POST | `/api/v1/ssh/jobs` | Queue one or more SSH commands |
 | POST | `/api/v1/http/jobs` | Queue one or more HTTPS requests |
 | GET | `/api/v1/http/targets` | Configured HTTP targets |
@@ -919,6 +924,152 @@ release and boot image, which stays on flash: recovery is
 switches and canned EOS JSON only; lab acceptance on your EOS releases is required,
 especially for the `| json` fields, SCP to `/mnt/flash` and the install reload.
 
+## Cisco IOS XE upgrades
+
+IOS XE jobs upgrade a Catalyst C9300 (including C9300L/C9300X), C9350, WS-C3650 or
+WS-C3850 switch or stack over the same audited SSH session as `cisco_ios` SSH jobs.
+The upgrade is install mode's one-shot `install add file flash:<image> activate commit`,
+which copies the image to every stack member, activates it, reloads and commits. The
+only boot change ever made is `boot system flash:packages.conf`, which install mode
+requires.
+
+```json
+{
+  "name": "Change790",
+  "defaults": {
+    "target_version": "17.12.6",
+    "allowed_source_versions": ["17.9.5", "17.12.4"],
+    "image": {"name": "cat9k_iosxe.17.12.06.SPA.bin", "sha256": "REPLACE_WITH_SHA256",
+              "sha512": "CISCO_PUBLISHED_SHA512"},
+    "config_policy": {"removed": "warn"},
+    "validation_policy": {"on_timeout": "needs_review"}
+  },
+  "overrides": {"idf1-a": {"peers": ["idf1-b"]}},
+  "waves": [
+    {"wave": 1, "upgrade_at_a_time": 1, "devices": ["idf1-a"]},
+    {"wave": 2, "upgrade_at_a_time": 20, "devices": ["idf1-b", "idf2", "idf3"]}
+  ]
+}
+```
+
+Send this to `/api/v1/iosxe/upgrade-batches`, or one request with `"device"` to
+`/api/v1/iosxe/jobs`. Devices are inventory IDs or management IPs; an inventory entry
+must be `cisco_ios` (or untyped). Use one batch per platform family, because each
+family has its own image package.
+
+| Option | Behavior/default |
+| --- | --- |
+| `target_version`, `image` | Target release (`17.12.6` and `17.12.06` are equal) and its `.bin`: `name` (its release must match the target), `sha256` of the executor's copy, optional Cisco-published `sha512` or `md5`, `verify` (`sha512` default, or `md5`), HTTPS `source_url` for the executor and `device_url` for the switch |
+| `allowed_source_versions` | Required running-release allowlist; a stack already on the target in INSTALL mode only validates |
+| `approved_models` | Optional exact `show version` model allowlist (3650/3850 `show version` omits the -L/-S/-E license suffix) |
+| `peers` | Inventory IDs or IPs reserved for the whole job, so HSRP partners or redundant uplink switches never reload at the same time |
+| `stage_only` | Preload: copy and verify the image only (with `remove_inactive` when needed); no backups, saves, boot changes or install |
+| `tech_support` | Default true: save `show tech-support` under `NETOPS_BACKUP_ROOT` (`iosxe/<device>`). The running configuration is always saved there, because validation compares with it |
+| `save_config` | Default true: `write memory` when running and startup configuration differ before the upgrade; false stops instead |
+| `save_after_validation` | Default true: `write memory` after validation, so startup-config uses the new release's syntax. Skipped when configuration lines were removed |
+| `remove_inactive` | Default true: `install remove inactive` before the copy when inactive packages exist or flash is short. It also deletes unused `.bin` files, so it never runs after the copy |
+| `allow_bundle_conversion` | Default false: a BUNDLE-mode switch stops; true lets the install convert it to INSTALL mode |
+| `config_policy` | How the post-upgrade configuration is compared (below) |
+| `minimum_free_bytes` | Flash kept free on every member beyond the image, for package expansion; default 1,500,000,000 |
+| `upload_timeout`, `install_timeout`, `reboot_timeout`, `validation_timeout` | Defaults 5400, 3600, 2700 and 1200 seconds |
+
+Steps: reserve the switch and `peers` (the same keys every job takes for those devices);
+prechecks; baseline; tech support; image copy and checksum; `write memory` if needed;
+`boot system flash:packages.conf` if missing; a recheck that release, stack membership,
+install state and configuration are unchanged; the install; a wait until every original
+member is back on the target in INSTALL mode, Ready, with a fresh uptime; settling
+(`settling_seconds`, default 180); system and configuration validation; traffic
+validation; and the final `write memory`.
+
+Prechecks refuse: a member that is not Ready or disagrees between `show version` and
+`show switch`; mixed releases or boot modes; hardware outside one supported family or
+`approved_models`; an image package for another family (`cat9k_iosxe` for C9300,
+`cisco9k_iosxe` or `cisco9k_iosxe_npe` for C9350, `cat3k_caa-universalk9` or its `ldpe`
+variant for 3650/3850); a release outside the one-shot install range (C9300 16.6.2 or
+later, C9350 17.18.1 or later and 26.1.1a for the C9350-24HX and C9350-48HXN, 3650/3850
+16.8.1a through 16.12.x); a C9350 stack going from 17.18.1 to 17.18.3 (Cisco CSCwt90927
+can corrupt the primary ROMMON); uncommitted install state or an active auto-abort timer;
+and a committed image that does not match the running release on every member.
+
+The image comes from the executor over SCP on the job's own SSH session (the switch needs
+`ip scp server enable`), with byte progress in `result.progress`. With `image.device_url`
+the switch copies it itself (`copy <url> flash:<image>`); when the switch answers that
+the copy failed, the partial file is deleted and the executor pushes the image instead.
+A copy that times out is never retried. The switch then runs `verify /sha512` (or
+`/md5`) against the published checksum or the executor's verified copy, and every member
+must keep `minimum_free_bytes` free.
+
+The install runs as one bounded dialogue that answers only the reload, save-configuration
+and packages.conf questions IOS XE asks; any other question stops the job. The latest
+installer line is reported as `result.progress.operation.status`, so pollers see the add,
+activate and reload phases. The command is sent once; a dropped session is expected, and
+only a fresh boot of every member on the target proves the outcome.
+
+### Configuration comparison across releases
+
+A new IOS XE release re-renders the same configuration, so a text diff fails nearly every
+upgrade. Validation instead canonicalizes the baseline and post-upgrade running
+configurations the same way and compares them as a tree:
+
+- Metadata above `version`, comments, boot lines, certificate bodies and whitespace are
+  dropped. Banners compare as one line.
+- Order is ignored everywhere except where it is semantic: the entries of IPv4, IPv6 and
+  MAC access lists and the classes of a policy map stay ordered.
+- Numbered access lists (`access-list 10 permit ...`) and their `ip access-list standard
+  10` form are the same list, and access-list sequence numbers are ignored while the
+  entry order is still compared.
+- Built-in rewrites map `ip domain-name`, `ip domain-lookup` and `ip domain-list` to
+  `ip domain name|lookup|list`.
+- Built-in ignores drop sections the switch generates itself: the `system-cpp-*` control
+  plane class maps and policy, the `SLA-TrustPoint` trustpoint and chain, `service
+  call-home` and `call-home`, `license smart` lines, the default `service-template`s,
+  `interface AppGigabitEthernet*` and `memory free low-watermark processor`.
+
+Whatever remains is reported as removed or added lines, each with its parent path, such
+as `interface GigabitEthernet1/0/1 > spanning-tree portfast`. `result.config_comparison`
+holds the counts, the first 50 lines of each with secrets masked, and the `tolerated`
+list: each rule that hid a difference, with before and after counts, and the sections
+whose order alone changed. The full unmasked differences and the post-upgrade
+configuration are private files next to the baseline (`config_differences` artifact).
+
+| `config_policy` | Behavior/default |
+| --- | --- |
+| `removed`, `added` | `warn` (default; the job ends `completed_with_warnings`), `critical` (validation does not pass, so the job waits for review or fails per `on_timeout`) or `ignore` |
+| `rewrite` | Extra `{"name", "line", "parent", "replace"}` rules applied to both configurations: `line` is a regex for a canonical line, `parent` limits it to children of a matching parent line, `replace` may use `\1` |
+| `ignore` | Extra `{"name", "line", "parent"}` rules; a matching line is dropped with its children on both sides |
+| `ordered_sections` | Extra parent-line regexes whose children are compared in order |
+| `builtin_rules` | Default true; false compares with only your rules |
+
+To tune rules, post a configuration from before and after an upgrade you have already
+done to `/api/v1/iosxe/config-compare` (`{"before": ..., "after": ..., "config_policy":
+{...}}`, or `netops-executor request --kind iosxe-config-compare`). It returns exactly
+what validation would report, contacts no device and stores nothing. Add each
+difference you accept as a rule in the batch defaults.
+
+System validation requires every original member on the target in INSTALL mode and
+Ready, the same models and serial numbers, the target committed on every member, and
+`boot system flash:packages.conf`; then the configuration comparison runs. Traffic
+validation compares the baseline: with `restore_required` (default), every interface that
+was up/up, every CDP and LLDP neighbor (same device and port), every Established BGP
+peer, every FULL OSPF neighbor and every bundled port-channel member must recover; routes
+(default VRF plus each IPv4 VRF) must stay at `min_route_percent` (90); MAC, ARP and
+802.1X/MAB session counts fail only an explicit `min_mac_percent`, `min_arp_percent` or
+`min_access_session_percent`; HSRP state changes are reported as warnings. A category
+that cannot be read before the upgrade is a gap and is never compared. Gates, decisions
+and timeouts work as for PAN-OS (`validate_system`, `validate_traffic`,
+`validate_current`).
+
+Failures before the install end `failed` with nothing changed beyond a removed inactive
+package set, a copied image, a saved configuration and, on an INSTALL-mode switch, a
+corrected boot variable. Once the install is sent, a failure ends `recovery_required`
+and keeps the reservations; so does a failure after the boot variable was changed on a
+BUNDLE-mode switch. `result.rollback` records the previous release and mode. Recovery
+uses the switch's own rollback points (`show install rollback`, then `install rollback
+to id <n>`), or a new job to the previous release. IOS XE upgrades are tested against
+simulated stacks and canned IOS XE output only; lab acceptance on your hardware and
+releases is required, especially for the table parsers, SCP to `flash:`, the install
+dialogue and the configuration rules.
+
 ## Generic SSH and HTTP jobs
 
 ```json
@@ -1233,6 +1384,12 @@ docker compose up -d --scale worker=3
 ```
 
 Use an HTTPS reverse proxy for central API access; default bind is loopback.
+To publish it under a path such as `https://<server>/netops-executor/`, set
+`NETOPS_ROOT_PATH=/netops-executor` and restart the API, so `/docs` and batch
+`status_url` values carry the prefix; the console already uses relative links.
+`deploy/apache-netops-executor.conf` is a tested Apache httpd 2.4 configuration for
+that layout. The proxy may strip the prefix or pass it through, and direct requests to
+the listener (health checks, the CLI on the host) keep working without it.
 Persist `data`, `backups`, and the external keyring. Do not use `down -v` if job
 history is needed. SELinux mounts use `:z` for sharing. Containers run as UID 10001.
 
@@ -1252,6 +1409,9 @@ netops-executor request --kind panos-batch --file panos-batch.json --idempotency
 netops-executor request --kind panos --file panos-upgrade.json
 netops-executor request --kind eos-batch --file eos-batch.json --idempotency-key change789
 netops-executor request --kind eos --file eos-upgrade.json
+netops-executor request --kind iosxe-batch --file iosxe-batch.json --idempotency-key change790
+netops-executor request --kind iosxe --file iosxe-upgrade.json
+netops-executor request --kind iosxe-config-compare --file before-after.json
 netops-executor credential-put ssh-local --file -       # JSON from stdin
 netops-executor job JOB_UUID
 netops-executor batch BATCH_UUID

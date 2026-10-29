@@ -16,6 +16,8 @@ from .config import Settings, under
 from .credentials import Credential, Vault
 from .eos_models import EosBatch, EosUpgradeRequest
 from .execution_models import Batch, HTTPJob, ManualCompletion, SSHJob, ValidationDecision
+from .iosxe_config import compare as compare_configs
+from .iosxe_models import ConfigComparison, IosxeBatch, IosxeUpgradeRequest
 from .models import JobRequest, Model, Name, RecoveryResolution, RollbackRequest
 from .panos_models import PanosBatch, PanosUpgradeRequest
 from .platforms import NETWORK_TYPES, validate_commands
@@ -29,7 +31,15 @@ class JobResponse(Model):
     lock_key: str
     lock_held: bool
     kind: Literal[
-        "upgrade", "rollback", "snmp_walk", "ssh", "http", "cipher_scan", "panos_upgrade", "eos_upgrade"
+        "upgrade",
+        "rollback",
+        "snmp_walk",
+        "ssh",
+        "http",
+        "cipher_scan",
+        "panos_upgrade",
+        "eos_upgrade",
+        "iosxe_upgrade",
     ]
     parent: str | None
     request: dict
@@ -84,7 +94,7 @@ class BatchItem(Model):
 
 class BatchResponse(Model):
     id: str
-    kind: Literal["upgrade", "panos_upgrade", "eos_upgrade"] = "upgrade"
+    kind: Literal["upgrade", "panos_upgrade", "eos_upgrade", "iosxe_upgrade"] = "upgrade"
     name: str
     status: Literal["completed", "needs_attention", "in_progress"]
     device_count: int
@@ -130,11 +140,24 @@ class EosPlanResponse(Model):
     lock_key: str
 
 
+class IosxePlanResponse(Model):
+    request: IosxeUpgradeRequest
+    steps: list[str]
+    lock_key: str
+
+
 def create_app(settings=None):
     os.umask(0o077)
     settings = settings or Settings.load()
     store = Store(settings.data_dir / "jobs.sqlite3")
-    app = FastAPI(title="NetOps Executor API", version=__version__, docs_url="/docs", redoc_url=None)
+    # Behind a reverse proxy at a sub-path, root_path makes /docs and status URLs include the prefix.
+    app = FastAPI(
+        title="NetOps Executor API",
+        version=__version__,
+        docs_url="/docs",
+        redoc_url=None,
+        root_path=settings.root_path,
+    )
     app.state.store = store
     vault = Vault(store, settings.credential_key_file)
     bearer = HTTPBearer(auto_error=False)
@@ -169,12 +192,19 @@ def create_app(settings=None):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Cache-Control"] = "no-store"
-        if request.url.path == "/" or request.url.path.startswith("/static/"):
+        # A proxy may or may not strip the prefix before forwarding.
+        path = request.scope["path"]
+        if settings.root_path and path.startswith(settings.root_path + "/"):
+            path = path[len(settings.root_path) :]
+        if path == "/" or path.startswith("/static/"):
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; "
                 "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
             )
         return response
+
+    def published(batch):
+        return {**batch, "status_url": settings.root_path + batch["status_url"]}
 
     def lock_key(device_id):
         try:
@@ -226,6 +256,23 @@ def create_app(settings=None):
             except ValueError:
                 raise HTTPException(422, "backup directory escapes BACKUP_ROOT") from None
         return EosPlanResponse(request=request, steps=request.plan(), lock_key=lock_key(request.device))
+
+    def iosxe_planned(request):
+        try:
+            device = settings.device(request.device)
+            peers = [settings.device(p) for p in request.peers]
+        except ValueError:
+            raise HTTPException(422, "device and peers must be inventory IDs or IP addresses") from None
+        if device.id in settings.devices and device.device_type not in ("linux", "cisco_ios"):
+            raise HTTPException(422, "device is not a cisco_ios device")
+        if any(p.id == device.id for p in peers):
+            raise HTTPException(422, "peers must be other devices")
+        if request.backup_directory:
+            try:
+                under(settings.backup_root, request.backup_directory)
+            except ValueError:
+                raise HTTPException(422, "backup directory escapes BACKUP_ROOT") from None
+        return IosxePlanResponse(request=request, steps=request.plan(), lock_key=lock_key(request.device))
 
     @app.get("/healthz")
     def healthz():
@@ -487,7 +534,7 @@ def create_app(settings=None):
         for wave in request.waves:
             for ip in wave.ips:
                 planned(request.request_for(ip))
-        return store.create_batch(request, idempotency_key, lock_key)
+        return published(store.create_batch(request, idempotency_key, lock_key))
 
     @app.get("/api/v1/upgrade-batches", dependencies=authenticated, response_model=list[BatchResponse])
     def batches(limit: int = Query(default=50, ge=1, le=500)):
@@ -501,7 +548,7 @@ def create_app(settings=None):
     @app.get("/api/v1/upgrade-batches/{batch_id}", dependencies=authenticated, response_model=BatchResponse)
     def batch_status(batch_id: str):
         store.reap(settings.stale_seconds)
-        return store.batch(batch_id)
+        return published(store.batch(batch_id))
 
     panos_tags = ["PAN-OS upgrades"]
 
@@ -549,8 +596,10 @@ def create_app(settings=None):
         for wave in request.waves:
             for serial in wave.serials:
                 panos_planned(request.request_for(serial))
-        return store.create_batch(
-            request, idempotency_key, lambda serial: "panos:" + serial, kind="panos_upgrade"
+        return published(
+            store.create_batch(
+                request, idempotency_key, lambda serial: "panos:" + serial, kind="panos_upgrade"
+            )
         )
 
     eos_tags = ["EOS upgrades"]
@@ -597,7 +646,65 @@ def create_app(settings=None):
         for wave in request.waves:
             for device in wave.devices:
                 eos_planned(request.request_for(device))
-        return store.create_batch(request, idempotency_key, lock_key, kind="eos_upgrade")
+        return published(store.create_batch(request, idempotency_key, lock_key, kind="eos_upgrade"))
+
+    iosxe_tags = ["IOS XE upgrades"]
+
+    @app.post(
+        "/api/v1/iosxe/plan",
+        dependencies=authenticated,
+        response_model=IosxePlanResponse,
+        tags=iosxe_tags,
+        summary="Normalize a Cisco IOS XE upgrade and show its steps without device access",
+    )
+    def iosxe_plan(request: IosxeUpgradeRequest):
+        return iosxe_planned(request)
+
+    @app.post(
+        "/api/v1/iosxe/jobs",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=JobResponse,
+        tags=iosxe_tags,
+        summary="Queue one Cisco IOS XE switch or stack upgrade over SSH",
+        description="Prechecks, image copy and checksum, install add file ... activate commit, stack verification and post-validation with release-tolerant configuration comparison run on a worker. Poll GET /api/v1/jobs/{job_id}. Supports Idempotency-Key.",
+    )
+    def iosxe_job(
+        request: IosxeUpgradeRequest,
+        idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
+    ):
+        p = iosxe_planned(request)
+        return store.submit(
+            request.model_dump(mode="json"), p.lock_key, idempotency_key, kind="iosxe_upgrade"
+        )
+
+    @app.post(
+        "/api/v1/iosxe/upgrade-batches",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=BatchResponse,
+        tags=iosxe_tags,
+        summary="Queue ordered waves of Cisco IOS XE upgrades",
+        description="Each wave starts only after every earlier item passed validation or was marked done. Put redundant switches in different waves or list them in peers so they never reload together.",
+    )
+    def iosxe_batch(
+        request: IosxeBatch,
+        idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
+    ):
+        for wave in request.waves:
+            for device in wave.devices:
+                iosxe_planned(request.request_for(device))
+        return published(store.create_batch(request, idempotency_key, lock_key, kind="iosxe_upgrade"))
+
+    @app.post(
+        "/api/v1/iosxe/config-compare",
+        dependencies=authenticated,
+        tags=iosxe_tags,
+        summary="Compare two IOS XE running configurations the way upgrade validation does",
+        description="Paste a pre- and post-upgrade show running-config to see what the built-in and your config_policy rules tolerate, and what would still be reported. Nothing is stored and no device is contacted.",
+    )
+    def iosxe_config_compare(request: ConfigComparison) -> dict:
+        return compare_configs(request.before, request.after, request.config_policy)
 
     @app.post("/api/v1/jobs/{job_id}/validation-decisions", dependencies=authenticated, status_code=202)
     def decision(
@@ -618,4 +725,31 @@ def create_app(settings=None):
     def index():
         return FileResponse(static / "index.html")
 
+    if settings.root_path:
+        app.add_middleware(PrefixedPath, prefix=settings.root_path)
     return app
+
+
+class PrefixedPath:
+    """Give every request the proxy prefix, whether or not the proxy stripped it.
+
+    Routing and static files then see one form of path, and direct requests to the
+    listener (health checks, the CLI) keep working.
+    """
+
+    def __init__(self, app, prefix):
+        self.app, self.prefix = app, prefix
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if (
+            scope["type"] in ("http", "websocket")
+            and path != self.prefix
+            and not path.startswith(self.prefix + "/")
+        ):
+            scope = {
+                **scope,
+                "path": self.prefix + path,
+                "raw_path": self.prefix.encode() + (scope.get("raw_path") or path.encode()),
+            }
+        await self.app(scope, receive, send)

@@ -9,6 +9,8 @@
     executor_http_targets: []
     executor_credentials: {}
     executor_known_hosts: ""
+    # Set to /netops-executor when a reverse proxy publishes the API under that path.
+    executor_root_path: ""
     executor_python: "{{ 'python3.11' if ansible_facts.os_family == 'RedHat' else 'python3' }}"
   pre_tasks:
     - name: Validate supported OS and required secret
@@ -146,6 +148,7 @@
           NETOPS_DEVICES_FILE=/etc/netops-executor/devices.json
           NETOPS_HTTP_TARGETS_FILE=/etc/netops-executor/http-targets.json
           NETOPS_KNOWN_HOSTS=/etc/netops-executor/known_hosts
+          NETOPS_ROOT_PATH={{ executor_root_path }}
       no_log: true
     - name: Configure inventories
       ansible.builtin.copy:

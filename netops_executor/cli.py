@@ -35,7 +35,20 @@ def parser():
     request.add_argument(
         "--kind",
         required=True,
-        choices=["upgrade", "batch", "ssh", "http", "snmp", "panos", "panos-batch", "eos", "eos-batch"],
+        choices=[
+            "upgrade",
+            "batch",
+            "ssh",
+            "http",
+            "snmp",
+            "panos",
+            "panos-batch",
+            "eos",
+            "eos-batch",
+            "iosxe",
+            "iosxe-batch",
+            "iosxe-config-compare",
+        ],
     )
     request.add_argument("--file", required=True, help="JSON file, or - for stdin")
     request.add_argument("--idempotency-key")
@@ -149,6 +162,9 @@ def main():
                     "panos-batch": "panos/upgrade-batches",
                     "eos": "eos/jobs",
                     "eos-batch": "eos/upgrade-batches",
+                    "iosxe": "iosxe/jobs",
+                    "iosxe-batch": "iosxe/upgrade-batches",
+                    "iosxe-config-compare": "iosxe/config-compare",
                 }[args.kind],
             )
         elif args.command == "credential-put":
@@ -189,7 +205,11 @@ def main():
                     "device_inspected": args.device_inspected,
                     "note": args.note,
                 }
-        if method == "POST" and args.command in ("submit", "rollback", "request", "validation"):
+        if (
+            method == "POST"
+            and args.command in ("submit", "rollback", "request", "validation")
+            and not (args.command == "request" and args.kind == "iosxe-config-compare")
+        ):
             key = args.idempotency_key or str(uuid.uuid4())
             headers["Idempotency-Key"] = key
             print("Idempotency-Key: " + key + " (reuse this key if the response is lost)", file=sys.stderr)
