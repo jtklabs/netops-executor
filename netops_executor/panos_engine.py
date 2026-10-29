@@ -943,8 +943,53 @@ class PanosRunner(StepRunner):
             ):
                 member["boot_verified"] = {"version": info["sw_version"], "uptime_seconds": uptime}
                 self.event("reboot_completed", serial=serial)
+                if self.ha["enabled"] and member.get("suspended"):
+                    self.after_reboot(serial)
                 return
         raise PanosError(serial + ": a new boot on the target version was not verified before timeout")
+
+    def after_reboot(self, serial):
+        """Handle a member that its reboot returned to service.
+
+        PAN-OS 12.1.6 brings a suspended member back (passive, or active in active/active)
+        when it reboots. By default it is validated in place and suspended only if that
+        validation fails; suspend_until_validated suspends it again first.
+        """
+        ha = self.wait_ha(
+            serial,
+            lambda h: h["local"] == "suspended" or functional(h["local"]),
+            600,
+            serial + " did not reach a stable HA state after the reboot",
+        )
+        if ha["local"] == "suspended":
+            return
+        member = self.member(serial)
+        member["suspended"] = False
+        member["returned_to_service_as"] = ha["local"]
+        self.event("ha_returned_to_service_after_reboot", serial=serial, state=ha["local"])
+        if self.request.ha_policy.after_reboot == "suspend_until_validated":
+            self.resuspend(serial, ha["local"])
+
+    def resuspend(self, serial, state):
+        other = self.fw(self.peer_of(serial)).ha_state()
+        if not functional(other["local"]) or other["peer_conn"] != "up":
+            raise PanosError(serial + " returned to service after its reboot and its peer cannot take over")
+        self.member(serial)["suspended"] = True
+        self.intent("ha_resuspend", serial=serial, state=state)
+        self.fw(serial).command(SUSPEND)
+        self.wait_ha(
+            serial,
+            lambda h: h["local"] == "suspended" and carries(h["peer_state"]),
+            300,
+            serial + " could not be suspended again after its reboot",
+        )
+        self.event("ha_resuspended", serial=serial, returned_as=state)
+
+    def suspend_failed(self, serial):
+        """Take a member that failed validation out of service, if its peer can carry traffic."""
+        if not self.member(serial).get("suspended"):
+            self.event("suspending_after_failed_validation", serial=serial)
+            self.suspend(serial)
 
     def system_sample(self, serial):
         r = self.request
@@ -1042,14 +1087,20 @@ class PanosRunner(StepRunner):
             ("reboot:" + serial, partial(self.reboot, serial)),
             ("settle:" + serial, self.settle),
         ]
+        # A member its reboot returned to service is suspended only when its validation fails.
+        failed = partial(self.suspend_failed, serial) if self.ha["enabled"] else None
         system = "validate_system:" + serial
-        steps.append((system, lambda: self.validate(system, partial(self.system_sample, serial))))
+        steps.append(
+            (system, lambda: self.validate(system, partial(self.system_sample, serial), failback=failed))
+        )
         if self.ha["enabled"]:
             steps.append(("functional:" + serial, partial(self.make_functional, serial)))
         traffic = "validate_traffic:" + serial
+        # In active/passive the upgraded member is passive here, so a traffic failure is the peer's.
+        traffic_failed = failed if self.ha["enabled"] and self.ha["mode"] == "active-active" else None
 
         def validate_traffic():
-            self.validate(traffic, self.pair_sample)
+            self.validate(traffic, self.pair_sample, failback=traffic_failed)
             self.member(serial)["validated"] = True
 
         steps.append((traffic, validate_traffic))

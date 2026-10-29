@@ -100,6 +100,9 @@ class FakeFirewall:
             if not self.rebooting:
                 self.version, self.uptime = self.installed, 30
                 self.job("AutoCom")
+                if self.pair and not self.pair.keep_suspended and self.pair.state[self.serial] == "suspended":
+                    # PAN-OS 12.1.6 (lab): a suspended member boots back into service.
+                    self.pair.functional(self)
             return None
         if form["type"] == "config":
             assert form["action"] == "set" and form["xpath"] == panos.HA_ELECTION
@@ -218,6 +221,7 @@ class FakeFirewall:
 class FakePair:
     def __init__(self, a, b, mode="Active-Passive"):
         self.mode = mode
+        self.keep_suspended = True
         self.roles = (
             {a.serial: "active", b.serial: "passive"}
             if mode == "Active-Passive"
@@ -628,6 +632,55 @@ def test_active_passive_upgrades_standby_first_then_validates_the_failover(setti
     peer = run(settings, store, b.serial)
     assert peer["status"] == "succeeded" and peer["result"]["already_on_target"]
     assert b.writes == ["suspend", "install " + TARGET, "restart", "functional"]
+
+
+@pytest.mark.parametrize("mode", ["Active-Passive", "Active-Active"])
+def test_member_returning_to_service_after_reboot_is_validated_in_place(settings, store, panorama, mode):
+    a, b = pair(panorama, mode=mode)
+    a.pair.keep_suspended = False
+    job = run(settings, store, a.serial, tech_support=False)
+    assert job["status"] == "succeeded", job["result"]
+    # No re-suspend and no functional command: the reboot already returned it to service.
+    assert b.writes == ["suspend", "install " + TARGET, "restart"]
+    assert (
+        sum(e["step"] == "ha_returned_to_service_after_reboot" for e in store.events(job["id"], 0, 5000)) == 2
+    )
+    assert a.version == b.version == TARGET
+
+
+@pytest.mark.parametrize("mode", ["Active-Passive", "Active-Active"])
+def test_suspend_until_validated_suspends_a_returning_member_again(settings, store, panorama, mode):
+    a, b = pair(panorama, mode=mode)
+    a.pair.keep_suspended = False
+    job = run(
+        settings, store, a.serial, tech_support=False, ha_policy={"after_reboot": "suspend_until_validated"}
+    )
+    assert job["status"] == "succeeded", job["result"]
+    assert b.writes == ["suspend", "install " + TARGET, "restart", "suspend", "functional"]
+    assert sum(e["step"] == "ha_resuspended" for e in store.events(job["id"], 0, 5000)) == 2
+
+
+def test_member_failing_validation_in_service_is_suspended_before_review(settings, store, panorama):
+    a, b = pair(panorama)
+    a.pair.keep_suspended = False
+    original = b.handle
+
+    def handle(cmd):
+        if cmd == panos.CHASSIS_READY and b.version == TARGET:
+            return "no"
+        return original(cmd)
+
+    b.handle = handle
+    job = run(settings, store, a.serial, tech_support=False)
+    assert job["status"] == "needs_review", job["result"]
+    assert job["validation_gates"][-1]["phase"] == "validate_system:" + b.serial
+    assert b.writes == ["suspend", "install " + TARGET, "restart", "suspend"]
+    assert a.pair.state == {a.serial: "active", b.serial: "suspended"}
+    b.handle = original
+    decide(store, job, "retry")
+    job = work(settings, store)
+    assert job["status"] == "succeeded", job["result"]
+    assert b.writes[-1] == "functional"
 
 
 def test_failed_handoff_returns_traffic_to_the_original_active(settings, store, panorama):

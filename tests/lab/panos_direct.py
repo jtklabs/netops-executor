@@ -301,7 +301,9 @@ def run_job(args, settings, store, images, sleep, clock):
     try:
         runner.setup()
         runner.reserve()
-        runner.prevalidate()
+        if args.mode != "f5-drain":
+            # f5-drain exercises only the F5; PAN prevalidation rightly refuses f5_drain on a pair.
+            runner.prevalidate()
         if args.mode == "backup":
             for member in runner.members:
                 runner.backup(member)

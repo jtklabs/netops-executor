@@ -84,6 +84,10 @@ class PanosHAPolicy(Model):
         default=True,
         description="Before the first suspend, set preemptive no on members that have it enabled and commit; restore and commit after both members validate.",
     )
+    after_reboot: Literal["validate_in_service", "suspend_until_validated"] = Field(
+        default="validate_in_service",
+        description="PAN-OS returns a suspended member to service when it reboots. validate_in_service validates it where it is and suspends it only if validation fails; suspend_until_validated suspends it again first.",
+    )
     failback: bool = Field(
         default=True,
         description="When the member left carrying traffic fails validation after a failover, return traffic to the other member before stopping.",
