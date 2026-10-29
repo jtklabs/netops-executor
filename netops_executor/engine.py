@@ -53,6 +53,7 @@ class Runner:
         self.ssh.transfer_guard = self.checkpoint
         self.ssh.progress = self.transfer_progress
         self.last_progress = 0
+        self.uploading = None
 
     def guard(self):
         self.store.guard(self.job["id"], self.worker)
@@ -63,6 +64,7 @@ class Runner:
         if self.clock() - self.last_progress >= 5 or done == total:
             self.last_progress = self.clock()
             self.result["transfer_progress"] = {
+                "image": self.uploading,
                 "bytes": done,
                 "total_bytes": total,
                 "percent": round(100 * done / total, 1) if total else 0,
@@ -302,17 +304,21 @@ class Runner:
     def images(self, request):
         for image in request.images:
             remote = "/shared/images/" + image.name
+            # A digest taken in this step, of the file or of the partial renamed onto it, stands.
+            verified = False
             if "transfer" in request.plan():
-                local = cached_image(self.settings, image, self.job["id"], self.checkpoint)
-                if not local.is_file() or digest(local) != image.sha256:
-                    raise DeviceError("local image missing or SHA-256 mismatch: " + image.name)
+                verified = True
                 try:
                     present = self.ssh.remote_digest(remote) == image.sha256
                 except (DeviceError, KeyError):
                     present = False
                 if present:
+                    # Already staged, for example by a preload: no executor copy is needed.
                     self.event("transfer_skipped_verified", image=image.name)
                 else:
+                    local = cached_image(self.settings, image, self.job["id"], self.checkpoint)
+                    if not local.is_file() or digest(local) != image.sha256:
+                        raise DeviceError("local image missing or SHA-256 mismatch: " + image.name)
                     if self.device.free_bytes() < local.stat().st_size + request.minimum_free_bytes:
                         if request.cleanup_images:
                             self.cleanup_images(request)
@@ -320,17 +326,28 @@ class Runner:
                             raise DeviceError("insufficient image filesystem space and reserve")
                     partial = "/shared/images/." + self.job["id"] + ".partial"
                     self.checkpoint()
-                    self.intent("transfer", image=image.name)
+                    if request.stage_only:
+                        # An upload only writes a hidden partial file; the running system is untouched.
+                        self.event("transfer_started", image=image.name, bytes=local.stat().st_size)
+                    else:
+                        self.intent("transfer", image=image.name)
+                    self.uploading = image.name
                     try:
                         self.ssh.put(local, partial)
                         if self.ssh.remote_digest(partial) != image.sha256:
                             raise DeviceError("transferred image SHA-256 mismatch")
                         self.ssh.shell("mv -- " + name(partial) + " " + name(remote))
-                    except CancelRequested:
-                        self.ssh.shell("rm -f -- " + name(partial))
+                    except Exception:
+                        # Cancelled, dropped or corrupt: never leave a partial file behind.
+                        try:
+                            self.ssh.shell("rm -f -- " + name(partial))
+                        except Exception:
+                            self.event("partial_cleanup_failed", file=partial)
                         raise
+                    finally:
+                        self.uploading = None
                     self.event("transfer_completed", image=image.name)
-            if self.ssh.remote_digest(remote) != image.sha256:
+            if not verified and self.ssh.remote_digest(remote) != image.sha256:
                 raise DeviceError("device image SHA-256 mismatch: " + image.name)
             # The software catalog can lag behind an SFTP rename while F5 scans the image.
             deadline = self.clock() + 120
@@ -784,8 +801,31 @@ class Runner:
         self.result["config_sync"] = "in sync"
         self.event("config_sync_completed")
 
+    def preload(self, r):
+        """Upload and verify images ahead of the window, touching nothing that carries traffic."""
+        self.phase = "preload_checks"
+        # Only this unit: its HA peer can keep working, and a later upgrade job reuses the files.
+        keys = [self.job["lock_key"], "endpoint:" + self.settings.device(self.job["device"]).host]
+        if not self.store.reserve(self.job["id"], self.worker, keys):
+            self.store.defer(self.job["id"], self.worker)
+        self.event("resources_reserved", keys=keys)
+        self.result["plan"] = r.plan()
+        active = self.device.active()
+        self.result["source"] = {key: active[key] for key in ("volume", "version", "build")}
+        if r.allowed_source_versions and active["version"] not in r.allowed_source_versions:
+            raise DeviceError("running version is outside allowed_source_versions")
+        if r.approved_models and not set(self.device.platform()) & set(r.approved_models):
+            raise DeviceError("hardware model is not approved")
+        self.event("preload_checks_completed", **self.result["source"])
+        self.checkpoint()
+        self.images(r)
+        self.result["preloaded"] = [image.name for image in r.images]
+        self.event("preload_completed", images=self.result["preloaded"])
+
     def upgrade(self):
         r = JobRequest.model_validate(self.job["request"])
+        if r.stage_only:
+            return self.preload(r)
         self.reserve()
         self.checkpoint()
         decision = self.store.apply_decision(self.job["id"], self.worker)

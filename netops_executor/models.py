@@ -122,6 +122,10 @@ class JobRequest(ScheduledRequest):
     license_check_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     minimum_free_bytes: int = Field(default=1500000000, ge=0)
     cleanup_images: bool = False
+    stage_only: bool = Field(
+        default=False,
+        description="Preload: upload and verify the images ahead of the window. Reads version and disk only; no UCS, HA or traffic gates, install or reboot, and the HA peer is not reserved.",
+    )
     transfer: bool = False
     images_on_device: bool = False
     images: list[Image] = Field(default_factory=list, max_length=10)
@@ -164,6 +168,25 @@ class JobRequest(ScheduledRequest):
             raise ValueError("drain requires reboot")
         if self.reboot_on_drain_timeout and not self.drain:
             raise ValueError("reboot_on_drain_timeout requires drain")
+        if self.stage_only:
+            busy = [
+                key
+                for key in ("install", "reboot", "drain", "create_ucs", "ucs_unencrypted", "images_on_device")
+                if getattr(self, key)
+            ]
+            if (
+                busy
+                or self.backup_directory
+                or self.admin_password
+                or self.validation_policy.waf_request_check
+            ):
+                raise ValueError(
+                    "stage_only only uploads and verifies images; remove "
+                    + ", ".join(busy or ["backup/admin/WAF options"])
+                )
+            if not self.images:
+                raise ValueError("stage_only requires images")
+            self.transfer = True
         if self.images_on_device and self.transfer:
             raise ValueError("images_on_device conflicts with transfer")
         if (self.install or self.transfer) and not self.images:
@@ -185,6 +208,8 @@ class JobRequest(ScheduledRequest):
         return self
 
     def plan(self):
+        if self.stage_only:
+            return ["preload_checks", "transfer", "verify_images"]
         steps = ["prevalidate"]
         if self.admin_password and self.admin_password.before:
             steps += ["verify_admin_password_before"]

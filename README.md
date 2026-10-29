@@ -329,6 +329,7 @@ Inventory/HTTP target defaults may restrict the eligible profiles for a target.
 
 | Upgrade option | Behavior/default |
 | --- | --- |
+| `stage_only` | Preload: upload and verify `images` only, ahead of the window (see below) |
 | `transfer` | Upload images from `NETOPS_IMAGE_ROOT`; verify SHA-256 and vendor catalog metadata |
 | `images` | Ordered `{name,sha256,version,build,kind}`; optional HTTPS `source_url` downloads to local cache |
 | `images_on_device` | Skip inherited upload; still verify checksum/metadata |
@@ -354,11 +355,42 @@ including reused volumes.** It requires a verified zero exit status. Copy progre
 and its private on-device log directory are recorded. An ambiguous install/copy
 is never automatically replayed.
 
-Verified images already on the device skip SFTP upload. HTTPS cache downloads
-require SHA-256, verified TLS and no redirects or embedded credentials. A download
-is limited to 30 GiB/two hours and committed atomically. SFTP uses a temporary
-remote filename and verifies it before rename. Transfer progress includes bytes
-and percentage. Installer cleanup never deletes boot volumes.
+Verified images already on the device skip SFTP upload and need no executor copy. HTTPS
+cache downloads require SHA-256, verified TLS and no redirects or embedded credentials. A
+download is limited to 30 GiB/two hours and committed atomically. SFTP uses a temporary
+remote filename and verifies it before rename; a cancelled, dropped or corrupt upload
+removes that file. `result.transfer_progress` reports the image, bytes and percentage.
+Installer cleanup never deletes boot volumes.
+
+### Preloading images
+
+`stage_only: true` copies the images to `/shared/images` ahead of the change window,
+the same flag the PAN-OS, EOS, IOS XE and 2960-X jobs use:
+
+```json
+{"name": "Preload-F5", "defaults": {"stage_only": true, "images": [
+  {"name": "BIGIP-17.5.1.10-0.0.35.iso", "sha256": "REPLACE_WITH_SHA256", "version": "17.5.1.10", "build": "0.0.35"}]},
+ "waves": [{"wave": 1, "upgrade_at_a_time": 20, "ips": ["192.0.2.10", "192.0.2.11"]}]}
+```
+
+A preload reads only the running version, volume, hardware model and free space. It
+takes no snapshot, UCS or traffic baseline, checks no HA health and reserves only the
+unit itself, so both members of a pair can preload in the same wave. If
+`allowed_source_versions` or `approved_models` are set, they are enforced. Each image is
+skipped if it is already there with the right SHA-256; otherwise the job checks space
+(`minimum_free_bytes`, optionally `cleanup_images`), uploads, verifies the SHA-256 on the
+device, renames the file and waits for the BIG-IP software catalog to verify its
+signature, version and build. A preload never ends `recovery_required`: an upload writes
+only a hidden partial file, which is removed on failure or cancellation. The later
+upgrade job finds the images in place, verifies them and skips the upload, even on an
+executor that does not hold the image. `stage_only` cannot be combined with install,
+reboot, drain, UCS, `images_on_device`, admin password or WAF options.
+
+Lab-verified on BIG-IP VE 17.5 (`tests/lab/f5_preload.py`): the checks and in-place
+verification on a standalone unit and an HA standby; a 3.36 GB upload from the
+executor host in about three minutes with live progress, SHA-256 and catalog
+verification; cancellation mid-upload ending `cancelled` with no partial file left; and
+the free-space check failing before any upload.
 
 ### Verify and enforce the local admin password
 
