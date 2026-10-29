@@ -50,6 +50,8 @@ def parser():
             "iosxe-config-compare",
             "ios",
             "ios-batch",
+            "fortigate",
+            "fortigate-batch",
         ],
     )
     request.add_argument("--file", required=True, help="JSON file, or - for stdin")
@@ -169,6 +171,8 @@ def main():
                     "iosxe-config-compare": "iosxe/config-compare",
                     "ios": "ios/jobs",
                     "ios-batch": "ios/upgrade-batches",
+                    "fortigate": "fortigate/jobs",
+                    "fortigate-batch": "fortigate/upgrade-batches",
                 }[args.kind],
             )
         elif args.command == "credential-put":

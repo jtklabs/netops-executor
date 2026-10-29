@@ -89,6 +89,10 @@ class Settings:
     ssh_host_keys: str = "known_hosts"
     # Path prefix a reverse proxy publishes the API under, such as /netops-executor.
     root_path: str = ""
+    # Address devices reach this executor on, and the ports it may listen on, for one-time
+    # firmware staging servers (FortiGate alternate-partition preloads).
+    staging_address: str | None = None
+    staging_ports: range = range(2121, 2141)
 
     def device(self, identifier):
         if identifier in self.devices:
@@ -128,6 +132,14 @@ class Settings:
         result.root_path = env("NETOPS_ROOT_PATH", "").rstrip("/")
         if result.root_path and not re.fullmatch(r"(?:/[A-Za-z0-9._~-]+)+", result.root_path):
             raise ValueError("NETOPS_ROOT_PATH must be a path such as /netops-executor")
+        result.staging_address = env("NETOPS_STAGING_ADDRESS") or None
+        if result.staging_address:
+            ip_address(result.staging_address)
+        ports = env("NETOPS_STAGING_PORTS", "2121-2140")
+        match = re.fullmatch(r"(\d{4,5})-(\d{4,5})", ports)
+        if not match or not 1024 <= int(match[1]) < int(match[2]) <= 65535:
+            raise ValueError("NETOPS_STAGING_PORTS must be a range such as 2121-2140")
+        result.staging_ports = range(int(match[1]), int(match[2]) + 1)
         result.ssh_host_keys = env("NETOPS_SSH_HOST_KEYS", "known_hosts")
         if result.ssh_host_keys not in ("known_hosts", "pin"):
             raise ValueError("NETOPS_SSH_HOST_KEYS must be known_hosts or pin")

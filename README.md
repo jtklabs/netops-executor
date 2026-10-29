@@ -4,7 +4,7 @@ A standalone remote for a central controller, with a versioned API, web console,
 CLI and durable SQLite queue. It runs F5 upgrades over **SSH/SFTP only**, PAN-OS
 firewall upgrades through **Panorama's XML API**, Arista EOS, Cisco IOS XE
 (Catalyst 9300, 9350, 3650 and 3850) and classic IOS (Catalyst 2960-X/2960-XR) switch
-upgrades over **SSH**, arbitrary SSH commands, HTTPS
+upgrades and FortiGate (FortiOS 7.4) upgrades over **SSH**, arbitrary SSH commands, HTTPS
 requests (including Panorama requests targeting a firewall), asynchronous SNMP v3
 walks, and Nmap SSH/HTTPS cipher scans. It has no NetBox dependency.
 
@@ -47,6 +47,9 @@ keeps the token only in tab memory and uses the same API.
 | POST | `/api/v1/ios/plan` | Normalize a Catalyst 2960-X classic IOS upgrade and show its steps without device access |
 | POST | `/api/v1/ios/jobs` | Queue one Catalyst 2960-X switch or stack upgrade |
 | POST | `/api/v1/ios/upgrade-batches` | Queue ordered 2960-X waves by inventory ID or IP with per-wave concurrency |
+| POST | `/api/v1/fortigate/plan` | Normalize a FortiGate upgrade and show its steps without device access |
+| POST | `/api/v1/fortigate/jobs` | Queue one FortiGate or FGCP cluster upgrade |
+| POST | `/api/v1/fortigate/upgrade-batches` | Queue ordered FortiGate waves with per-wave concurrency |
 | POST | `/api/v1/ssh/jobs` | Queue one or more SSH commands |
 | POST | `/api/v1/http/jobs` | Queue one or more HTTPS requests |
 | GET | `/api/v1/http/targets` | Configured HTTP targets |
@@ -1168,6 +1171,113 @@ tested against simulated stacks only; lab acceptance is required, especially for
 `archive download-sw` output, `show boot` on a stack, member flash names and the reload
 prompt.
 
+## FortiGate upgrades (FortiOS 7.4)
+
+FortiGate jobs upgrade standalone FortiGates and FGCP clusters over the audited SSH session
+(`fortinet` device type), optionally with FortiManager. Each cluster is one job, addressed
+to its primary.
+
+```json
+{
+  "name": "Change792",
+  "defaults": {
+    "allowed_source_versions": ["7.4.4"],
+    "image": {"name": "FGT_600E-v7.4.5.F-build2702-FORTINET.out", "sha256": "REPLACE_WITH_SHA256",
+              "version": "7.4.5", "build": 2702},
+    "software_source": "executor",
+    "stage_only": true
+  },
+  "waves": [{"wave": 1, "upgrade_at_a_time": 20, "devices": ["fw-branch1", "fw-branch2"]}]
+}
+```
+
+**Staging.** FortiOS stages firmware into its alternate partition only by pulling it
+over FTP, TFTP or USB (`execute restore secondary-image`). For each staging the executor
+runs a one-time FTP server and the FortiGate pulls the verified image from it. The server:
+
+- uses a random login, which is redacted from job output;
+- serves only that one file, read-only and in passive mode;
+- accepts connections only from the FortiGate's address (its management IP, or
+  `staging_source_address`);
+- closes when the pull ends.
+
+Set `NETOPS_STAGING_ADDRESS` to the executor address the FortiGates reach, and allow TCP
+from them to `NETOPS_STAGING_PORTS` (default 2121-2140; the server uses one port for
+control and one for data). FTP is cleartext. The one-time login and the FortiOS
+signature check on the image limit the exposure.
+
+`stage_only: true` preloads ahead of the window. The job checks the firmware, model, image
+package and release, then stages the image. If the alternate partition already holds the
+build it skips the pull. It never reboots. A later upgrade job finds the staged build and
+reuses it.
+
+**Sources.** `software_source: "executor"` drives the FortiGate directly.
+`software_source: "fortimanager"` (with `fortimanager`, an HTTP target authenticated with an
+API key as a bearer token, and `adom`) also:
+
+- looks the device up by serial;
+- runs FortiManager's upgrade preview (`/um/image/upgrade` with `f_preview`), which must
+  reach the target build, so the image is proven available on FortiManager ahead of time;
+- runs cluster upgrades;
+- after a standalone reboot it did not run, asks FortiManager to retrieve the
+  configuration. If that request fails, the job ends `completed_with_warnings`.
+
+**Activation.**
+
+- **Standalone:** `execute set-next-reboot secondary` and `execute reboot`, then the job
+  waits for the target build with a fresh uptime.
+- **FGCP cluster:** the cluster upgrades itself from the primary, secondaries first. On
+  the executor source that is `execute restore image ftp` from the one-time server; on the
+  fortimanager source it is a FortiManager upgrade task, whose percentage appears in
+  `result.progress`. A cluster's staged partition only proves the image ahead of the
+  window. The job then requires HA health OK and every original member in sync.
+
+Prechecks refuse:
+
+- a model outside `approved_models`;
+- an image package for another model (`FGT_<model>-...`);
+- a running version outside `allowed_source_versions`;
+- a downgrade;
+- for an upgrade, a cluster that is unhealthy or out of sync, or an address that is not
+  the primary.
+
+Immediately before activation the job rechecks that the build, the configuration and the
+cluster sync are unchanged.
+
+**Validation.**
+
+- **System:** the target build, the same unit or cluster members, HA health and sync, and
+  a comparison of `show` (non-default configuration) with the baseline. The comparison
+  uses the IOS XE engine with FortiOS rules:
+  - `#` header lines and `next` lines are ignored;
+  - encrypted `ENC` values compare by presence;
+  - multi-line quoted values such as certificates compare as one line;
+  - firewall policy, route-map, access-list and `edit` entry order is kept.
+
+  `config_policy` adds rules and sets how added and removed lines are reported.
+- **Traffic:** with `restore_required`, interfaces that were up, IPsec tunnels that were up,
+  Established BGP peers and Full OSPF neighbors must recover. Routes must stay at
+  `min_route_percent`; sessions fail only an explicit `min_session_percent`.
+
+Netmiko switches `config system console` output to `standard` for its sessions, and it
+cannot switch it back under this executor. The job records the original setting and
+restores `more` when it finishes.
+
+Failures before activation end `failed`, leaving at most a staged alternate partition. From
+activation on, a failure ends `recovery_required`. `result.rollback` records the previous
+version, build and partition. A standalone unit keeps the previous image in the other
+partition, so recovery is `execute set-next-reboot` back to it and a reboot.
+
+FortiGate support is tested against simulated FortiGates and a simulated FortiManager only;
+the one-time FTP server is exercised for real in the tests. No FortiGate or FortiManager has
+run it. Lab acceptance is required before production use, especially for:
+
+- the FortiOS confirmation prompts;
+- `set-next-reboot` partition naming;
+- `execute restore image` on a cluster primary;
+- the FortiManager JSON-RPC payloads and task fields;
+- multi-VDOM units, where the per-VDOM traffic reads are recorded as gaps.
+
 ## Generic SSH and HTTP jobs
 
 ```json
@@ -1198,6 +1308,7 @@ the dedicated F5 workflow and need no additional field.
 | `cisco_ios` | Interactive IOS / IOS-XE CLI | `show version` |
 | `cisco_nxos` | Interactive NX-OS CLI | `show version` |
 | `arista_eos` | Interactive EOS CLI | `show version` |
+| `fortinet` | Interactive FortiOS CLI (Netmiko sets console output to `standard`) | `get system status` |
 
 Discover supported types and modes through authenticated
 `GET /api/v1/ssh/device-types`. Device inventory responses also include the type.
@@ -1511,6 +1622,7 @@ netops-executor request --kind iosxe-batch --file iosxe-batch.json --idempotency
 netops-executor request --kind iosxe --file iosxe-upgrade.json
 netops-executor request --kind iosxe-config-compare --file before-after.json
 netops-executor request --kind ios-batch --file c2960x-batch.json --idempotency-key change791
+netops-executor request --kind fortigate-batch --file fortigate-batch.json --idempotency-key change792
 netops-executor credential-put ssh-local --file -       # JSON from stdin
 netops-executor job JOB_UUID
 netops-executor batch BATCH_UUID

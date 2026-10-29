@@ -189,7 +189,7 @@ class Canonical:
 
     def __init__(self, text, rewrites, ignores):
         self.rewrites, self.ignores = rewrites, ignores
-        self.rewritten, self.ignored = Counter(), {}
+        self.rewritten, self.ignored = {}, {}
         self.root = self.apply(merge_numbered(tree(text)), None)
 
     def apply(self, node, parent):
@@ -200,7 +200,7 @@ class Canonical:
                 if rule.applies(text, parent):
                     new = rule.line.sub(rule.replace, text, count=1).strip()
                     if new != text:
-                        self.rewritten[rule.name] += 1
+                        self.rewritten.setdefault(rule.name, Counter())[text] += 1
                         text = new
             hit = next((rule for rule in self.ignores if rule.applies(text, parent)), None)
             if hit:
@@ -268,9 +268,17 @@ def compare(before, after, policy=None, limit=500):
     walk(old.root["children"], new.root["children"], (), False)
     tolerated = []
     for name in sorted(set(old.rewritten) | set(new.rewritten)):
-        if old.rewritten[name] != new.rewritten[name]:
+        # Original spellings hidden by a rewrite, compared side by side.
+        a, b = old.rewritten.get(name, Counter()), new.rewritten.get(name, Counter())
+        if a != b:
             tolerated.append(
-                {"rule": name, "kind": "rewrite", "before": old.rewritten[name], "after": new.rewritten[name]}
+                {
+                    "rule": name,
+                    "kind": "rewrite",
+                    "before": sum(a.values()),
+                    "after": sum(b.values()),
+                    "lines_hidden": sum(((a - b) + (b - a)).values()),
+                }
             )
     for name in sorted(set(old.ignored) | set(new.ignored)):
         a, b = old.ignored.get(name, Counter()), new.ignored.get(name, Counter())

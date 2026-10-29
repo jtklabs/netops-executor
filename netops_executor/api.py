@@ -16,6 +16,7 @@ from .config import Settings, under
 from .credentials import Credential, Vault
 from .eos_models import EosBatch, EosUpgradeRequest
 from .execution_models import Batch, HTTPJob, ManualCompletion, SSHJob, ValidationDecision
+from .fortigate_models import FortigateBatch, FortigateUpgradeRequest
 from .ios_models import IosBatch, IosUpgradeRequest
 from .iosxe_config import compare as compare_configs
 from .iosxe_models import ConfigComparison, IosxeBatch, IosxeUpgradeRequest
@@ -42,6 +43,7 @@ class JobResponse(Model):
         "eos_upgrade",
         "iosxe_upgrade",
         "ios_upgrade",
+        "fortigate_upgrade",
     ]
     parent: str | None
     request: dict
@@ -96,7 +98,9 @@ class BatchItem(Model):
 
 class BatchResponse(Model):
     id: str
-    kind: Literal["upgrade", "panos_upgrade", "eos_upgrade", "iosxe_upgrade", "ios_upgrade"] = "upgrade"
+    kind: Literal[
+        "upgrade", "panos_upgrade", "eos_upgrade", "iosxe_upgrade", "ios_upgrade", "fortigate_upgrade"
+    ] = "upgrade"
     name: str
     status: Literal["completed", "needs_attention", "in_progress"]
     device_count: int
@@ -150,6 +154,12 @@ class IosxePlanResponse(Model):
 
 class IosPlanResponse(Model):
     request: IosUpgradeRequest
+    steps: list[str]
+    lock_key: str
+
+
+class FortigatePlanResponse(Model):
+    request: FortigateUpgradeRequest
     steps: list[str]
     lock_key: str
 
@@ -264,6 +274,24 @@ def create_app(settings=None):
             except ValueError:
                 raise HTTPException(422, "backup directory escapes BACKUP_ROOT") from None
         return EosPlanResponse(request=request, steps=request.plan(), lock_key=lock_key(request.device))
+
+    def fortigate_planned(request):
+        try:
+            device = settings.device(request.device)
+        except ValueError:
+            raise HTTPException(422, "device must be an inventory ID or IP address") from None
+        if device.id in settings.devices and device.device_type not in ("linux", "fortinet"):
+            raise HTTPException(422, "device is not a fortinet device")
+        if not settings.staging_address:
+            raise HTTPException(422, "FortiGate staging requires NETOPS_STAGING_ADDRESS on the executor")
+        if request.software_source == "fortimanager" and request.fortimanager not in settings.http_targets:
+            raise HTTPException(422, "unknown FortiManager HTTP target")
+        if request.backup_directory:
+            try:
+                under(settings.backup_root, request.backup_directory)
+            except ValueError:
+                raise HTTPException(422, "backup directory escapes BACKUP_ROOT") from None
+        return FortigatePlanResponse(request=request, steps=request.plan(), lock_key=lock_key(request.device))
 
     def iosxe_planned(request, response=IosxePlanResponse):
         try:
@@ -498,7 +526,7 @@ def create_app(settings=None):
     def ssh_device_types():
         return [
             {"device_type": name, "modes": ["exec", "config"] if name in NETWORK_TYPES else ["exec"]}
-            for name in ["linux", "f5", "cisco_ios", "cisco_nxos", "arista_eos"]
+            for name in ["linux", "f5", "cisco_ios", "cisco_nxos", "arista_eos", "fortinet"]
         ]
 
     @app.post("/api/v1/ssh/jobs", dependencies=authenticated, status_code=202, response_model=JobResponse)
@@ -749,6 +777,54 @@ def create_app(settings=None):
             for device in wave.devices:
                 iosxe_planned(request.request_for(device), IosPlanResponse)
         return published(store.create_batch(request, idempotency_key, lock_key, kind="ios_upgrade"))
+
+    fortigate_tags = ["FortiGate upgrades"]
+
+    @app.post(
+        "/api/v1/fortigate/plan",
+        dependencies=authenticated,
+        response_model=FortigatePlanResponse,
+        tags=fortigate_tags,
+        summary="Normalize a FortiGate upgrade and show its steps without device access",
+    )
+    def fortigate_plan(request: FortigateUpgradeRequest):
+        return fortigate_planned(request)
+
+    @app.post(
+        "/api/v1/fortigate/jobs",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=JobResponse,
+        tags=fortigate_tags,
+        summary="Queue one FortiGate or FGCP cluster upgrade",
+        description="Prechecks, alternate-partition staging from a one-time FTP server on the executor, then a reboot into it (standalone) or the FGCP cluster upgrade from the primary, and post-validation. Poll GET /api/v1/jobs/{job_id}. Supports Idempotency-Key.",
+    )
+    def fortigate_job(
+        request: FortigateUpgradeRequest,
+        idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
+    ):
+        p = fortigate_planned(request)
+        return store.submit(
+            request.model_dump(mode="json"), p.lock_key, idempotency_key, kind="fortigate_upgrade"
+        )
+
+    @app.post(
+        "/api/v1/fortigate/upgrade-batches",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=BatchResponse,
+        tags=fortigate_tags,
+        summary="Queue ordered waves of FortiGate upgrades",
+        description="Each wave starts only after every earlier item passed validation or was marked done. List each FGCP cluster once, by its primary.",
+    )
+    def fortigate_batch(
+        request: FortigateBatch,
+        idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
+    ):
+        for wave in request.waves:
+            for device in wave.devices:
+                fortigate_planned(request.request_for(device))
+        return published(store.create_batch(request, idempotency_key, lock_key, kind="fortigate_upgrade"))
 
     @app.post(
         "/api/v1/iosxe/config-compare",

@@ -2,8 +2,8 @@
 
 from typing import Literal
 
-DeviceType = Literal["linux", "f5", "cisco_ios", "cisco_nxos", "arista_eos"]
-NETWORK_TYPES = {"cisco_ios", "cisco_nxos", "arista_eos"}
+DeviceType = Literal["linux", "f5", "cisco_ios", "cisco_nxos", "arista_eos", "fortinet"]
+NETWORK_TYPES = {"cisco_ios", "cisco_nxos", "arista_eos", "fortinet"}
 
 
 def validate_commands(request, device_type):

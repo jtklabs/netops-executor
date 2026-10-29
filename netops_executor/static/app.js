@@ -442,6 +442,32 @@ const examples = {
     allowed_source_versions: ["15.2(7)E3"],
     image: { name: "c2960x-universalk9-tar.152-7.E10.tar", sha256: "REPLACE_WITH_SHA256" },
   },
+  "fortigate/upgrade-batches": {
+    name: "Change792",
+    defaults: {
+      allowed_source_versions: ["7.4.4"],
+      image: {
+        name: "FGT_600E-v7.4.5.F-build2702-FORTINET.out",
+        sha256: "REPLACE_WITH_SHA256",
+        version: "7.4.5",
+        build: 2702,
+      },
+      stage_only: true,
+    },
+    waves: [{ wave: 1, upgrade_at_a_time: 20, devices: ["192.0.2.61", "192.0.2.62"] }],
+  },
+  "fortigate/jobs": {
+    device: "192.0.2.61",
+    software_source: "fortimanager",
+    fortimanager: "fortimanager",
+    allowed_source_versions: ["7.4.4"],
+    image: {
+      name: "FGT_600E-v7.4.5.F-build2702-FORTINET.out",
+      sha256: "REPLACE_WITH_SHA256",
+      version: "7.4.5",
+      build: 2702,
+    },
+  },
   "iosxe/config-compare": {
     before: "PASTE show running-config FROM BEFORE THE UPGRADE",
     after: "PASTE show running-config FROM AFTER THE UPGRADE",

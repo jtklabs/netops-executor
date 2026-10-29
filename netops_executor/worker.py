@@ -9,6 +9,7 @@ from .config import Settings
 from .engine import Runner
 from .eos_engine import EosRunner
 from .execution import ExecutionRunner
+from .fortigate_engine import FortigateRunner
 from .ios_engine import IosRunner
 from .iosxe_engine import IosxeRunner
 from .panos_engine import PanosRunner
@@ -44,6 +45,8 @@ def process(settings, store, job, worker):
             if job["kind"] == "iosxe_upgrade"
             else IosRunner
             if job["kind"] == "ios_upgrade"
+            else FortigateRunner
+            if job["kind"] == "fortigate_upgrade"
             else Runner
         )
         runner(settings, store, job, worker).run()

@@ -21,7 +21,7 @@ CLI_ERROR = re.compile(
 )
 # A question the CLI is waiting on; dialogue() answers only the ones it was given.
 QUESTION = re.compile(
-    r"(?:\[y/n(?:/q)?\]|\[confirm\]|\[yes/no[^\]]*\]|\[[^\]\r\n]*\]\?|[Pp]assword:|[Uu]sername:)\s*[:?]?\s*$"
+    r"(?:\[y/n(?:/q)?\]|\(y/n\)|\[confirm\]|\[yes/no[^\]]*\]|\[[^\]\r\n]*\]\?|[Pp]assword:|[Uu]sername:)\s*[:?]?\s*$"
 )
 
 
@@ -132,12 +132,13 @@ class NetworkSSH(SSH):
         finally:
             self.operation_deadline = None
 
-    def dialogue(self, command, replies, timeout, *, progress=None, disconnect_ok=False):
+    def dialogue(self, command, replies, timeout, *, progress=None, disconnect_ok=False, poll=None):
         """Send one command and answer only recognized questions until the prompt returns.
 
         `replies` pairs a pattern for a question at the end of the unanswered output with
         its answer; any other question stops the dialogue. With disconnect_ok a dropped
         session (a reload) ends it, and the caller verifies the outcome from fresh reads.
+        `poll` runs on every read, for progress that does not appear in the output.
         Returns (output, disconnected). The command is sent once and never retried.
         """
         driver = self.connect()
@@ -161,6 +162,8 @@ class NetworkSSH(SSH):
                     disconnected = True
                     break
                 output += chunk
+                if poll:
+                    poll()
                 tail = output[answered:]
                 if chunk and progress:
                     lines = [line.strip() for line in output.splitlines() if line.strip()]
