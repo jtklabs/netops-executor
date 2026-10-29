@@ -55,7 +55,7 @@ keeps the token only in tab memory and uses the same API.
 | GET | `/api/v1/http/targets` | Configured HTTP targets |
 | POST | `/api/v1/cipher-scans` | Queue a single-IP SSH/HTTPS cipher scan |
 | GET | `/api/v1/cipher-scans/{id}` | Scan status, structured cipher data and readable output |
-| POST | `/api/v1/snmp/walks` | Queue SNMP v3 OID subtree walks |
+| POST | `/api/v1/snmp/walks` | Queue SNMP v3 subtree walks (GETBULK with fallback) and GETs |
 | GET | `/api/v1/snmp/walks/{id}` | Walk status and per-root progress |
 | GET | `/api/v1/snmp/walks/{id}/results?after=0&limit=500` | Paginated partial/final rows |
 | GET | `/api/v1/jobs?limit=100&offset=0` or `/jobs/{id}` | Jobs and full results/credential audit |
@@ -1533,10 +1533,11 @@ New deployments should use encrypted profiles.
 
 ## SNMP v3 walks
 
-Submit an IPv4/IPv6 address and numeric OID subtrees to `/snmp/walks`:
+Submit an IPv4/IPv6 address with numeric OID subtrees (`oids`) and/or exact
+instances (`get_oids`) to `/snmp/walks`:
 
 ```json
-{"device_ip":"192.0.2.10","oids":["1.3.6.1.2.1.1","1.3.6.1.4.1.3375"]}
+{"device_ip":"192.0.2.10","oids":["1.3.6.1.2.1.2.2","1.3.6.1.4.1.3375"],"get_oids":["1.3.6.1.2.1.1.5.0","1.3.6.1.2.1.1.3.0"]}
 ```
 
 `credential_profiles` optionally restricts selection. SNMP v3 only: authPriv,
@@ -1544,8 +1545,29 @@ authNoPriv or noAuthNoPriv, SHA/SHA224/SHA256/SHA384/SHA512, AES128 privacy.
 Authentication/privacy passphrases need at least eight UTF-8 bytes. Profiles
 support a context name. Credentials never appear in walk job requests.
 
-Walks use GETNEXT, one root at a time, and stop at the subtree boundary. To retrieve
-a scalar instance, walk its parent. Roots can overlap; results retain `root_oid`.
+Walks run one root at a time and stop at the subtree boundary. `walk_mode` chooses
+the request type:
+
+| `walk_mode` | Behavior |
+| --- | --- |
+| `auto` (default) | GETBULK with `max_repetitions` rows per round trip (default 25, 1–100). A `tooBig` reply or a mid-walk timeout halves it; at 1, or when the agent rejects GETBULK (Report PDU or PDU error) or never answers the first GETBULK, the walk switches to GETNEXT |
+| `bulk` | GETBULK only; `tooBig` and mid-walk timeouts still halve `max_repetitions`, but there is no GETNEXT fallback |
+| `next` | GETNEXT only, one row per round trip |
+
+A reduction or fallback applies to the rest of the job, and each retry resumes
+after the last committed row, so nothing is duplicated or skipped. A dead agent
+costs one extra GETNEXT attempt, not a full halving sequence. `request_interval`
+(0–10 seconds, default 0) paces requests for agents that rate-limit. The result's
+`walk` object reports the final `method`, `max_repetitions`, request count, and each
+fallback with its reason and root; resubmit with a lower `max_repetitions` or
+`walk_mode: next` if a device needed one.
+
+`get_oids` (up to 256) are read with GET, ten per request; a `tooBig` reply splits
+the batch. Each entry in `result.gets` ends `succeeded` (one row, `root_oid` is the
+requested OID) or `missing` (noSuchObject/noSuchInstance); missing does not fail the
+job. A walk root whose subtree is empty is read with GET, as net-snmp `snmpwalk`
+does, so a scalar instance such as `1.3.6.1.2.1.1.5.0` can also be passed in
+`oids`; that root is marked `scalar`. Roots can overlap; results retain `root_oid`.
 An accessible empty subtree succeeds, but SNMP cannot distinguish absent data
 from data hidden by the agent's access controls.
 
@@ -1556,7 +1578,7 @@ is true **and** `has_more` is false. Empty live pages require continued polling.
 Octet strings are base64; integers/counters and other textual values are strings
 to preserve precision. IP addresses are dotted text.
 
-Bounds: 1–64 roots; port 161 default; per-request timeout 2 seconds (0.1–30),
+Bounds: up to 64 roots and 256 GET OIDs (at least one OID); port 161 default; per-request timeout 2 seconds (0.1–30),
 retries 1 (0–5); job timeout 300 seconds (1–3600); maximum rows 10000
 (1–100000). A fixed 16 MiB result limit also applies. Limits/timeouts fail the job
 with partial results retained. Authentication fallback is allowed before a root

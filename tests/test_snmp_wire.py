@@ -13,16 +13,18 @@ from netops_executor.snmp_models import SnmpProfile, SnmpWalkRequest
 
 
 @pytest.mark.parametrize(
-    "level,ipv6,bad_password,encrypted",
+    "level,ipv6,bad_password,encrypted,bulk",
     [
-        ("authPriv", False, False, False),
-        ("authPriv", False, False, True),
-        ("authNoPriv", False, False, False),
-        ("noAuthNoPriv", True, False, False),
-        ("authPriv", False, True, False),
+        ("authPriv", False, False, False, True),
+        ("authPriv", False, False, True, True),
+        ("authNoPriv", False, False, False, True),
+        ("noAuthNoPriv", True, False, False, True),
+        ("authPriv", False, True, False, True),
+        # An agent without a GETBULK handler answers with a Report PDU; auto mode uses GETNEXT.
+        ("authPriv", False, False, False, False),
     ],
 )
-def test_loopback_v3(settings, store, monkeypatch, level, ipv6, bad_password, encrypted):
+def test_loopback_v3(settings, store, monkeypatch, level, ipv6, bad_password, encrypted, bulk):
     monkeypatch.setenv("TEST_SNMP_AUTH", "wrong-passphrase" if bad_password else "loopback-auth-passphrase")
     monkeypatch.setenv("TEST_SNMP_PRIV", "loopback-priv-passphrase")
     settings.snmp_profiles = {
@@ -84,10 +86,20 @@ def test_loopback_v3(settings, store, monkeypatch, level, ipv6, bad_password, en
             "loopback-priv-passphrase" if level == "authPriv" else None,
         )
         config.add_vacm_user(agent, 3, "test-reader", level, (1, 3, 6, 1, 2, 1))
-        responder = cmdrsp.NextCommandResponder(agent, context.SnmpContext(agent))
+        snmp_context = context.SnmpContext(agent)
+        responders = [
+            cmdrsp.NextCommandResponder(agent, snmp_context),
+            cmdrsp.GetCommandResponder(agent, snmp_context),
+        ]
+        if bulk:
+            responders.append(cmdrsp.BulkCommandResponder(agent, snmp_context))
         try:
             request = SnmpWalkRequest(
-                device_ip=address, port=port, oids=["1.3.6.1.2.1.1", "1.3.6.1.2.1.999"], job_timeout=5
+                device_ip=address,
+                port=port,
+                oids=["1.3.6.1.2.1.1", "1.3.6.1.2.1.999"],
+                get_oids=["1.3.6.1.2.1.1.3.0", "1.3.6.1.2.1.1.999.0"],
+                job_timeout=5,
             )
             job = store.submit(request.model_dump(mode="json"), "loopback", kind="snmp_walk")
             runner = SnmpRunner(settings, store, store.claim("wire"), "wire")
@@ -97,16 +109,27 @@ def test_loopback_v3(settings, store, monkeypatch, level, ipv6, bad_password, en
                 assert all(r["status"] == "failed" for r in runner.result["oids"]), runner.result
                 return
             assert all(r["status"] == "succeeded" for r in runner.result["oids"]), runner.result
+            assert [g["status"] for g in runner.result["gets"]] == ["succeeded", "missing"]
             rows = store.snmp_results(job["id"])["rows"]
             assert rows
             assert all(row["oid"].startswith("1.3.6.1.2.1.1.") for row in rows)
+            assert (
+                len({row["oid"] for row in rows if row["root_oid"] == "1.3.6.1.2.1.1"})
+                == runner.result["oids"][0]["rows"]
+            )
             assert runner.result["oids"][1]["rows"] == 0
+            walk = runner.result["walk"]
+            if bulk:
+                assert walk["method"] == "bulk" and walk["fallbacks"] == []
+            else:
+                assert walk["method"] == "next" and walk["fallbacks"][0]["reason"] == "unsupported"
             if encrypted:
                 audit = store.get(job["id"])["credential_usage"]
                 assert any(c["profile"] == "unknown" and c["outcome"] == "rejected" for c in audit)
                 assert store.get(job["id"])["credential_summary"]["profiles_used"] == ["valid"]
         finally:
-            responder.close(agent)
+            for responder in responders:
+                responder.close(agent)
             agent.close_dispatcher()
             sock.close()
 
