@@ -206,7 +206,7 @@ class FakeSwitch:
         self.calls.append("write memory")
         self.startup = self.running
 
-    def flash(self, member, name):
+    def flash(self, member, name, active=False):
         self.check()
         data = self.files[member].get(name)
         return self.free, len(data) if data is not None else None

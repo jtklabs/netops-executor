@@ -80,7 +80,8 @@ def members(text):
 
 def stack(text):
     rows = re.findall(
-        r"(?m)^\s*(\*?)\s*(\d+)\s+(Active|Standby|Member)\s+(" + MAC + r")\s+\d+\s+\S+\s+(\S+)\s*$", text
+        r"(?m)^\s*(\*?)\s*(\d+)\s+(Active|Standby|Member|Master)\s+(" + MAC + r")\s+\d+\s+\S+\s+(\S+)\s*$",
+        text,
     )
     if not rows:
         raise DeviceError("show switch: no recognized members")
@@ -153,7 +154,7 @@ class Iosxe:
         return {
             "version": running[1] if running else None,
             "members": members(output),
-            "serials": sorted(set(re.findall(r"(?m)^System Serial Number\s*:\s*(\S+)", output))),
+            "serials": sorted(set(re.findall(r"(?im)^System Serial Number\s*:\s*(\S+)", output))),
             "uptime_seconds": uptime_seconds(output),
         }
 
@@ -177,7 +178,7 @@ class Iosxe:
         if "[OK]" not in self.text("write memory", timeout=300):
             raise DeviceError("write memory was not acknowledged")
 
-    def flash(self, member, name):
+    def flash(self, member, name, active=False):
         return listing(self.text(f"dir flash-{member}:"), name)
 
     def verify(self, name, algorithm):

@@ -2,9 +2,9 @@
 
 A standalone remote for a central controller, with a versioned API, web console,
 CLI and durable SQLite queue. It runs F5 upgrades over **SSH/SFTP only**, PAN-OS
-firewall upgrades through **Panorama's XML API**, Arista EOS and Cisco IOS XE
-(Catalyst 9300, 9350, 3650 and 3850) switch upgrades over **SSH**, arbitrary SSH
-commands, HTTPS
+firewall upgrades through **Panorama's XML API**, Arista EOS, Cisco IOS XE
+(Catalyst 9300, 9350, 3650 and 3850) and classic IOS (Catalyst 2960-X/2960-XR) switch
+upgrades over **SSH**, arbitrary SSH commands, HTTPS
 requests (including Panorama requests targeting a firewall), asynchronous SNMP v3
 walks, and Nmap SSH/HTTPS cipher scans. It has no NetBox dependency.
 
@@ -44,6 +44,9 @@ keeps the token only in tab memory and uses the same API.
 | POST | `/api/v1/iosxe/jobs` | Queue one Cisco IOS XE switch or stack upgrade |
 | POST | `/api/v1/iosxe/upgrade-batches` | Queue ordered IOS XE waves by inventory ID or IP with per-wave concurrency |
 | POST | `/api/v1/iosxe/config-compare` | Compare two running configurations the way IOS XE validation does |
+| POST | `/api/v1/ios/plan` | Normalize a Catalyst 2960-X classic IOS upgrade and show its steps without device access |
+| POST | `/api/v1/ios/jobs` | Queue one Catalyst 2960-X switch or stack upgrade |
+| POST | `/api/v1/ios/upgrade-batches` | Queue ordered 2960-X waves by inventory ID or IP with per-wave concurrency |
 | POST | `/api/v1/ssh/jobs` | Queue one or more SSH commands |
 | POST | `/api/v1/http/jobs` | Queue one or more HTTPS requests |
 | GET | `/api/v1/http/targets` | Configured HTTP targets |
@@ -1070,6 +1073,69 @@ simulated stacks and canned IOS XE output only; lab acceptance on your hardware 
 releases is required, especially for the table parsers, SCP to `flash:`, the install
 dialogue and the configuration rules.
 
+## Cisco Catalyst 2960-X upgrades (classic IOS)
+
+Classic IOS jobs upgrade WS-C2960X and WS-C2960XR switches and FlexStack-Plus stacks on IOS
+15.2. They take the same request as IOS XE jobs, minus the install-mode options, and use
+`/api/v1/ios/plan`, `/api/v1/ios/jobs` and `/api/v1/ios/upgrade-batches` (CLI kinds `ios`
+and `ios-batch`):
+
+```json
+{
+  "name": "Change791",
+  "defaults": {
+    "target_version": "15.2(7)E10",
+    "allowed_source_versions": ["15.2(7)E3", "15.2(7)E8"],
+    "image": {"name": "c2960x-universalk9-tar.152-7.E10.tar", "sha256": "REPLACE_WITH_SHA256",
+              "md5": "CISCO_PUBLISHED_MD5",
+              "device_url": "http://images.example.com/c2960x-universalk9-tar.152-7.E10.tar"}
+  },
+  "waves": [
+    {"wave": 1, "upgrade_at_a_time": 1, "devices": ["access1"]},
+    {"wave": 2, "upgrade_at_a_time": 20, "devices": ["access2", "access3"]}
+  ]
+}
+```
+
+The image is the release's `.tar` (`c2960x-universalk9-tar.<release>.tar`; the name must
+carry the target release, so `15.2(7)E10` needs `152-7.E10`). The switch verifies it with
+`verify /md5` by default (`image.verify` can be `sha512`). `minimum_free_bytes` defaults to
+3,000,000; the other options (`peers`, `stage_only`, `tech_support`, `save_config`,
+`save_after_validation`, `config_policy`, `validation_policy`, timeouts) behave as for IOS
+XE.
+
+The upgrade uses Cisco's own `archive download-sw`, never a hand-set boot variable:
+
+1. Prechecks: every member Ready and agreeing between `show version` and `show switch`, one
+   release, WS-C2960X/WS-C2960XR hardware (and `approved_models`), a `c2960x-universalk9`
+   image, an allowed source release, and no extracted target image already on flash.
+2. The `.tar` goes to the master's `flash:` with `copy <device_url> flash:` first and SCP
+   from the executor as the fallback, then is checksum-verified. The master needs room for
+   the `.tar` plus the extracted image, and every other member (`flash<N>:`) room for the
+   extracted image, plus `minimum_free_bytes`. When the master cannot hold both but
+   `device_url` is set, `archive download-sw` reads the `.tar` straight from the URL
+   instead; the switch then checks the archive itself, not against the request's checksum.
+   `stage_only` preloads the `.tar` and needs that room.
+3. A recheck that release, membership, configuration and boot paths are unchanged.
+4. `archive download-sw /imageonly /safe flash:<tar>` (or the URL). `/safe` keeps the running
+   image until the new one is in place, and the command extracts the image onto every
+   member and points each member's boot path at it. `show boot` must then name the target on
+   every member, or the job stops before the reload. The `.tar` is deleted.
+5. `write memory` if only the boot path changed the saved configuration, then `reload`,
+   answering only `Proceed with reload? [confirm]`.
+6. The wait for every original member back on the target, Ready, with a fresh uptime, then
+   settling, system validation (members, models, serials, boot paths and the configuration
+   comparison described for IOS XE) and traffic validation.
+
+Failures before `archive download-sw` end `failed`, leaving at most a copied `.tar` and a
+saved configuration. From `archive download-sw` on, a failure ends `recovery_required`,
+because boot paths may already name the new image. `result.rollback` records the previous
+release and boot paths. `archive download-sw` removes the old image after a successful
+install, so recovery is another job to the previous release's `.tar`. 2960-X upgrades are
+tested against simulated stacks only; lab acceptance is required, especially for the
+`archive download-sw` output, `show boot` on a stack, member flash names and the reload
+prompt.
+
 ## Generic SSH and HTTP jobs
 
 ```json
@@ -1412,6 +1478,7 @@ netops-executor request --kind eos --file eos-upgrade.json
 netops-executor request --kind iosxe-batch --file iosxe-batch.json --idempotency-key change790
 netops-executor request --kind iosxe --file iosxe-upgrade.json
 netops-executor request --kind iosxe-config-compare --file before-after.json
+netops-executor request --kind ios-batch --file c2960x-batch.json --idempotency-key change791
 netops-executor credential-put ssh-local --file -       # JSON from stdin
 netops-executor job JOB_UUID
 netops-executor batch BATCH_UUID

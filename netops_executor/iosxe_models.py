@@ -2,7 +2,7 @@
 
 import re
 from pathlib import PurePosixPath
-from typing import Annotated, Literal
+from typing import Annotated, ClassVar, Literal
 from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
@@ -230,6 +230,7 @@ class IosxeWave(Model):
 
 
 class IosxeBatch(ScheduledRequest):
+    request_model: ClassVar = None
     name: str = Field(min_length=1, max_length=160)
     defaults: dict = Field(default_factory=dict)
     overrides: dict[str, dict] = Field(default_factory=dict)
@@ -250,10 +251,13 @@ class IosxeBatch(ScheduledRequest):
         return self
 
     def request_for(self, device):
-        request = IosxeUpgradeRequest.model_validate(
+        request = self.request_model.model_validate(
             {**merged(self.defaults, self.overrides.get(device, {})), "device": device}
         )
         return within_window(self, request)
+
+
+IosxeBatch.request_model = IosxeUpgradeRequest
 
 
 class ConfigComparison(Model):

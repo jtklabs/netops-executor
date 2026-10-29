@@ -63,6 +63,8 @@ def masked(line):
 class IosxeRunner(StepRunner):
     device_errors = (DeviceError,)
     error = DeviceError
+    # Where files go under NETOPS_BACKUP_ROOT, and the format GET /backup reports.
+    subdirectory, backup_format = "iosxe", "iosxe-running-config"
 
     def __init__(self, settings, store, job, worker, ios=None, sleep=time.sleep, clock=time.monotonic):
         super().__init__(settings, store, job, worker, sleep, clock)
@@ -76,7 +78,9 @@ class IosxeRunner(StepRunner):
 
     def directory(self):
         r = self.request
-        path = under(self.settings.backup_root, r.backup_directory or "iosxe/" + self.device.id)
+        path = under(
+            self.settings.backup_root, r.backup_directory or self.subdirectory + "/" + self.device.id
+        )
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         return path
 
@@ -106,11 +110,16 @@ class IosxeRunner(StepRunner):
         ]
         if on_target:
             problems += [
-                f"member {n} runs {m['version']} in {m['mode']} mode"
+                f"member {n} runs {m['version']}" + (f" in {m['mode']} mode" if m["mode"] else "")
                 for n, m in sorted(members.items())
-                if release(m["version"]) != release(self.request.target_version) or m["mode"] != "INSTALL"
+                if self.off_target(m)
             ]
         return problems
+
+    def off_target(self, member):
+        return (
+            release(member["version"]) != release(self.request.target_version) or member["mode"] != "INSTALL"
+        )
 
     def prevalidate(self):
         r = self.request
@@ -167,23 +176,27 @@ class IosxeRunner(StepRunner):
         running_config = self.ios.config("running-config")
         if on_target and not r.stage_only and not boot_ok(running_config):
             raise DeviceError("running the target, but boot system is not flash:packages.conf")
-        if r.stage_only:
-            self.result["pre_validation"] = {}
-        else:
-            path = self.directory() / (self.job["id"] + "-" + self.device.id + "-running-config.txt")
-            self.write_private(path, running_config.encode())
-            self.artifact(self.device.id, "config", path, "iosxe-running-config")
-            self.result["pre_validation"] = {
-                "traffic": self.ios.traffic(),
-                "config_sha256": hashlib.sha256(normalized(running_config, boot=True).encode()).hexdigest(),
-                "baseline": {
-                    "path": str(path.relative_to(self.settings.backup_root.resolve())),
-                    "sha256": digest(path),
-                },
-                "unsaved": self.ios.unsaved(),
-                "boot_ok": boot_ok(running_config),
-            }
+        self.capture_baseline(running_config, boot_ok=boot_ok(running_config))
         self.event("pre_validation_completed", upgrade_needed=not on_target)
+
+    def capture_baseline(self, running_config, **extra):
+        """Save the running configuration privately; validation compares the new release with it."""
+        if self.request.stage_only:
+            self.result["pre_validation"] = {}
+            return
+        path = self.directory() / (self.job["id"] + "-" + self.device.id + "-running-config.txt")
+        self.write_private(path, running_config.encode())
+        self.artifact(self.device.id, "config", path, self.backup_format)
+        self.result["pre_validation"] = {
+            "traffic": self.ios.traffic(),
+            "config_sha256": hashlib.sha256(normalized(running_config, boot=True).encode()).hexdigest(),
+            "baseline": {
+                "path": str(path.relative_to(self.settings.backup_root.resolve())),
+                "sha256": digest(path),
+            },
+            "unsaved": self.ios.unsaved(),
+            **extra,
+        }
 
     def baseline_config(self):
         saved = self.result["pre_validation"]["baseline"]
@@ -222,9 +235,8 @@ class IosxeRunner(StepRunner):
 
     def flash(self):
         stack = self.ios.stack()
-        return {n: self.ios.flash(n, self.request.image.name) for n in sorted(stack)}, next(
-            (n for n, s in stack.items() if s["role"] == "Active"), None
-        )
+        active = next((n for n, s in stack.items() if s["role"] in ("Active", "Master")), None)
+        return {n: self.ios.flash(n, self.request.image.name, n == active) for n in sorted(stack)}, active
 
     def stage(self):
         r, image = self.request, self.request.image
@@ -367,6 +379,11 @@ class IosxeRunner(StepRunner):
                 raise
             # A deadline or dropped session leaves the outcome to fresh observations.
             self.event("install_response_uncertain")
+        self.await_reload()
+
+    def await_reload(self):
+        """Wait until every original member answers on the target, Ready and freshly booted."""
+        r, source = self.request, self.result["source"]
         self.ios.close()
         start = self.clock()
         deadline = start + r.reboot_timeout
@@ -400,34 +417,27 @@ class IosxeRunner(StepRunner):
             status = problems[0]
         raise DeviceError("the stack was not verified on the target before timeout: " + status)
 
-    def system_sample(self):
-        r = self.request
-        critical, findings = [], []
-        info, stack = self.ios.version(), self.ios.stack()
+    def identity_problems(self, info, stack):
+        """Every original member back, Ready on the target, and the same hardware."""
         source = self.result["source"]
         missing = sorted(set(source["members"]) - set(info["members"]))
-        if missing:
-            critical.append("member(s) " + ", ".join(missing) + " missing")
-        critical += self.stack_problems(info, stack, on_target=True)
+        problems = ["member(s) " + ", ".join(missing) + " missing"] if missing else []
+        problems += self.stack_problems(info, stack, on_target=True)
         if {n: m["model"] for n, m in info["members"].items()} != {
             n: m["model"] for n, m in source["members"].items()
         } or (source["serials"] and info["serials"] != source["serials"]):
-            critical.append("a different switch or stack answered after the reload")
-        summary = self.ios.install_summary()
-        if (
-            set(summary["committed"]) != set(source["members"])
-            or not all(release_in(v, r.target_version) for v in summary["committed"].values())
-            or summary["pending"]
-        ):
-            critical.append("the target image is not committed on every member")
+            problems.append("a different switch or stack answered after the reload")
+        return problems
+
+    def config_sample(self, critical, findings):
+        """Compare the running configuration with the baseline under config_policy."""
+        policy = self.request.config_policy
         running = self.ios.config("running-config")
-        if not boot_ok(running):
-            critical.append("boot system is not flash:packages.conf")
-        result = compare_configs(self.baseline_config(), running, r.config_policy)
+        result = compare_configs(self.baseline_config(), running, policy)
         self.record_config(result, running)
         for kind in ("removed", "added"):
             count = result[kind + "_count"]
-            action = getattr(r.config_policy, kind)
+            action = getattr(policy, kind)
             if not count or action == "ignore":
                 continue
             message = f"{count} configuration line(s) {kind} beyond the tolerated release differences"
@@ -437,6 +447,23 @@ class IosxeRunner(StepRunner):
                 findings.append(
                     {"category": "config", "change": kind, "objects": [masked(x) for x in result[kind][:100]]}
                 )
+        return running
+
+    def system_sample(self):
+        r = self.request
+        critical, findings = [], []
+        info, stack = self.ios.version(), self.ios.stack()
+        source = self.result["source"]
+        critical += self.identity_problems(info, stack)
+        summary = self.ios.install_summary()
+        if (
+            set(summary["committed"]) != set(source["members"])
+            or not all(release_in(v, r.target_version) for v in summary["committed"].values())
+            or summary["pending"]
+        ):
+            critical.append("the target image is not committed on every member")
+        if not boot_ok(self.config_sample(critical, findings)):
+            critical.append("boot system is not flash:packages.conf")
         self.result["post_system"] = {"version": info["version"], "members": info["members"]}
         return critical, findings
 

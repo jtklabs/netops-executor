@@ -9,6 +9,7 @@ from .config import Settings
 from .engine import Runner
 from .eos_engine import EosRunner
 from .execution import ExecutionRunner
+from .ios_engine import IosRunner
 from .iosxe_engine import IosxeRunner
 from .panos_engine import PanosRunner
 from .snmp import SnmpRunner
@@ -41,6 +42,8 @@ def process(settings, store, job, worker):
             if job["kind"] == "eos_upgrade"
             else IosxeRunner
             if job["kind"] == "iosxe_upgrade"
+            else IosRunner
+            if job["kind"] == "ios_upgrade"
             else Runner
         )
         runner(settings, store, job, worker).run()

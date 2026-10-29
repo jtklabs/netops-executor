@@ -16,6 +16,7 @@ from .config import Settings, under
 from .credentials import Credential, Vault
 from .eos_models import EosBatch, EosUpgradeRequest
 from .execution_models import Batch, HTTPJob, ManualCompletion, SSHJob, ValidationDecision
+from .ios_models import IosBatch, IosUpgradeRequest
 from .iosxe_config import compare as compare_configs
 from .iosxe_models import ConfigComparison, IosxeBatch, IosxeUpgradeRequest
 from .models import JobRequest, Model, Name, RecoveryResolution, RollbackRequest
@@ -40,6 +41,7 @@ class JobResponse(Model):
         "panos_upgrade",
         "eos_upgrade",
         "iosxe_upgrade",
+        "ios_upgrade",
     ]
     parent: str | None
     request: dict
@@ -94,7 +96,7 @@ class BatchItem(Model):
 
 class BatchResponse(Model):
     id: str
-    kind: Literal["upgrade", "panos_upgrade", "eos_upgrade", "iosxe_upgrade"] = "upgrade"
+    kind: Literal["upgrade", "panos_upgrade", "eos_upgrade", "iosxe_upgrade", "ios_upgrade"] = "upgrade"
     name: str
     status: Literal["completed", "needs_attention", "in_progress"]
     device_count: int
@@ -142,6 +144,12 @@ class EosPlanResponse(Model):
 
 class IosxePlanResponse(Model):
     request: IosxeUpgradeRequest
+    steps: list[str]
+    lock_key: str
+
+
+class IosPlanResponse(Model):
+    request: IosUpgradeRequest
     steps: list[str]
     lock_key: str
 
@@ -257,7 +265,7 @@ def create_app(settings=None):
                 raise HTTPException(422, "backup directory escapes BACKUP_ROOT") from None
         return EosPlanResponse(request=request, steps=request.plan(), lock_key=lock_key(request.device))
 
-    def iosxe_planned(request):
+    def iosxe_planned(request, response=IosxePlanResponse):
         try:
             device = settings.device(request.device)
             peers = [settings.device(p) for p in request.peers]
@@ -272,7 +280,7 @@ def create_app(settings=None):
                 under(settings.backup_root, request.backup_directory)
             except ValueError:
                 raise HTTPException(422, "backup directory escapes BACKUP_ROOT") from None
-        return IosxePlanResponse(request=request, steps=request.plan(), lock_key=lock_key(request.device))
+        return response(request=request, steps=request.plan(), lock_key=lock_key(request.device))
 
     @app.get("/healthz")
     def healthz():
@@ -695,6 +703,52 @@ def create_app(settings=None):
             for device in wave.devices:
                 iosxe_planned(request.request_for(device))
         return published(store.create_batch(request, idempotency_key, lock_key, kind="iosxe_upgrade"))
+
+    ios_tags = ["Classic IOS upgrades (2960-X)"]
+
+    @app.post(
+        "/api/v1/ios/plan",
+        dependencies=authenticated,
+        response_model=IosPlanResponse,
+        tags=ios_tags,
+        summary="Normalize a Catalyst 2960-X classic IOS upgrade and show its steps without device access",
+    )
+    def ios_plan(request: IosUpgradeRequest):
+        return iosxe_planned(request, IosPlanResponse)
+
+    @app.post(
+        "/api/v1/ios/jobs",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=JobResponse,
+        tags=ios_tags,
+        summary="Queue one Catalyst 2960-X switch or stack upgrade over SSH",
+        description="Prechecks, .tar copy and checksum, archive download-sw, reload, stack verification and post-validation with release-tolerant configuration comparison run on a worker. Poll GET /api/v1/jobs/{job_id}. Supports Idempotency-Key.",
+    )
+    def ios_job(
+        request: IosUpgradeRequest,
+        idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
+    ):
+        p = iosxe_planned(request, IosPlanResponse)
+        return store.submit(request.model_dump(mode="json"), p.lock_key, idempotency_key, kind="ios_upgrade")
+
+    @app.post(
+        "/api/v1/ios/upgrade-batches",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=BatchResponse,
+        tags=ios_tags,
+        summary="Queue ordered waves of Catalyst 2960-X upgrades",
+        description="Each wave starts only after every earlier item passed validation or was marked done.",
+    )
+    def ios_batch(
+        request: IosBatch,
+        idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
+    ):
+        for wave in request.waves:
+            for device in wave.devices:
+                iosxe_planned(request.request_for(device), IosPlanResponse)
+        return published(store.create_batch(request, idempotency_key, lock_key, kind="ios_upgrade"))
 
     @app.post(
         "/api/v1/iosxe/config-compare",

@@ -419,6 +419,29 @@ const examples = {
     allowed_source_versions: ["17.9.5"],
     image: { name: "cat9k_iosxe.17.12.06.SPA.bin", sha256: "REPLACE_WITH_SHA256" },
   },
+  "ios/upgrade-batches": {
+    name: "Change791",
+    defaults: {
+      target_version: "15.2(7)E10",
+      allowed_source_versions: ["15.2(7)E3", "15.2(7)E8"],
+      image: {
+        name: "c2960x-universalk9-tar.152-7.E10.tar",
+        sha256: "REPLACE_WITH_SHA256",
+        md5: "CISCO_PUBLISHED_MD5",
+        device_url: "http://images.example.com/c2960x-universalk9-tar.152-7.E10.tar",
+      },
+    },
+    waves: [
+      { wave: 1, upgrade_at_a_time: 1, devices: ["192.0.2.51"] },
+      { wave: 2, upgrade_at_a_time: 20, devices: ["192.0.2.52", "192.0.2.53"] },
+    ],
+  },
+  "ios/jobs": {
+    device: "192.0.2.51",
+    target_version: "15.2(7)E10",
+    allowed_source_versions: ["15.2(7)E3"],
+    image: { name: "c2960x-universalk9-tar.152-7.E10.tar", sha256: "REPLACE_WITH_SHA256" },
+  },
   "iosxe/config-compare": {
     before: "PASTE show running-config FROM BEFORE THE UPGRADE",
     after: "PASTE show running-config FROM AFTER THE UPGRADE",
