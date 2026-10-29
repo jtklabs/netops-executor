@@ -32,7 +32,9 @@ def parser():
     credential.add_argument("profile")
     credential.add_argument("--file", required=True, help="JSON file, or - for stdin")
     request = commands.add_parser("request")
-    request.add_argument("--kind", required=True, choices=["upgrade", "batch", "ssh", "http", "snmp"])
+    request.add_argument(
+        "--kind", required=True, choices=["upgrade", "batch", "ssh", "http", "snmp", "panos", "panos-batch"]
+    )
     request.add_argument("--file", required=True, help="JSON file, or - for stdin")
     request.add_argument("--idempotency-key")
     batch = commands.add_parser("batch")
@@ -141,6 +143,8 @@ def main():
                     "ssh": "ssh/jobs",
                     "http": "http/jobs",
                     "snmp": "snmp/walks",
+                    "panos": "panos/jobs",
+                    "panos-batch": "panos/upgrade-batches",
                 }[args.kind],
             )
         elif args.command == "credential-put":

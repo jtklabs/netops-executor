@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from .models import JobRequest, Model, Name, ScheduledRequest
+from .panos_models import within_window
 from .platforms import DeviceType
 
 
@@ -75,6 +76,10 @@ class Wave(Model):
     def ips_valid(cls, values):
         return [str(ip_address(v)) for v in values]
 
+    @property
+    def members(self):
+        return self.ips
+
 
 class Batch(ScheduledRequest):
     name: str = Field(min_length=1, max_length=160)
@@ -99,15 +104,7 @@ class Batch(ScheduledRequest):
 
     def request_for(self, ip):
         request = JobRequest.model_validate({**self.defaults, **self.overrides.get(ip, {}), "device": ip})
-        starts = [value for value in (self.start_at, request.start_at) if value is not None]
-        deadlines = [value for value in (self.latest_start_at, request.latest_start_at) if value is not None]
-        return JobRequest.model_validate(
-            {
-                **request.model_dump(),
-                "start_at": max(starts) if starts else None,
-                "latest_start_at": min(deadlines) if deadlines else None,
-            }
-        )
+        return within_window(self, request)
 
 
 class ValidationDecision(Model):

@@ -312,7 +312,9 @@ $("backup").onclick = async () => {
     const url = URL.createObjectURL(await r.blob());
     const a = document.createElement("a");
     a.href = url;
-    a.download = selected + ".ucs";
+    a.download =
+      (r.headers.get("content-disposition") || "").match(/filename="?([^";]+)/)?.[1] ||
+      selected + ".ucs";
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (e) {
@@ -351,6 +353,26 @@ const examples = {
       { wave: 1, upgrade_at_a_time: 2, ips: ["192.0.2.10", "192.0.2.11"] },
       { wave: 2, upgrade_at_a_time: 1, ips: ["192.0.2.12"] },
     ],
+  },
+  "panos/upgrade-batches": {
+    name: "Change456",
+    defaults: {
+      panorama: "panorama",
+      target_version: "11.1.6-h3",
+      allowed_source_versions: ["10.2.9-h1", "10.2.10-h2"],
+      validation_policy: { on_timeout: "needs_review" },
+    },
+    waves: [
+      { wave: 1, upgrade_at_a_time: 2, serials: ["007951000123456", "007951000123457"] },
+      { wave: 2, upgrade_at_a_time: 20, serials: ["007951000123458"] },
+    ],
+  },
+  "panos/jobs": {
+    serial: "007951000123456",
+    panorama: "panorama",
+    target_version: "11.1.6-h3",
+    allowed_source_versions: ["10.2.9-h1"],
+    f5_drain: { device: "192.0.2.51", remaining_connections: 50 },
   },
   "ssh/jobs": {
     device: "192.0.2.10",
@@ -396,7 +418,7 @@ $("json-submit").onsubmit = async (e) => {
     $("json-result").textContent = JSON.stringify(result, null, 2);
     jsonPending = "";
     jsonKey = "";
-    if (path !== "upgrade-batches") selected = result.id;
+    if (!path.endsWith("upgrade-batches")) selected = result.id;
     message("Queued: " + result.id);
     await refresh();
   } catch (err) {

@@ -8,6 +8,7 @@ from .cipher_scan import CipherScanRunner
 from .config import Settings
 from .engine import Runner
 from .execution import ExecutionRunner
+from .panos_engine import PanosRunner
 from .snmp import SnmpRunner
 from .store import Store
 
@@ -32,6 +33,8 @@ def process(settings, store, job, worker):
             if job["kind"] == "snmp_walk"
             else ExecutionRunner
             if job["kind"] in ("ssh", "http")
+            else PanosRunner
+            if job["kind"] == "panos_upgrade"
             else Runner
         )
         runner(settings, store, job, worker).run()

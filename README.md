@@ -1,12 +1,13 @@
 # NetOps Executor
 
 A standalone remote for a central controller, with a versioned API, web console,
-CLI and durable SQLite queue. It runs F5 upgrades over **SSH/SFTP only**, arbitrary
-SSH commands, HTTPS requests (including Panorama requests targeting a firewall),
-asynchronous SNMP v3 walks, and Nmap SSH/HTTPS cipher scans. It has no NetBox dependency.
+CLI and durable SQLite queue. It runs F5 upgrades over **SSH/SFTP only**, PAN-OS
+firewall upgrades through **Panorama's XML API**, arbitrary SSH commands, HTTPS
+requests (including Panorama requests targeting a firewall), asynchronous SNMP v3
+walks, and Nmap SSH/HTTPS cipher scans. It has no NetBox dependency.
 
-The main application submits jobs and polls their results. F5 upgrade sequencing,
-reconnection, HA checks, backups, validation and rollback live on the remote.
+The main application submits jobs and polls their results. F5 and PAN-OS upgrade
+sequencing, reconnection, HA checks, backups and validation live on the remote.
 For generic commands, the main application interprets the returned output and
 submits a **separate** remediation job, optionally linked with `parent_job_id`.
 
@@ -30,7 +31,10 @@ keeps the token only in tab memory and uses the same API.
 | POST | `/api/v1/plan` | Normalize a single upgrade and show inherited steps without device access |
 | POST | `/api/v1/jobs` | Queue one F5 upgrade/backup/validation job |
 | POST | `/api/v1/upgrade-batches` | Queue ordered waves with per-wave concurrency |
-| GET | `/api/v1/upgrade-batches` or `/{id}` | Batch membership, wave progress and item results |
+| GET | `/api/v1/upgrade-batches` or `/{id}` | F5 or PAN-OS batch membership, wave progress and item results |
+| POST | `/api/v1/panos/plan` | Normalize a PAN-OS upgrade and show its steps without device access |
+| POST | `/api/v1/panos/jobs` | Queue one PAN-OS firewall upgrade through Panorama |
+| POST | `/api/v1/panos/upgrade-batches` | Queue ordered PAN-OS waves by serial with per-wave concurrency |
 | POST | `/api/v1/ssh/jobs` | Queue one or more SSH commands |
 | POST | `/api/v1/http/jobs` | Queue one or more HTTPS requests |
 | GET | `/api/v1/http/targets` | Configured HTTP targets |
@@ -41,7 +45,8 @@ keeps the token only in tab memory and uses the same API.
 | GET | `/api/v1/snmp/walks/{id}/results?after=0&limit=500` | Paginated partial/final rows |
 | GET | `/api/v1/jobs?limit=100&offset=0` or `/jobs/{id}` | Jobs and full results/credential audit |
 | GET | `/api/v1/jobs/{id}/events?after=0&limit=500` | Ordered events; advance cursor to last `seq` |
-| GET | `/api/v1/jobs/{id}/backup` | Download completed UCS backup |
+| GET | `/api/v1/jobs/{id}/backup` | Download completed UCS backup (or the first PAN-OS config backup) |
+| GET | `/api/v1/jobs/{id}/artifacts/{name}` | Download a saved PAN-OS running config or tech support file |
 | POST | `/api/v1/jobs/{id}/cancel` | Durable cancellation request |
 | POST | `/api/v1/jobs/{id}/validation-decisions` | Accept/retry a particular validation gate |
 | POST | `/api/v1/jobs/{id}/mark-done` | Manually complete an item for the wave barrier |
@@ -544,6 +549,284 @@ carry later configuration changes back. Keep database, backups and keyring as a
 recovery set. Back up SQLite with its online backup API, or stop all processes
 before copying its database/WAL files. No automatic purge removes rollback history.
 
+## PAN-OS upgrades through Panorama
+
+Every firewall operation is a Panorama XML API request with `target=<firewall
+serial>`, so the remote needs HTTPS to Panorama only. By default, software is
+**pushed from Panorama's software repository** ("Panorama > Device Deployment >
+Software"), so firewalls need no internet access: `request batch software upload
+file <PanOS_<family>-<version>> devices <serial>`. The platform family comes from
+Panorama's device list (`PanOS_3200-11.1.6-h3`, `PanOS_vm-11.1.6-h3`); override it
+with `software_family`. A file missing from the repository is downloaded by
+Panorama (`request batch software download file`) unless `panorama_download` is
+false; an offline Panorama can use files uploaded to it manually. Concurrent jobs
+that need the same file wait for one shared repository download. With
+`software_source: update_server`, each firewall instead downloads from its own
+update server (`request system software download`). Installation always runs on
+the firewall (`request system software install version`) after it reports the
+image as downloaded.
+
+Provision the Panorama HTTP target and its API key profile as described under
+[Generic SSH and HTTP jobs](#generic-ssh-and-http-jobs) (`scheme:header`,
+`header:X-PAN-KEY`, read-only `type=version` probe). The key's Panorama admin role
+needs operational, configuration, commit and export requests for the managed
+firewalls, plus Panorama's batch software requests. Then send this to
+`/api/v1/panos/upgrade-batches`:
+
+```json
+{
+  "name": "Change456",
+  "start_at": "2026-11-01T02:00:00Z",
+  "latest_start_at": "2026-11-01T08:00:00Z",
+  "defaults": {
+    "panorama": "panorama",
+    "target_version": "11.1.6-h3",
+    "allowed_source_versions": ["10.2.9-h1", "10.2.10-h2"],
+    "approved_models": ["PA-3220", "PA-3410"],
+    "validation_policy": {"on_timeout": "needs_review", "min_route_percent": 90}
+  },
+  "waves": [
+    {"wave": 1, "upgrade_at_a_time": 2, "serials": ["007951000123456", "007951000123457"]},
+    {"wave": 2, "upgrade_at_a_time": 20, "serials": ["007951000123458", "007951000123459"]}
+  ],
+  "overrides": {"007951000123459": {"validation_policy": {"min_session_percent": 50}}}
+}
+```
+
+### Pushing images from the executor and preloading
+
+When Panorama is far from some firewalls, the executor nearer to them can push the
+image itself: `software_source: executor` uploads each `PanOS_<family>-<version>` file
+from `NETOPS_IMAGE_ROOT` (or downloads it first from an HTTPS `source_url`, with the
+same SHA-256 checks as F5 images) straight to the firewall's management API
+(`type=import&category=software`). Listing, install and everything else still go
+through Panorama. The firewall must be reachable from the executor on HTTPS, with an
+API key in an `http` credential profile whose `targets` name the serial or address.
+Certificates are verified; set `NETOPS_FIREWALL_CA_FILE` for a private CA, and use
+`management_addresses` hostnames when certificates do not carry IP addresses. After an
+upload the firewall must list the image with the same SHA-256. A firewall's web front
+end can answer 504 on a large import that still completes (seen on PA-VM 12.1.6 at
+about seven minutes), so an unconfirmed upload is confirmed from the software list.
+
+Preload is `stage_only: true`, usually with `software_source: executor`, run as a batch
+days before the maintenance window. It checks the firewall is connected, on an allowed
+version and idle, then stages the base (when needed) and target images on every member
+of each pair. It takes no backups and skips uncommitted-change, HA-health and traffic
+gates, because staging does not touch traffic; the upgrade job enforces them later and
+skips images already present with a matching checksum:
+
+```json
+{
+  "name": "Preload-456",
+  "defaults": {
+    "stage_only": true,
+    "software_source": "executor",
+    "target_version": "12.2.2",
+    "allowed_source_versions": ["12.1.6"],
+    "images": [{"name": "PanOS_vm-12.2.2", "sha256": "15cb673b4cf66c2dd8a1c5ade5892beaf522612ec7545b976abf56376d5d956c"}]
+  },
+  "waves": [{"wave": 1, "upgrade_at_a_time": 10, "serials": ["007951000123456", "007951000123457"]}]
+}
+```
+
+### Progress
+
+Poll `GET /api/v1/jobs/{id}` and read `result.progress`:
+
+```json
+{
+  "step": "stage:007951000123456",
+  "steps_completed": 3,
+  "steps_total": 14,
+  "percent": 21,
+  "operation": {"kind": "upload", "serial": "007951000123456", "percent": 42.5,
+                "file": "PanOS_vm-12.2.2", "bytes": 725614592, "total_bytes": 1707326960},
+  "updated_at": "2026-11-01T02:14:09.512000+00:00"
+}
+```
+
+`percent` counts completed steps against the planned total for this job, including
+both members of a pair. `operation` describes what is running now, with a real
+`percent` where one exists: `upload` (bytes sent by the executor), `software_upload`,
+`software_download`, `panorama_download`, `install` and `commit` (the PAN-OS job's own
+percentage) and `f5_drain` (connections drained towards the threshold). `reboot`
+(elapsed/timeout), `validation` (consecutive passes), `tech_support`, `settle` and
+`upload_confirmation` carry status fields instead. The same operations appear as
+`progress` events in `GET /api/v1/jobs/{id}/events`, written at most every five
+seconds or when the whole percent changes, alongside every step's own events.
+
+A batch holds up to 1,000 serials. Wave barriers, start windows, `defaults`,
+`overrides` and idempotency behave exactly as for F5 batches; poll
+`/api/v1/upgrade-batches/{id}` (`kind: panos_upgrade`). Put a small canary wave
+first. A failed or `needs_review` item stops later waves but not its own wave.
+For one firewall, send the defaults plus `"serial"` to `/api/v1/panos/jobs`.
+
+**An HA pair is one unit of work.** The job for either member upgrades both, one at
+a time, and reserves both. When the batch also lists the peer, the peer's item runs
+afterwards, finds the pair on the target and only validates. A job holds a worker
+while it waits for backups, transfers, installs and reboots, so run at least as many
+workers as the largest `upgrade_at_a_time` (`executor_workers`, or
+`--scale worker=N`).
+
+| Option | Behavior/default |
+| --- | --- |
+| `target_version` | Version to install, such as `11.1.6-h3` |
+| `allowed_source_versions` | Required exact running-version allowlist; members already on the target only validate |
+| `software_source` | `panorama` (default), `executor` or `update_server` |
+| `images` | For `executor`: `{name, sha256, source_url?}` per `PanOS_<family>-<version>` file, any families |
+| `management_addresses` | For `executor`: firewall management address per serial; default Panorama's `ip-address` |
+| `firewall_credential_profiles` | For `executor`: HTTP API key profiles for the firewalls; default profiles whose `targets` match the serial or address |
+| `panorama_download` | Default true: Panorama downloads a missing file into its repository |
+| `software_family` | Override the family used in Panorama filenames |
+| `download_versions` | Extra versions to stage, not install, such as intermediate base images for a skip-version upgrade |
+| `auto_base_image` | Default true: when changing feature release, first stage the lowest release of the target's feature release that the source offers below the target (base releases are not always `X.Y.0`); without one, install the target directly |
+| `approved_models` | Optional model allowlist matching `show system info` |
+| `stage_only` | Preload: stage images only, ahead of the window; no backups, install, reboot or traffic/HA-health gates. A later full job reuses the staged images |
+| `config_backup`, `tech_support` | Default true: save each member's running configuration XML and a tech support file under `NETOPS_BACKUP_ROOT` (`backup_directory`, default `panos/<serial>`) |
+| `ha_policy.upgrade_order` | `standby_first` (default) or `active_first` |
+| `ha_policy.disable_preemption` | Default true: disable preemption and commit before the first suspend, then restore and commit after both members validate; false leaves preemption alone |
+| `ha_policy.failback` | Default true: return traffic to the other member when the member left carrying it fails validation |
+| `ha_policy.require_running_sync` | Default true: same-version pairs must report running configuration synchronized |
+| `job_wait_timeout` | Wait for running firewall jobs before starting; default 600 seconds |
+| `tech_support_timeout`, `commit_timeout` | Defaults 1800 and 900 seconds |
+| `download_timeout`, `install_timeout` | Per transfer or install job; default 3600 seconds each |
+| `reboot_timeout` | Verified reboot window; default 2700, maximum 7200 seconds |
+| `validation_timeout` | Bounded window for each validation step; default 900 seconds |
+
+Steps, in order:
+
+1. **Discover and reserve.** Panorama's `show devices all` must list the firewall as
+   connected. The HA peer comes from Panorama's `ha/peer/serial`.
+2. **Prechecks for every member** (failure here changes nothing): serial,
+   `operational-mode normal`, allowed source version, approved model, chassis ready,
+   no running firewall jobs, no uncommitted local changes (`check pending-changes`),
+   connected to Panorama. HA pairs must be active/passive (one active, one passive)
+   or active/active (both active), with peer connections up and running
+   configuration synchronized when both run the same version.
+3. **Baseline:** hardware interface link states, legacy routing-table routes, BGP
+   peer states, IPsec tunnel states, active session count and ARP count. An
+   active/passive pair has one baseline from its active member; active/active
+   members and standalone firewalls each have their own. A command that fails, such
+   as routes with the Advanced Routing Engine, is recorded as a gap and never compared.
+4. **Backups** of each member to be upgraded: running configuration and tech support
+   file (`type=export&category=tech-support`). Download them with
+   `GET /api/v1/jobs/{id}/artifacts/{name}`.
+5. **Stage** every required image on each member to be upgraded.
+6. **Disable preemption** (`ha_policy.disable_preemption`, default true). Members
+   whose HA state reports preemptive `yes` get `preemptive no` in their local HA
+   election settings, committed and read back. With the flag false, preemption is
+   left alone; a suspended member never preempts, but a higher-priority member can
+   take traffic back as soon as it is made functional.
+7. **Upgrade each member in order.** `standby_first` takes the passive member
+   (active-secondary in active/active) first:
+   1. Suspend it. Suspending a member that carries traffic is a **handoff**: the
+      peer must then pass traffic validation against the baseline while carrying
+      everything. A member is never suspended unless its peer is functional.
+   2. Install, then reboot. A new boot is verified by the target version and an
+      uptime shorter than the time since the restart request.
+   3. **System validation** while still suspended: target version, chassis ready,
+      latest auto-commit finished `OK`, connected to Panorama on the target. Content
+      version changes are reported.
+   4. Make it functional (`request high-availability state functional`), then
+      validate the pair: every member functional with its peer connection up, one
+      active member (active/passive) or every functional member active
+      (active/active), and traffic on each active member against its baseline.
+
+   In an active/passive pair this means: upgrade the standby, validate it, fail
+   over to it by suspending the active, validate the upgraded member carrying
+   traffic, then upgrade the former active.
+8. **Restore preemption** where this job disabled it, commit, and run a final pair
+   validation, which also requires synchronized running configuration.
+
+Traffic validation: with `restore_required` (default), every baseline interface
+that was up, BGP peer that was Established and IPsec tunnel that was active must
+recover. Routes must stay at `min_route_percent` (default 90) of the baseline.
+Session and ARP counts fail only an explicit `min_session_percent`/`min_arp_percent`.
+Other differences (added/removed routes, state changes) are warnings. Samples run
+every `sample_interval_seconds` (15), after `settling_seconds` (60) following a
+reboot, and need `consecutive_passes` (2) clean samples. On timeout, `on_timeout`
+selects `needs_review` (default) or `fail`; `noncritical_differences:
+require_review` also gates on warnings.
+
+**Failback.** If the member left carrying traffic after a handoff fails
+validation, the job makes the suspended member functional again and suspends the
+failing one before it stops. In the standby-first order that returns traffic to the
+original active member on its original software, with the upgraded member
+suspended for inspection.
+
+Review gates are named after the step (`handoff:<serial>`,
+`validate_system:<serial>`, `validate_traffic:<serial>`, `validate_final`,
+`validate_current`) and use the existing validation-decision endpoint. `retry`
+samples again; for a handoff gate it returns the failed-back member to service and
+hands off again. `accept` records the waiver and continues. A decision resumes
+after the completed steps and never repeats a backup, transfer, install or reboot.
+
+Failures before any install, and installs the firewall reports as failed, end as
+`failed` and release the reservations: suspended members return to service and
+preemption is restored first. An install with an unknown outcome, a staged image or
+a reboot that did not pass validation ends as `recovery_required`. Both HA
+reservations stay held, preemption stays disabled, and an upgraded but unvalidated
+member **stays suspended** so its peer keeps carrying traffic. Inspect the
+firewalls, make them functional and restore preemption manually if appropriate,
+then resolve the job. Cancellation during prechecks, backups or staging is clean.
+An install is never interrupted; cancellation is honored after it finishes. Results
+contain per-member `members` (role, source, software, install, boot, validation),
+`upgrade_plan`, `completed_steps`, `preemption`, `artifacts`, `pre_validation`,
+`post_validation`, `validation_findings` and `validated_version`.
+
+### Draining a related F5
+
+Where a standalone firewall has a 1:1 related F5 whose virtual addresses keep an
+upstream load balancer (such as a GCP internal load balancer) sending traffic through
+the firewall, add `f5_drain`. Disabling those addresses fails the load balancer's
+health checks, so traffic moves off this firewall before it is upgraded:
+
+```json
+{
+  "defaults": {
+    "target_version": "11.1.6-h3",
+    "allowed_source_versions": ["10.2.9-h1"],
+    "f5_drain": {"remaining_connections": 50, "timeout_seconds": 900}
+  },
+  "overrides": {
+    "007951000123456": {"f5_drain": {"device": "192.0.2.51"}},
+    "007951000123457": {"f5_drain": {"device": "192.0.2.52", "addresses": ["/Common/10.1.1.10"]}}
+  }
+}
+```
+
+PAN-OS batch overrides merge into nested defaults, so a per-serial F5 address keeps the
+shared thresholds. `device` is an F5 inventory ID or management IP reached over SSH
+with the usual encrypted SSH profiles (`credential_profiles` optional). The drain
+reuses the F5 upgrade job's logic and reserves the same F5 keys as F5 upgrade, SSH and
+HTTP jobs, so none can overlap it.
+
+| `f5_drain` option | Behavior/default |
+| --- | --- |
+| `device` | Required: the related F5 |
+| `addresses` | Virtual addresses to drain, such as `/Common/10.1.1.10`; default every enabled address |
+| `remaining_connections` or `reduction_percent` | Drain target from F5 clientside virtual-server connections; neither means zero |
+| `timeout_seconds` | Default 600 |
+| `proceed_on_timeout` | Default false: restore the addresses and stop; true upgrades anyway |
+
+Prechecks also require the F5 to be standalone and active, with no automatic config
+sync, and every listed address to exist. After backups and staging, the job disables
+the enabled addresses (recording each before the command) and waits for connections
+to reach the threshold. It then installs, reboots and validates the firewall; session
+and ARP thresholds are skipped while drained. Next it re-enables only the addresses it
+disabled, saves the F5 configuration, reads the states back, and runs
+`validate_restored` with all thresholds. A failure before the install restores the F5.
+An upgraded firewall that has not passed validation leaves the F5 drained, so no
+traffic reaches it, and ends `recovery_required` or at a review gate; accepting or
+retrying the gate continues to the restore. `result.f5_drain` records the original
+address states, changed addresses, connection counts, threshold, timeout and restore.
+HA pairs move traffic with failover instead, so `f5_drain` is refused for them.
+
+Preemption is restored by setting the original value locally. If HA election
+settings come from a Panorama template, this leaves a local override equal to the
+template value. Mixed-version pairs may not synchronize sessions across a
+feature-release difference, so a handoff can drop sessions.
+
 ## Generic SSH and HTTP jobs
 
 ```json
@@ -644,6 +927,48 @@ Responses are bounded to 4 MiB each/32 MiB per job. Basic, bearer and named-head
 credentials are supported. Use `params`, `form`, `json_body` or `body` as appropriate;
 paths must remain relative to the configured target. Authentication belongs in
 profiles rather than submitted headers. `parent_job_id` links follow-up jobs.
+
+## Device trust: self-signed certificates and host keys
+
+Devices usually present self-signed certificates. Firewall management APIs used by
+PAN-OS executor uploads, and HTTP targets configured with `"tls": "pin"`, trust the
+certificate an endpoint presents the **first** time and pin its SHA-256 fingerprint in
+the job store (shared by every worker). Afterwards only that certificate is accepted.
+The check runs during the TLS handshake, before any request, API key or password is
+sent, so a changed certificate stops the job without exposing credentials. Set
+`NETOPS_FIREWALL_CA_FILE` to verify firewall certificates against a CA instead.
+
+SSH works the same way with `NETOPS_SSH_HOST_KEYS=pin`: a host missing from
+`NETOPS_KNOWN_HOSTS` has its key pinned on first use and a different key is rejected.
+Entries in the known_hosts file always take precedence. The default remains
+`known_hosts`, which rejects unknown hosts.
+
+After a certificate or host key is legitimately replaced, inspect the device, then
+reset its pin; the next connection pins the new one:
+
+```http
+GET /api/v1/pins
+DELETE /api/v1/pins/tls:192.0.2.10:443
+DELETE /api/v1/pins/ssh:192.0.2.10:22
+```
+
+Pinning trusts the first connection. Make that first connection from the executor's
+network, ideally during a preload, or pre-seed known_hosts where SSH keys are known.
+
+### PAN-OS device API keys from saved credentials
+
+Firewall management APIs can use an `http` profile with `scheme: keygen` instead of a
+stored API key. At connection time the executor exchanges the saved username and
+password for an API key (`type=keygen`, password in the POST body, never the URL),
+uses it for that connection only and never stores it. A rejected login moves to the
+next eligible profile and cools down for 60 seconds, as for other credentials:
+
+```json
+{"kind": "http", "scheme": "keygen", "username": "automation", "password": "SECRET", "targets": ["007951000123456", "198.51.100.20"]}
+```
+
+`targets` limits the profile to firewall serials or management addresses. Panorama
+targets keep their stored `X-PAN-KEY` profile.
 
 ## Encrypted credentials and Ansible
 
@@ -831,6 +1156,8 @@ netops-executor request --kind batch --file batch.json --idempotency-key change1
 netops-executor request --kind ssh --file commands.json
 netops-executor request --kind http --file requests.json
 netops-executor request --kind snmp --file walk.json
+netops-executor request --kind panos-batch --file panos-batch.json --idempotency-key change456
+netops-executor request --kind panos --file panos-upgrade.json
 netops-executor credential-put ssh-local --file -       # JSON from stdin
 netops-executor job JOB_UUID
 netops-executor batch BATCH_UUID
@@ -871,6 +1198,28 @@ pairs. F5OS, VIPRION slot orchestration, vCMP hosts, active-active traffic group
 and multi-host shared queues are not implemented. Unrecognized critical device
 output fails closed. The WAF traffic gate requires the configured log adapter or
 manual acceptance; it does not assume a universal SSH request-log interface.
+
+PAN-OS upgrades are tested against a simulated Panorama and firewalls, and partly
+against a PA-VM 12.1.6 active/passive lab pair without a Panorama using
+`tests/lab/panos_direct.py`. That harness runs the real runner and sends every
+proxied request straight to the firewall's XML API; only Panorama's own commands are
+emulated. Lab-verified on 12.1.6: prechecks, HA state parsing (including disabled
+config sync), traffic baselines, running config and tech support export, HA election
+set and commit, the standby-first suspend, functional, failover and validation
+sequence, image import and staging of 12.2.2, an executor preload (`software_source: executor`)
+that uploaded 1.7 GB in about two minutes with live byte progress, survived the
+firewall's HTTP 504 and confirmed the image by SHA-256 about 16 minutes later while the
+other member was skipped as already staged, and an install refused by the firewall
+(unlicensed VM: "Base license is not valid") returning the suspended standby to
+service and failing cleanly. Not yet verified on real devices: Panorama's device list fields, the batch
+software commands (taken from published community automation rather than the API
+reference), the `target` relay itself, install and reboot on a newer image, HA suspend
+persistence across reboot, active/active state names and the F5 drain against a real
+BIG-IP. A successful install needs licensed firewalls. Lab acceptance through a
+real Panorama is required before production use. Supported scope is standalone
+firewalls and active/passive or active/active pairs managed by one Panorama. Firewall
+clusters, Advanced Routing Engine route comparison and automatic downgrade are not
+implemented.
 
 Command references: [virtual addresses](https://clouddocs.f5.com/cli/tmsh-reference/latest/modules/ltm/ltm_virtual-address.html),
 [UCS](https://clouddocs.f5.com/cli/tmsh-reference/latest/modules/sys/sys_ucs.html),

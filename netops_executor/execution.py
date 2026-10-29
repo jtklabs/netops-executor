@@ -11,9 +11,76 @@ import httpx
 from .credentials import AuthenticationRejected, Selector, Vault
 from .execution_models import HTTPJob, SSHJob
 from .network_ssh import NetworkSSH
+from .pins import PinnedContext, tls_key
 from .platforms import NETWORK_TYPES, validate_commands
 from .ssh import SSH
 from .store import CancelRequested, Deferred, LostOwnership
+
+
+def credential_options(selector, c, client=None):
+    if c["scheme"] == "basic":
+        selector.secrets.add(base64.b64encode((c["username"] + ":" + c["password"]).encode()).decode())
+        return {"auth": (c["username"], c["password"])}
+    if c["scheme"] == "keygen":
+        return {"headers": {"X-PAN-KEY": keygen(client, selector, c)}}
+    return {"headers": {c["header"]: ("Bearer " if c["scheme"] == "bearer" else "") + c["token"]}}
+
+
+def keygen(client, selector, c):
+    """Exchange saved device credentials for a PAN-OS API key; the key is never stored."""
+    # The password travels in the POST body, never in the URL.
+    response = client.post(
+        "/api/", data={"type": "keygen", "user": c["username"], "password": c["password"]}, timeout=30
+    )
+    if len(response.content) > 1024 * 1024:
+        raise ValueError("keygen response exceeded bounds")
+    try:
+        root = ET.fromstring(response.content)
+    except ET.ParseError:
+        raise ValueError("keygen returned malformed XML") from None
+    key = root.findtext("result/key")
+    if root.get("status") == "success" and key:
+        selector.secrets.add(key)
+        return key
+    detail = " ".join(root.itertext()).lower()
+    if (
+        response.status_code in (401, 403)
+        or root.get("code") in ("403", "16")
+        or "invalid credential" in detail
+    ):
+        raise AuthenticationRejected()
+    raise ValueError("keygen did not return an API key")
+
+
+def probe(client, target, options, timeout, guard):
+    # Probe separately so a write is never used to test a series of credentials.
+    with client.stream(
+        target.auth_probe_method,
+        target.auth_probe_path,
+        params=target.auth_probe_params,
+        timeout=min(timeout, 30),
+        **options,
+    ) as response:
+        content = bytearray()
+        probe_deadline = time.monotonic() + 30
+        for chunk in response.iter_bytes():
+            guard()
+            content.extend(chunk)
+            if len(content) > 4 * 1024 * 1024 or time.monotonic() > probe_deadline:
+                raise ValueError("authentication probe exceeded bounds")
+        if response.status_code == 401:
+            raise AuthenticationRejected()
+        if not 200 <= response.status_code < 300:
+            raise ValueError("HTTP authentication probe did not succeed")
+        if content.lstrip().startswith(b"<"):
+            try:
+                root = ET.fromstring(content)
+            except ET.ParseError:
+                raise ValueError("authentication probe returned malformed XML") from None
+            if root.tag == "response" and root.get("status") == "error":
+                if root.get("code") in ("403", "16"):
+                    raise AuthenticationRejected()
+                raise ValueError("Panorama authentication probe reported an application error")
 
 
 class ExecutionRunner:
@@ -120,16 +187,14 @@ class ExecutionRunner:
         )
         if not self.store.reserve(self.job["id"], self.worker, ["http:" + target.id]):
             self.store.defer(self.job["id"], self.worker)
-        verify = ssl.create_default_context(cafile=target.ca_file) if target.ca_file else True
+        verify = (
+            PinnedContext(self.store, tls_key(target.base_url))
+            if target.tls == "pin"
+            else ssl.create_default_context(cafile=target.ca_file)
+            if target.ca_file
+            else True
+        )
         success = True
-
-        def options(c):
-            if c["scheme"] == "basic":
-                selector.secrets.add(
-                    base64.b64encode((c["username"] + ":" + c["password"]).encode()).decode()
-                )
-                return {"auth": (c["username"], c["password"])}
-            return {"headers": {c["header"]: ("Bearer " if c["scheme"] == "bearer" else "") + c["token"]}}
 
         with httpx.Client(
             base_url=target.base_url, verify=verify, follow_redirects=False, trust_env=False
@@ -139,46 +204,13 @@ class ExecutionRunner:
                 self.guard()
                 if not target.auth_probe_path:
                     raise ValueError("HTTP execution requires a configured read-only authentication probe")
-                selected = {}
 
                 def authenticate(c):
-                    # Probe separately so a write is never used to test a series of credentials.
-                    path = target.auth_probe_path or operation.path
-                    params = target.auth_probe_params if target.auth_probe_path else operation.params
-                    with client.stream(
-                        target.auth_probe_method if target.auth_probe_path else "GET",
-                        path,
-                        params=params,
-                        timeout=min(operation.timeout_seconds, 30),
-                        **options(c),
-                    ) as response:
-                        content = bytearray()
-                        probe_deadline = time.monotonic() + 30
-                        for chunk in response.iter_bytes():
-                            self.guard()
-                            content.extend(chunk)
-                            if len(content) > 4 * 1024 * 1024 or time.monotonic() > probe_deadline:
-                                raise ValueError("authentication probe exceeded bounds")
-                        if response.status_code == 401:
-                            raise AuthenticationRejected()
-                        if not 200 <= response.status_code < 300:
-                            raise ValueError("HTTP authentication probe did not succeed")
-                        if content.lstrip().startswith(b"<"):
-                            try:
-                                root = ET.fromstring(content)
-                            except ET.ParseError:
-                                raise ValueError("authentication probe returned malformed XML") from None
-                            if root.tag == "response" and root.get("status") == "error":
-                                if root.get("code") in ("403", "16"):
-                                    raise AuthenticationRejected()
-                                raise ValueError(
-                                    "Panorama authentication probe reported an application error"
-                                )
-                    selected.update(c)
-                    return True
+                    options = credential_options(selector, c, client)
+                    probe(client, target, options, operation.timeout_seconds, self.guard)
+                    return options
 
-                selector.run(authenticate)
-                auth_options = options(selected)
+                auth_options = dict(selector.run(authenticate))
                 auth_options["headers"] = {**operation.headers, **auth_options.get("headers", {})}
                 self.uncertain = True
                 self.result["in_flight"] = index

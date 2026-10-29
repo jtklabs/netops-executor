@@ -183,7 +183,8 @@
         <section>
           <h2>API job submission</h2>
           <p class="hint">
-            Use JSON to submit waves, commands, HTTP requests or SNMP walks.
+            Use JSON to submit F5 or PAN-OS waves, commands, HTTP requests or
+            SNMP walks.
             Authentication stays in server-side credential profiles.
           </p>
           <form id="json-submit">
@@ -191,6 +192,8 @@
               >Job type
               <select id="json-kind">
                 <option value="upgrade-batches">Upgrade batch</option>
+                <option value="panos/upgrade-batches">PAN-OS upgrade batch</option>
+                <option value="panos/jobs">PAN-OS upgrade</option>
                 <option value="ssh/jobs">SSH commands</option>
                 <option value="http/jobs">HTTP requests</option>
                 <option value="snmp/walks">SNMP v3 walks</option>

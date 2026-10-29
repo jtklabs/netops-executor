@@ -3,6 +3,7 @@ import os
 from dataclasses import dataclass, field
 from ipaddress import ip_address
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
@@ -41,6 +42,8 @@ class HTTPTarget(Model):
     auth_probe_path: str | None = None
     auth_probe_method: str = "GET"
     auth_probe_params: dict[str, str] = Field(default_factory=dict)
+    # "pin" trusts the first certificate the target presents (self-signed devices), then only it.
+    tls: Literal["verify", "pin"] = "verify"
     # A configured read-only probe is required before trying credentials for writes.
 
     @model_validator(mode="after")
@@ -79,6 +82,10 @@ class Settings:
 
     credential_key_file: Path | None = None
     http_targets: dict[str, HTTPTarget] = field(default_factory=dict)
+    # CA bundle for firewall management certificates; without one, firewall certificates are pinned.
+    firewall_ca_file: Path | None = None
+    # "pin" trusts an SSH host key missing from known_hosts on first use, then only that key.
+    ssh_host_keys: str = "known_hosts"
 
     def device(self, identifier):
         if identifier in self.devices:
@@ -115,6 +122,12 @@ class Settings:
             if len({p.id for p in profiles}) != len(profiles):
                 raise ValueError("duplicate SNMP profile IDs")
             result.snmp_profiles = {p.id: p for p in profiles}
+        result.ssh_host_keys = env("NETOPS_SSH_HOST_KEYS", "known_hosts")
+        if result.ssh_host_keys not in ("known_hosts", "pin"):
+            raise ValueError("NETOPS_SSH_HOST_KEYS must be known_hosts or pin")
+        result.firewall_ca_file = (
+            Path(env("NETOPS_FIREWALL_CA_FILE")) if env("NETOPS_FIREWALL_CA_FILE") else None
+        )
         result.credential_key_file = (
             Path(env("NETOPS_CREDENTIAL_KEY_FILE")) if env("NETOPS_CREDENTIAL_KEY_FILE") else None
         )

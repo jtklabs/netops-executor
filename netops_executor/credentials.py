@@ -22,7 +22,8 @@ class Credential(Model):
     enable_password: SecretStr | None = None
     token: SecretStr | None = None
     header: str = Field(default="Authorization", pattern=r"^[A-Za-z0-9-]{1,80}$")
-    scheme: Literal["bearer", "basic", "header"] = "bearer"
+    # keygen: username and password exchanged for a PAN-OS API key (type=keygen) at connect time.
+    scheme: Literal["bearer", "basic", "header", "keygen"] = "bearer"
     security_level: Literal["authPriv", "authNoPriv", "noAuthNoPriv"] = "authPriv"
     auth_protocol: Literal["SHA", "SHA224", "SHA256", "SHA384", "SHA512"] = "SHA256"
     auth_password: SecretStr | None = None
@@ -54,7 +55,7 @@ class Credential(Model):
         if self.kind == "ssh" and (not self.username or not (self.password or self.private_key)):
             raise ValueError("SSH requires username and password or private_key")
         if self.kind == "http" and not (
-            self.username and self.password if self.scheme == "basic" else self.token
+            self.username and self.password if self.scheme in ("basic", "keygen") else self.token
         ):
             raise ValueError("HTTP requires credentials for the selected scheme")
         if self.kind == "f5_admin":

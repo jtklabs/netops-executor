@@ -9,6 +9,7 @@ from pathlib import Path
 import paramiko
 
 from .credentials import AuthenticationRejected, Selector, Vault
+from .pins import PinnedHostKeys
 from .store import Store
 
 
@@ -37,9 +38,16 @@ class SSH:
             return self.client
         self.close()
         client = paramiko.SSHClient()
-        client.load_host_keys(str(self.settings.known_hosts))
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
         d = self.device
+        pinning = self.settings.ssh_host_keys == "pin"
+        # Verified known_hosts entries always win; pinning only covers hosts missing from the file.
+        if not pinning or Path(self.settings.known_hosts).is_file():
+            client.load_host_keys(str(self.settings.known_hosts))
+        client.set_missing_host_key_policy(
+            PinnedHostKeys(Store(self.settings.data_dir / "jobs.sqlite3"), f"ssh:{d.host}:{d.port}")
+            if pinning
+            else paramiko.RejectPolicy()
+        )
         base = dict(
             hostname=d.host,
             port=d.port,

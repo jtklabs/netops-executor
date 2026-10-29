@@ -70,6 +70,9 @@ class Store:
                     id TEXT PRIMARY KEY, job TEXT NOT NULL, revision INTEGER NOT NULL,
                     phase TEXT NOT NULL, findings TEXT NOT NULL, state TEXT NOT NULL, decision TEXT, decision_key TEXT UNIQUE);
                 CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, heartbeat REAL, job TEXT, state TEXT);
+                CREATE TABLE IF NOT EXISTS pins (
+                    key TEXT PRIMARY KEY, kind TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                    first_seen REAL NOT NULL, last_seen REAL NOT NULL);
                 CREATE INDEX IF NOT EXISTS resources_job ON resources(job);
                 CREATE INDEX IF NOT EXISTS gates_job ON gates(job);
                 CREATE INDEX IF NOT EXISTS batch_members_batch ON batch_members(batch,wave);
@@ -252,7 +255,7 @@ class Store:
                 VALUES (?,?,?,?,?,?,'queued',?,?,?,?,?)""",
                 (
                     job_id,
-                    request.get("device", request.get("device_ip")),
+                    request.get("device", request.get("device_ip", request.get("serial"))),
                     lock_key,
                     kind,
                     parent,
@@ -583,7 +586,7 @@ class Store:
                 (job, time.time(), json.dumps(data)),
             )
 
-    def create_batch(self, batch, key, lock_key):
+    def create_batch(self, batch, key, lock_key, kind="upgrade"):
         payload = batch.model_dump_json(
             exclude={key for key in ("start_at", "latest_start_at") if getattr(batch, key) is None}
         )
@@ -601,17 +604,18 @@ class Store:
             db.execute("INSERT INTO batches VALUES (?,?,?,?)", (batch_id, payload, key, now))
             ordinal = 0
             for wave in batch.waves:
-                for ip in wave.ips:
+                for member in wave.members:
                     request, start_at, latest_start_at = self.scheduled_request(
-                        batch.request_for(ip).model_dump(mode="json")
+                        batch.request_for(member).model_dump(mode="json")
                     )
                     job = str(uuid.uuid4())
                     db.execute(
-                        "INSERT INTO jobs(id,device,lock_key,kind,request,status,created,updated,start_at,latest_start_at) VALUES (?,?,?,'upgrade',?,'queued',?,?,?,?)",
+                        "INSERT INTO jobs(id,device,lock_key,kind,request,status,created,updated,start_at,latest_start_at) VALUES (?,?,?,?,?,'queued',?,?,?,?)",
                         (
                             job,
-                            ip,
-                            lock_key(ip),
+                            member,
+                            lock_key(member),
+                            kind,
                             json.dumps(request),
                             now + ordinal * 0.000001,
                             now,
@@ -633,7 +637,7 @@ class Store:
         jobs = [
             dict(r)
             for r in db.execute(
-                "SELECT j.id,j.device,j.status,j.result,j.start_at,j.latest_start_at,j.started_at,m.wave,m.ordinal FROM jobs j JOIN batch_members m ON m.job=j.id WHERE m.batch=? ORDER BY m.ordinal",
+                "SELECT j.id,j.device,j.kind,j.status,j.result,j.start_at,j.latest_start_at,j.started_at,m.wave,m.ordinal FROM jobs j JOIN batch_members m ON m.job=j.id WHERE m.batch=? ORDER BY m.ordinal",
                 (batch,),
             )
         ]
@@ -661,6 +665,7 @@ class Store:
         return {
             "waves": waves,
             "id": batch,
+            "kind": jobs[0]["kind"] if jobs else "upgrade",
             "name": json.loads(row["request"])["name"],
             "start_at": json.loads(row["request"]).get("start_at"),
             "latest_start_at": json.loads(row["request"]).get("latest_start_at"),
@@ -781,6 +786,29 @@ class Store:
                         continue
                     return all(verified.get(k) == active.get(k) for k in ("volume", "version", "build"))
         return False
+
+    def pin(self, key, kind, fingerprint):
+        """Trust on first use: record a first fingerprint, then accept only a match."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT fingerprint FROM pins WHERE key=?", (key,)).fetchone()
+            now = time.time()
+            if row is None:
+                db.execute("INSERT INTO pins VALUES (?,?,?,?,?)", (key, kind, fingerprint, now, now))
+                return True
+            if row["fingerprint"] != fingerprint:
+                return False
+            db.execute("UPDATE pins SET last_seen=? WHERE key=?", (now, key))
+            return True
+
+    def pins(self):
+        with self.connect() as db:
+            return [dict(r) for r in db.execute("SELECT * FROM pins ORDER BY key")]
+
+    def unpin(self, key):
+        with self.connect() as db:
+            if not db.execute("DELETE FROM pins WHERE key=?", (key,)).rowcount:
+                raise KeyError(key)
 
     def worker_seen(self, worker, job=None, state="available"):
         with self.connect() as db:
