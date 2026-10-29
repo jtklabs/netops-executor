@@ -33,7 +33,9 @@ def parser():
     credential.add_argument("--file", required=True, help="JSON file, or - for stdin")
     request = commands.add_parser("request")
     request.add_argument(
-        "--kind", required=True, choices=["upgrade", "batch", "ssh", "http", "snmp", "panos", "panos-batch"]
+        "--kind",
+        required=True,
+        choices=["upgrade", "batch", "ssh", "http", "snmp", "panos", "panos-batch", "eos", "eos-batch"],
     )
     request.add_argument("--file", required=True, help="JSON file, or - for stdin")
     request.add_argument("--idempotency-key")
@@ -145,6 +147,8 @@ def main():
                     "snmp": "snmp/walks",
                     "panos": "panos/jobs",
                     "panos-batch": "panos/upgrade-batches",
+                    "eos": "eos/jobs",
+                    "eos-batch": "eos/upgrade-batches",
                 }[args.kind],
             )
         elif args.command == "credential-put":

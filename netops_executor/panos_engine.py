@@ -27,8 +27,8 @@ from .panos import (
     repository_upload,
 )
 from .panos_models import PanosUpgradeRequest, feature_release, version_key
-from .ssh import SSH, DeviceError, digest
-from .store import CancelRequested, Deferred, LostOwnership, NeedsReview
+from .ssh import SSH, digest
+from .stepped import StepRunner
 
 TRAFFIC_CATEGORIES = ("interfaces", "routes", "bgp_peers", "ipsec_tunnels", "sessions", "arp")
 # Values that mean an object carries traffic; baseline objects in this state must recover.
@@ -104,20 +104,18 @@ def carries(state):
     return state == "active" or state.startswith("active-")
 
 
-class PanosRunner:
+class PanosRunner(StepRunner):
+    device_errors = (PanosError,)
+    error = PanosError
+
     def __init__(
         self, settings, store, job, worker, panorama=None, sleep=time.sleep, clock=time.monotonic, f5=None
     ):
-        self.settings, self.store, self.job, self.worker = settings, store, job, worker
-        self.sleep, self.clock = sleep, clock
-        self.result = job["result"]
-        self.phase = "connect"
-        self.request = self.decision = None
+        super().__init__(settings, store, job, worker, sleep, clock)
         self.panorama = panorama
         self.firewalls = {}
         self.direct_clients = {}
         self.f5_device = f5
-        self.last_report = float("-inf")
 
     def setup(self):
         # Inside run(): a removed Panorama target or credential fails this job, never the worker.
@@ -139,29 +137,6 @@ class PanosRunner:
             self.firewalls[serial] = Firewall(self.panorama, serial)
         return self.firewalls[serial]
 
-    def guard(self):
-        self.store.guard(self.job["id"], self.worker)
-
-    def checkpoint(self):
-        self.store.checkpoint(self.job["id"], self.worker)
-
-    def audit(self, data):
-        self.store.credential_event(self.job["id"], self.worker, {**data, "phase": self.phase})
-
-    def event(self, step, **data):
-        self.phase = step
-        self.store.record(self.job["id"], self.worker, step, data, self.result)
-
-    def intent(self, step, **data):
-        # Persist BEFORE issuing a disruptive write. An interrupted operation is never replayed.
-        self.result.setdefault("mutations", []).append(step)
-        self.event(step + "_started", **data)
-
-    def wait(self, seconds):
-        self.guard()
-        self.sleep(seconds)
-        self.guard()
-
     @property
     def ha(self):
         return self.result["ha"]
@@ -179,55 +154,6 @@ class PanosRunner:
     def version(self, serial):
         member = self.member(serial)
         return member.get("boot_verified", {}).get("version") or member["source"]["version"]
-
-    def step(self, key, action):
-        """Run each named step once; a review continuation resumes after the completed ones."""
-        done = self.result.setdefault("completed_steps", [])
-        if key in done:
-            return
-        progress = self.result.setdefault("progress", {})
-        progress.update(step=key, operation=None)
-        action()
-        done.append(key)
-        total = progress.get("steps_total")
-        progress.update(
-            steps_completed=len(done),
-            percent=round(100 * len(done) / total) if total else None,
-            operation=None,
-        )
-        self.event("step_completed", name=key)
-
-    def report(self, kind, serial=None, percent=None, force=False, **detail):
-        """Expose the current operation in result.progress for pollers.
-
-        Saved at most every five seconds, or when the operation or its whole percent changes.
-        """
-        progress = self.result.setdefault("progress", {})
-        previous = progress.get("operation") or {}
-        operation = {
-            "kind": kind,
-            "serial": serial,
-            "percent": None if percent is None else round(percent, 1),
-        }
-        progress["operation"] = {**operation, **detail}
-        progress["updated_at"] = datetime.now(timezone.utc).isoformat()
-        changed = (previous.get("kind"), previous.get("serial")) != (kind, serial) or (
-            percent is not None and int(percent) != int(previous.get("percent") or -1)
-        )
-        if force or changed or self.clock() - self.last_report >= 5:
-            self.last_report = self.clock()
-            self.store.record(self.job["id"], self.worker, "progress", progress["operation"], self.result)
-
-    def take(self, phase):
-        """Consume the operator decision for the gate this phase opened, if any."""
-        if not self.decision or self.decision["phase"] != phase:
-            return None
-        decision, self.decision = self.decision, None
-        action = decision["decision"]["action"]
-        if action == "accept":
-            self.result.setdefault("manual_validations", []).append({**decision["decision"], "phase": phase})
-            self.event("manual_validation_applied", gate_id=decision["id"], phase=phase)
-        return action
 
     def unsafe(self):
         # A staged image boots on the next restart; a suspended unit carries no traffic.
@@ -543,20 +469,6 @@ class PanosRunner:
         self.result["upgrade_plan"] = self.upgrade_plan()
         self.event("pre_validation_completed", plan=self.result["upgrade_plan"])
 
-    def artifact(self, serial, kind, path):
-        item = {
-            "name": path.name,
-            "serial": serial,
-            "kind": kind,
-            "path": str(path.relative_to(self.settings.backup_root.resolve())),
-            "sha256": digest(path),
-            "bytes": path.stat().st_size,
-        }
-        self.result.setdefault("artifacts", []).append(item)
-        if kind == "config" and "backup" not in self.result:
-            self.result["backup"] = {**item, "format": "panos-running-config-xml"}
-        self.event(kind + "_backup_completed", serial=serial, bytes=item["bytes"])
-
     def backup(self, serial):
         r = self.request
         if not (r.config_backup or r.tech_support):
@@ -573,7 +485,7 @@ class PanosRunner:
                 stream.write(firewall.running_config())
                 stream.flush()
                 os.fsync(stream.fileno())
-            self.artifact(serial, "config", path)
+            self.artifact(serial, "config", path, "panos-running-config-xml")
         if r.tech_support:
             self.event("tech_support_backup_started", serial=serial)
             path = directory / (prefix + "-techsupport.tgz")
@@ -1034,56 +946,6 @@ class PanosRunner:
                 return
         raise PanosError(serial + ": a new boot on the target version was not verified before timeout")
 
-    def validate(self, phase, sample, failback=None):
-        if self.take(phase) == "accept":
-            return
-        policy, timeout = self.request.validation_policy, self.request.validation_timeout
-        deadline = self.clock() + timeout
-        passes = 0
-        while True:
-            self.checkpoint()
-            try:
-                critical, findings = sample()
-            except PanosError as exc:
-                critical, findings = ["device unavailable: " + str(exc)], []
-            review = bool(findings) and policy.noncritical_differences == "require_review"
-            self.result.setdefault("validation_findings", {})[phase] = findings
-            self.result["validation_differences"] = [
-                f for items in self.result["validation_findings"].values() for f in items
-            ]
-            self.result["validation_issues"] = critical
-            passes = passes + 1 if not critical and not review else 0
-            required = policy.consecutive_passes if timeout else 1
-            self.report(
-                "validation",
-                phase=phase,
-                consecutive_passes=passes,
-                required_passes=required,
-                critical=len(critical),
-                differences=len(findings),
-            )
-            self.event(
-                phase + "_sample",
-                critical=critical,
-                difference_count=len(findings),
-                consecutive_passes=passes,
-            )
-            if passes >= required:
-                return
-            if self.clock() >= deadline:
-                if failback:
-                    failback()
-                if policy.on_timeout == "fail":
-                    raise PanosError(phase + " timed out; findings recorded")
-                self.store.open_gate(
-                    self.job["id"],
-                    self.worker,
-                    phase,
-                    {"critical": critical, "differences": findings},
-                    self.result,
-                )
-            self.wait(min(policy.sample_interval_seconds, max(0, deadline - self.clock())))
-
     def system_sample(self, serial):
         r = self.request
         firewall = self.fw(serial)
@@ -1168,14 +1030,6 @@ class PanosRunner:
             findings += [{**f, "serial": serial} for f in items]
             post[serial] = {"traffic": current, "metrics": metrics}
         return critical, findings
-
-    def settle(self):
-        remaining = self.request.validation_policy.settling_seconds
-        while remaining > 0:
-            self.report("settle", remaining_seconds=remaining)
-            self.checkpoint()
-            self.wait(min(15, remaining))
-            remaining -= min(15, remaining)
 
     def member_steps(self, serial, handoff):
         steps = []
@@ -1268,61 +1122,8 @@ class PanosRunner:
         if unchanged and self.f5_drained():
             self.f5_restore()
 
-    def run(self):
-        try:
-            self.upgrade()
-            self.result["completed"] = True
-            self.event("completed")
-            # Panorama, firewall and F5 connections use different profiles; a warning means one
-            # target fell back from one profile to another.
-            profiles = {}
-            for usage in self.store.get(self.job["id"])["credential_usage"]:
-                if usage["outcome"] == "authenticated":
-                    profiles.setdefault(usage["target"], set()).add(usage["profile"])
-            warnings = bool(
-                self.result.get("validation_differences")
-                or self.result.get("manual_validations")
-                or any(len(used) > 1 for used in profiles.values())
-            )
-            self.store.finish(
-                self.job["id"], self.worker, "completed_with_warnings" if warnings else "succeeded"
-            )
-        except (LostOwnership, Deferred, NeedsReview):
-            pass
-        except CancelRequested:
-            try:
-                self.restore_service()
-                self.result["cancelled_at"] = self.phase
-                self.event("cancel_acknowledged")
-                self.store.finish(
-                    self.job["id"], self.worker, "recovery_required" if self.unsafe() else "cancelled"
-                )
-            except LostOwnership:
-                pass
-            except Exception:
-                self.store.finish(self.job["id"], self.worker, "recovery_required")
-        except Exception as exc:
-            message = (
-                str(exc)
-                if isinstance(exc, (PanosError, DeviceError))
-                else "operation failed (" + type(exc).__name__ + ")"
-            )
-            self.result["error"] = message
-            try:
-                try:
-                    self.restore_service()
-                except LostOwnership:
-                    raise
-                except Exception:
-                    self.result["restore_failed"] = True
-                self.event("failed", message=message)
-                self.store.finish(
-                    self.job["id"], self.worker, "recovery_required" if self.unsafe() else "failed"
-                )
-            except LostOwnership:
-                pass
-        finally:
-            if self.panorama is not None:
-                self.panorama.close()
-            for client in self.direct_clients.values():
-                client.close()
+    def close(self):
+        if self.panorama is not None:
+            self.panorama.close()
+        for client in self.direct_clients.values():
+            client.close()

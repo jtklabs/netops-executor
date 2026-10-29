@@ -2,7 +2,8 @@
 
 A standalone remote for a central controller, with a versioned API, web console,
 CLI and durable SQLite queue. It runs F5 upgrades over **SSH/SFTP only**, PAN-OS
-firewall upgrades through **Panorama's XML API**, arbitrary SSH commands, HTTPS
+firewall upgrades through **Panorama's XML API**, Arista EOS switch upgrades over
+**SSH**, arbitrary SSH commands, HTTPS
 requests (including Panorama requests targeting a firewall), asynchronous SNMP v3
 walks, and Nmap SSH/HTTPS cipher scans. It has no NetBox dependency.
 
@@ -35,6 +36,9 @@ keeps the token only in tab memory and uses the same API.
 | POST | `/api/v1/panos/plan` | Normalize a PAN-OS upgrade and show its steps without device access |
 | POST | `/api/v1/panos/jobs` | Queue one PAN-OS firewall upgrade through Panorama |
 | POST | `/api/v1/panos/upgrade-batches` | Queue ordered PAN-OS waves by serial with per-wave concurrency |
+| POST | `/api/v1/eos/plan` | Normalize an Arista EOS upgrade and show its steps without device access |
+| POST | `/api/v1/eos/jobs` | Queue one Arista EOS switch upgrade |
+| POST | `/api/v1/eos/upgrade-batches` | Queue ordered EOS waves by inventory ID or IP with per-wave concurrency |
 | POST | `/api/v1/ssh/jobs` | Queue one or more SSH commands |
 | POST | `/api/v1/http/jobs` | Queue one or more HTTPS requests |
 | GET | `/api/v1/http/targets` | Configured HTTP targets |
@@ -827,6 +831,85 @@ settings come from a Panorama template, this leaves a local override equal to th
 template value. Mixed-version pairs may not synchronize sessions across a
 feature-release difference, so a handoff can drop sessions.
 
+## Arista EOS upgrades
+
+EOS jobs run over the same audited SSH session as `arista_eos` SSH jobs (encrypted SSH
+profiles, `known_hosts` or `NETOPS_SSH_HOST_KEYS=pin`). Reads use EOS's structured
+`| json` output. The image is copied from the executor's `NETOPS_IMAGE_ROOT` (or its
+HTTPS `source_url`) to `flash:` with SCP over that session, then checked on the switch
+with `verify /sha512` against the executor's verified copy. The upgrade itself is EOS's
+native install mode, `install source flash:<image> now reload`, which points
+boot-config at the image and reloads; boot variables are never set by hand.
+
+```json
+{
+  "name": "Change789",
+  "defaults": {
+    "target_version": "4.32.2F",
+    "allowed_source_versions": ["4.30.5M", "4.31.3M"],
+    "image": {"name": "EOS-4.32.2F.swi", "sha256": "REPLACE_WITH_SHA256"},
+    "validation_policy": {"on_timeout": "needs_review"}
+  },
+  "overrides": {
+    "leaf1a": {"mlag_peer": "leaf1b"},
+    "leaf1b": {"mlag_peer": "leaf1a"}
+  },
+  "waves": [
+    {"wave": 1, "upgrade_at_a_time": 1, "devices": ["leaf1a"]},
+    {"wave": 2, "upgrade_at_a_time": 10, "devices": ["leaf1b", "leaf2a", "leaf3"]}
+  ]
+}
+```
+
+Send this to `/api/v1/eos/upgrade-batches`, or one request with `"device"` to
+`/api/v1/eos/jobs`. Devices are inventory IDs or management IPs; an inventory entry must
+be `arista_eos` (or untyped). Batch overrides merge into nested defaults, wave barriers
+and start windows behave as for F5 batches, and `result.progress` reports steps and the
+current operation, with byte percentages for the image copy.
+
+| Option | Behavior/default |
+| --- | --- |
+| `target_version`, `image` | Target release and its `.swi` (`name`, `sha256` of the executor's copy, optional `sha512` and `source_url`) |
+| `allowed_source_versions` | Required exact running-release allowlist; a switch already on the target and booting its image only validates |
+| `approved_models` | Optional `modelName` allowlist |
+| `mlag_peer` | The MLAG peer's inventory ID or IP: reserved for the whole job and checked healthy from its own side right before the reload |
+| `stage_only` | Preload: copy and verify the image only; no backups, saves, MLAG gates or reload |
+| `config_backup`, `tech_support` | Default true: save `show running-config` and `show tech-support` under `NETOPS_BACKUP_ROOT` (`eos/<device>`) |
+| `save_config` | Default true: `write memory` when running and startup configuration differ; false stops instead |
+| `minimum_free_bytes` | Flash reserve kept after the image; default 500,000,000 |
+| `upload_timeout`, `install_timeout`, `reboot_timeout`, `validation_timeout` | Defaults 3600, 1800, 1800 and 900 seconds |
+
+Steps: reserve the switch (and `mlag_peer`, with the same keys F5, SSH and EOS jobs use,
+so peers never reload together; giving MLAG peers the same inventory `lock_group` also
+serializes them); prechecks (allowed release and model; MLAG either disabled or active
+with negotiation connected, peer link up and consistent configuration; a target already
+running must also be in boot-config); baseline; backups; image copy and SHA-512 check
+(skipped when the image is already on flash with the right checksum, after a free-space
+check); `write memory` if needed; then, immediately before the install, a recheck that
+the running configuration (normalized, ignoring EOS metadata comments), release and MLAG
+health are unchanged. After `install source ... now reload` the job waits for the switch
+to answer on the target release with a fresh uptime, settles (`settling_seconds`, default
+120), then validates.
+
+System validation requires the target release, the same model and system MAC, and
+boot-config on the target image; unsaved or changed configuration and an unexpected
+reload cause are reported as warnings. Traffic validation compares the baseline: with
+`restore_required` (default), every interface that was `connected`, every LLDP neighbor
+(same device and port), every Established BGP peer, every FULL OSPF neighbor and every
+active port-channel member must recover; a switch that was in MLAG must return to
+`active` with the peer link up; routes must stay at `min_route_percent` (90); MAC and ARP
+counts fail only an explicit `min_mac_percent`/`min_arp_percent`. A command that cannot
+be read before the upgrade is a gap and never compared. Gates, decisions and timeouts
+work as for PAN-OS (`validate_system`, `validate_traffic`, `validate_current`).
+
+Failures before the install end `failed` with nothing changed on the switch beyond a
+copied image and a saved configuration. Once the install is sent, a failure ends
+`recovery_required` and keeps the reservations. `result.rollback` records the previous
+release and boot image, which stays on flash: recovery is
+`install source flash:<previous> now reload`. EOS upgrades are tested against simulated
+switches and canned EOS JSON only; lab acceptance on your EOS releases is required,
+especially for the `| json` fields, SCP to `/mnt/flash` and the install reload.
+
 ## Generic SSH and HTTP jobs
 
 ```json
@@ -1158,6 +1241,8 @@ netops-executor request --kind http --file requests.json
 netops-executor request --kind snmp --file walk.json
 netops-executor request --kind panos-batch --file panos-batch.json --idempotency-key change456
 netops-executor request --kind panos --file panos-upgrade.json
+netops-executor request --kind eos-batch --file eos-batch.json --idempotency-key change789
+netops-executor request --kind eos --file eos-upgrade.json
 netops-executor credential-put ssh-local --file -       # JSON from stdin
 netops-executor job JOB_UUID
 netops-executor batch BATCH_UUID

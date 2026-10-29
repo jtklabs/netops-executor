@@ -238,8 +238,8 @@ class SSH:
         return output.split()[0]
 
 
-def digest(path):
-    h = hashlib.sha256()
+def digest(path, algorithm="sha256"):
+    h = hashlib.new(algorithm)
     with open(path, "rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             h.update(chunk)

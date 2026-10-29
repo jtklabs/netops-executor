@@ -14,6 +14,7 @@ from . import __version__
 from .cipher_models import CipherScanRequest, CipherScanResult
 from .config import Settings, under
 from .credentials import Credential, Vault
+from .eos_models import EosBatch, EosUpgradeRequest
 from .execution_models import Batch, HTTPJob, ManualCompletion, SSHJob, ValidationDecision
 from .models import JobRequest, Model, Name, RecoveryResolution, RollbackRequest
 from .panos_models import PanosBatch, PanosUpgradeRequest
@@ -27,7 +28,9 @@ class JobResponse(Model):
     device: str
     lock_key: str
     lock_held: bool
-    kind: Literal["upgrade", "rollback", "snmp_walk", "ssh", "http", "cipher_scan", "panos_upgrade"]
+    kind: Literal[
+        "upgrade", "rollback", "snmp_walk", "ssh", "http", "cipher_scan", "panos_upgrade", "eos_upgrade"
+    ]
     parent: str | None
     request: dict
     status: Literal[
@@ -81,7 +84,7 @@ class BatchItem(Model):
 
 class BatchResponse(Model):
     id: str
-    kind: Literal["upgrade", "panos_upgrade"] = "upgrade"
+    kind: Literal["upgrade", "panos_upgrade", "eos_upgrade"] = "upgrade"
     name: str
     status: Literal["completed", "needs_attention", "in_progress"]
     device_count: int
@@ -117,6 +120,12 @@ class PlanResponse(Model):
 
 class PanosPlanResponse(Model):
     request: PanosUpgradeRequest
+    steps: list[str]
+    lock_key: str
+
+
+class EosPlanResponse(Model):
+    request: EosUpgradeRequest
     steps: list[str]
     lock_key: str
 
@@ -200,6 +209,23 @@ def create_app(settings=None):
             except ValueError:
                 raise HTTPException(422, "f5_drain.device must be an inventory ID or IP address") from None
         return PanosPlanResponse(request=request, steps=request.plan(), lock_key="panos:" + request.serial)
+
+    def eos_planned(request):
+        try:
+            device = settings.device(request.device)
+            peer = settings.device(request.mlag_peer) if request.mlag_peer else None
+        except ValueError:
+            raise HTTPException(422, "device and mlag_peer must be inventory IDs or IP addresses") from None
+        if device.id in settings.devices and device.device_type not in ("linux", "arista_eos"):
+            raise HTTPException(422, "device is not an arista_eos device")
+        if peer is not None and peer.id == device.id:
+            raise HTTPException(422, "mlag_peer must be the other switch")
+        if request.backup_directory:
+            try:
+                under(settings.backup_root, request.backup_directory)
+            except ValueError:
+                raise HTTPException(422, "backup directory escapes BACKUP_ROOT") from None
+        return EosPlanResponse(request=request, steps=request.plan(), lock_key=lock_key(request.device))
 
     @app.get("/healthz")
     def healthz():
@@ -526,6 +552,52 @@ def create_app(settings=None):
         return store.create_batch(
             request, idempotency_key, lambda serial: "panos:" + serial, kind="panos_upgrade"
         )
+
+    eos_tags = ["EOS upgrades"]
+
+    @app.post(
+        "/api/v1/eos/plan",
+        dependencies=authenticated,
+        response_model=EosPlanResponse,
+        tags=eos_tags,
+        summary="Normalize an Arista EOS upgrade and show its steps without device access",
+    )
+    def eos_plan(request: EosUpgradeRequest):
+        return eos_planned(request)
+
+    @app.post(
+        "/api/v1/eos/jobs",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=JobResponse,
+        tags=eos_tags,
+        summary="Queue one Arista EOS upgrade over SSH",
+        description="Prechecks, image copy and SHA-512 check, write memory, install source ... now reload, and post-validation run on a worker. Poll GET /api/v1/jobs/{job_id}. Supports Idempotency-Key.",
+    )
+    def eos_job(
+        request: EosUpgradeRequest,
+        idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
+    ):
+        p = eos_planned(request)
+        return store.submit(request.model_dump(mode="json"), p.lock_key, idempotency_key, kind="eos_upgrade")
+
+    @app.post(
+        "/api/v1/eos/upgrade-batches",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=BatchResponse,
+        tags=eos_tags,
+        summary="Queue ordered waves of Arista EOS upgrades",
+        description="Each wave starts only after every earlier item passed validation or was marked done. Put MLAG peers in different waves or set mlag_peer so they never reload together.",
+    )
+    def eos_batch(
+        request: EosBatch,
+        idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
+    ):
+        for wave in request.waves:
+            for device in wave.devices:
+                eos_planned(request.request_for(device))
+        return store.create_batch(request, idempotency_key, lock_key, kind="eos_upgrade")
 
     @app.post("/api/v1/jobs/{job_id}/validation-decisions", dependencies=authenticated, status_code=202)
     def decision(

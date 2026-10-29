@@ -374,6 +374,25 @@ const examples = {
     allowed_source_versions: ["10.2.9-h1"],
     f5_drain: { device: "192.0.2.51", remaining_connections: 50 },
   },
+  "eos/upgrade-batches": {
+    name: "Change789",
+    defaults: {
+      target_version: "4.32.2F",
+      allowed_source_versions: ["4.30.5M", "4.31.3M"],
+      image: { name: "EOS-4.32.2F.swi", sha256: "REPLACE_WITH_SHA256" },
+    },
+    overrides: { "192.0.2.31": { mlag_peer: "192.0.2.32" } },
+    waves: [
+      { wave: 1, upgrade_at_a_time: 1, devices: ["192.0.2.31"] },
+      { wave: 2, upgrade_at_a_time: 10, devices: ["192.0.2.32", "192.0.2.33"] },
+    ],
+  },
+  "eos/jobs": {
+    device: "192.0.2.31",
+    target_version: "4.32.2F",
+    allowed_source_versions: ["4.30.5M"],
+    image: { name: "EOS-4.32.2F.swi", sha256: "REPLACE_WITH_SHA256" },
+  },
   "ssh/jobs": {
     device: "192.0.2.10",
     device_type: "cisco_ios",
