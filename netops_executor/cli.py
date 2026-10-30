@@ -9,7 +9,7 @@ import httpx
 from dotenv import load_dotenv
 
 from .config import env
-from .models import JobRequest
+from .models import POOLS, QUEUES, JobRequest
 
 
 def parser():
@@ -20,11 +20,19 @@ def parser():
     serve = commands.add_parser("serve")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", default=8080, type=int)
-    commands.add_parser("worker")
+    worker = commands.add_parser("worker").add_mutually_exclusive_group()
+    worker.add_argument(
+        "--pool", choices=POOLS, help="Claim from this queue first, then the others when it is empty"
+    )
+    worker.add_argument(
+        "--queue", help="Exact comma-separated claim order (default: priority,upgrade,scheduled)"
+    )
+    worker.add_argument("--instance", help="systemd instance name: <pool>-<n>, or a number for no pool")
     commands.add_parser("devices")
     commands.add_parser("jobs")
     commands.add_parser("credentials")
     commands.add_parser("workers")
+    commands.add_parser("queues")
     commands.add_parser("rotate-credentials")
     key = commands.add_parser("init-key")
     key.add_argument("path", type=Path)
@@ -76,6 +84,7 @@ def parser():
             sub.add_argument("--worker-stopped", action="store_true")
             sub.add_argument("--start-at")
             sub.add_argument("--latest-start-at")
+            sub.add_argument("--queue", choices=QUEUES)
         if command == "resolve":
             sub.add_argument("--worker-stopped", required=True, action="store_true")
             sub.add_argument("--device-inspected", required=True, action="store_true")
@@ -85,6 +94,7 @@ def parser():
         sub.add_argument("--device", required=True)
         sub.add_argument("--start-at", help="Earliest start, ISO 8601 with timezone")
         sub.add_argument("--latest-start-at", help="Latest allowed start, ISO 8601 with timezone")
+        sub.add_argument("--queue", choices=QUEUES, help="Worker queue (default: upgrade)")
         sub.add_argument("--credential-profile", action="append", dest="credential_profiles")
         sub.add_argument("--ucs-credential")
         sub.add_argument("--images", type=Path, help="JSON array of image name, sha256, version, build, kind")
@@ -130,8 +140,13 @@ def main():
         return
     if args.command == "worker":
         from .worker import main as worker
+        from .worker import worker_queues
 
-        worker()
+        try:
+            queues = worker_queues(args.queue, args.pool, args.instance)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+        worker(queues)
         return
     if args.command == "init-key":
         from .credentials import initialize_key
@@ -206,7 +221,7 @@ def main():
                 method, body = "POST", {}
             if args.command == "rollback":
                 body["worker_stopped"] = args.worker_stopped
-                body.update(start_at=args.start_at, latest_start_at=args.latest_start_at)
+                body.update(start_at=args.start_at, latest_start_at=args.latest_start_at, queue=args.queue)
             if args.command == "resolve":
                 body = {
                     "worker_stopped": args.worker_stopped,

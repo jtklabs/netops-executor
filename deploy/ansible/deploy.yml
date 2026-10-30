@@ -4,7 +4,16 @@
   become: true
   vars:
     executor_source: "{{ playbook_dir }}/../.."
-    executor_workers: 2
+    # Workers per pool. Each worker claims from its pool's queue first, then the other pool's queue,
+    # then scheduled jobs. A plain number starts that many workers in the priority order.
+    executor_workers:
+      priority: 2
+      upgrade: 1
+    executor_worker_instances: >-
+      {{ (['priority'] | product(range(1, executor_workers.priority | default(0) | int + 1)) | list
+      + ['upgrade'] | product(range(1, executor_workers.upgrade | default(0) | int + 1)) | list)
+      | map('join', '-') | list if executor_workers is mapping
+      else range(1, executor_workers | int + 1) | list }}
     executor_devices: []
     executor_http_targets: []
     executor_credentials: {}
@@ -18,7 +27,8 @@
         that:
           - (ansible_facts.distribution == 'Ubuntu' and ansible_facts.distribution_version is version('24.04', '>=')) or (ansible_facts.os_family == 'RedHat' and ansible_facts.distribution_major_version == '9')
           - executor_api_token | default('') is match('^[A-Za-z0-9_.~-]{32,}$')
-          - executor_workers | int > 0
+          - executor_workers is not mapping or executor_workers | list | difference(['priority', 'upgrade']) | length == 0
+          - executor_worker_instances | length > 0
       no_log: true
   tasks:
     - name: Install Python and Nmap on Ubuntu
@@ -202,4 +212,4 @@
         name: "netops-executor-worker@{{ item }}"
         enabled: true
         state: started
-      loop: "{{ range(1, executor_workers | int + 1) | list }}"
+      loop: "{{ executor_worker_instances }}"

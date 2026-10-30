@@ -8,7 +8,8 @@ User=netopsexecutor
 Group=netopsexecutor
 WorkingDirectory=/opt/netops-executor
 EnvironmentFile=/etc/netops-executor/service.env
-ExecStart=/opt/netops-executor/.venv/bin/netops-executor worker
+# Instance <pool>-<n> (priority-2 or upgrade-1) claims from that queue first, then the others.
+ExecStart=/opt/netops-executor/.venv/bin/netops-executor worker --instance %i
 Restart=on-failure
 TimeoutStopSec=2h
 UMask=0077

@@ -7,7 +7,21 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from .models import ScheduledRequest
+from .models import QUEUES, ScheduledRequest
+
+UPGRADE_KINDS = (
+    "upgrade",
+    "panos_upgrade",
+    "eos_upgrade",
+    "iosxe_upgrade",
+    "ios_upgrade",
+    "fortigate_upgrade",
+)
+
+
+def default_queue(kind):
+    """Rollbacks are operator recovery; upgrades get their own pool; everything else is bulk."""
+    return "priority" if kind == "rollback" else "upgrade" if kind in UPGRADE_KINDS else "scheduled"
 
 
 class Conflict(Exception):
@@ -94,12 +108,22 @@ class Store:
             db.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_start_window ON jobs(status,started_at,latest_start_at)"
             )
+            if "queue" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN queue TEXT NOT NULL DEFAULT 'scheduled'")
+                db.execute(
+                    "UPDATE jobs SET queue=CASE WHEN kind='rollback' THEN 'priority' "
+                    f"WHEN kind IN ({','.join('?' * len(UPGRADE_KINDS))}) THEN 'upgrade' ELSE 'scheduled' END",
+                    UPGRADE_KINDS,
+                )
+            db.execute("CREATE INDEX IF NOT EXISTS jobs_queue_order ON jobs(status,queue,created)")
+            if "queues" not in {row["name"] for row in db.execute("PRAGMA table_info(workers)")}:
+                db.execute("ALTER TABLE workers ADD COLUMN queues TEXT")
 
     @staticmethod
     def scheduled_request(request):
         request = dict(request)
         window = ScheduledRequest.model_validate(
-            {key: request.get(key) for key in ("start_at", "latest_start_at")}
+            {key: request.get(key) for key in ("start_at", "latest_start_at", "queue")}
         )
         for key, value in window.model_dump().items():
             if value is None:
@@ -251,8 +275,8 @@ class Store:
             now, job_id = time.time(), str(uuid.uuid4())
             db.execute(
                 """INSERT INTO jobs
-                (id,device,lock_key,kind,parent,request,status,created,updated,idempotency_key,start_at,latest_start_at)
-                VALUES (?,?,?,?,?,?,'queued',?,?,?,?,?)""",
+                (id,device,lock_key,kind,parent,request,status,created,updated,idempotency_key,start_at,latest_start_at,queue)
+                VALUES (?,?,?,?,?,?,'queued',?,?,?,?,?,?)""",
                 (
                     job_id,
                     request.get("device", request.get("device_ip", request.get("serial"))),
@@ -265,16 +289,26 @@ class Store:
                     key,
                     start_at,
                     latest_start_at,
+                    request.get("queue") or default_queue(kind),
                 ),
             )
             self.expire_pending(db, now)
         return self.get(job_id)
 
-    def claim(self, worker):
+    def claim(self, worker, queues=QUEUES):
+        """Claim the oldest eligible job, trying the worker's queues in the order given."""
+        queues = tuple(queues)
+        if not queues or not set(queues) <= set(QUEUES):
+            raise ValueError("unknown worker queue")
+        order = "".join(f" WHEN ? THEN {rank}" for rank in range(len(queues)))
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             self.expire_pending(db, time.time())
-            for row in db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created,id").fetchall():
+            for row in db.execute(
+                f"""SELECT * FROM jobs WHERE status='queued' AND queue IN ({",".join("?" * len(queues))})
+                ORDER BY CASE queue{order} END,created,id""",
+                queues + queues,
+            ).fetchall():
                 now = time.time()
                 if row["started_at"] is None:
                     if row["latest_start_at"] is not None and row["latest_start_at"] < now:
@@ -588,7 +622,7 @@ class Store:
 
     def create_batch(self, batch, key, lock_key, kind="upgrade"):
         payload = batch.model_dump_json(
-            exclude={key for key in ("start_at", "latest_start_at") if getattr(batch, key) is None}
+            exclude={key for key in ("start_at", "latest_start_at", "queue") if getattr(batch, key) is None}
         )
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -610,7 +644,7 @@ class Store:
                     )
                     job = str(uuid.uuid4())
                     db.execute(
-                        "INSERT INTO jobs(id,device,lock_key,kind,request,status,created,updated,start_at,latest_start_at) VALUES (?,?,?,?,?,'queued',?,?,?,?)",
+                        "INSERT INTO jobs(id,device,lock_key,kind,request,status,created,updated,start_at,latest_start_at,queue) VALUES (?,?,?,?,?,'queued',?,?,?,?,?)",
                         (
                             job,
                             member,
@@ -621,6 +655,7 @@ class Store:
                             now,
                             start_at,
                             latest_start_at,
+                            request.get("queue") or batch.queue or default_queue(kind),
                         ),
                     )
                     db.execute(
@@ -637,7 +672,7 @@ class Store:
         jobs = [
             dict(r)
             for r in db.execute(
-                "SELECT j.id,j.device,j.kind,j.status,j.result,j.start_at,j.latest_start_at,j.started_at,m.wave,m.ordinal FROM jobs j JOIN batch_members m ON m.job=j.id WHERE m.batch=? ORDER BY m.ordinal",
+                "SELECT j.id,j.device,j.kind,j.queue,j.status,j.result,j.start_at,j.latest_start_at,j.started_at,m.wave,m.ordinal FROM jobs j JOIN batch_members m ON m.job=j.id WHERE m.batch=? ORDER BY m.ordinal",
                 (batch,),
             )
         ]
@@ -810,11 +845,13 @@ class Store:
             if not db.execute("DELETE FROM pins WHERE key=?", (key,)).rowcount:
                 raise KeyError(key)
 
-    def worker_seen(self, worker, job=None, state="available"):
+    def worker_seen(self, worker, job=None, state="available", queues=None):
         with self.connect() as db:
             db.execute(
-                "INSERT INTO workers(id,heartbeat,job,state) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET heartbeat=excluded.heartbeat,job=excluded.job,state=excluded.state",
-                (worker, time.time(), job, state),
+                """INSERT INTO workers(id,heartbeat,job,state,queues) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE
+                SET heartbeat=excluded.heartbeat,job=excluded.job,state=excluded.state,
+                queues=coalesce(excluded.queues,workers.queues)""",
+                (worker, time.time(), job, state, json.dumps(list(queues)) if queues else None),
             )
 
     def worker_list(self, seconds=120):
@@ -822,7 +859,44 @@ class Store:
             return [
                 {
                     **dict(row),
+                    # Workers from releases before queues claimed from every queue.
+                    "queues": json.loads(row["queues"]) if row["queues"] else list(QUEUES),
                     "online": row["state"] != "stopped" and row["heartbeat"] >= time.time() - seconds,
                 }
                 for row in db.execute("SELECT * FROM workers ORDER BY id")
             ]
+
+    def queue_summary(self, seconds=120):
+        """Backlog and workers per queue. due excludes jobs waiting for a future start_at; workers are
+        the queue's pool (first choice) and fallback_workers the other online workers that claim from it."""
+        now = time.time()
+        summary = {
+            q: {"queue": q, "queued": 0, "due": 0, "running": 0, "oldest_due_wait_seconds": None}
+            for q in QUEUES
+        }
+        with self.connect() as db:
+            for row in db.execute(
+                """SELECT queue,status,count(*) AS jobs,
+                min(CASE WHEN start_at IS NULL OR start_at<=? THEN created END) AS oldest,
+                sum(start_at IS NULL OR start_at<=?) AS due
+                FROM jobs WHERE status IN ('queued','running') GROUP BY queue,status""",
+                (now, now),
+            ):
+                item = summary[row["queue"]]
+                if row["status"] == "running":
+                    item["running"] = row["jobs"]
+                else:
+                    item.update(
+                        queued=row["jobs"],
+                        due=row["due"],
+                        oldest_due_wait_seconds=round(now - row["oldest"], 1) if row["oldest"] else None,
+                    )
+        workers = [w for w in self.worker_list(seconds) if w["online"]]
+        for item in summary.values():
+            pool = [w for w in workers if w["queues"][0] == item["queue"]]
+            item.update(
+                workers=len(pool),
+                busy_workers=sum(w["state"] == "busy" for w in pool),
+                fallback_workers=sum(item["queue"] in w["queues"][1:] for w in workers),
+            )
+        return list(summary.values())

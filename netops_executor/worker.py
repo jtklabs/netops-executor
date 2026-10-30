@@ -1,4 +1,5 @@
 import os
+import re
 import signal
 import socket
 import threading
@@ -12,9 +13,28 @@ from .execution import ExecutionRunner
 from .fortigate_engine import FortigateRunner
 from .ios_engine import IosRunner
 from .iosxe_engine import IosxeRunner
+from .models import POOLS, QUEUES
 from .panos_engine import PanosRunner
 from .snmp import SnmpRunner
 from .store import Store
+
+
+def worker_queues(queue=None, pool=None, instance=None):
+    """Queues to claim from, in order. --queue is the exact order. --pool, or a systemd instance
+    named <pool>-<n>, claims from that queue first, then the other pool's queue, then scheduled.
+    A bare instance number, or no option, uses the default order."""
+    if queue:
+        names = [name.strip() for name in queue.split(",")]
+    else:
+        if instance and not instance.isdigit():
+            match = re.fullmatch(r"([a-z]+)-\d+", instance)
+            pool = match[1] if match else instance
+        if pool and pool not in POOLS:
+            raise ValueError("worker pool must be one of: " + ", ".join(POOLS))
+        names = [pool, *(q for q in QUEUES if q != pool)] if pool else list(QUEUES)
+    if not names or not set(names) <= set(QUEUES) or len(set(names)) != len(names):
+        raise ValueError("worker queues must be distinct names from: " + ", ".join(QUEUES))
+    return tuple(names)
 
 
 def process(settings, store, job, worker):
@@ -56,7 +76,7 @@ def process(settings, store, job, worker):
         store.worker_seen(worker)
 
 
-def main():
+def main(queues=QUEUES):
     os.umask(0o077)
     settings = Settings.load()
     store = Store(settings.data_dir / "jobs.sqlite3")
@@ -66,9 +86,9 @@ def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
     while not stop.is_set():
-        store.worker_seen(worker)
+        store.worker_seen(worker, queues=queues)
         store.reap(settings.stale_seconds)
-        job = store.claim(worker)
+        job = store.claim(worker, queues)
         if job:
             process(settings, store, job, worker)
         else:

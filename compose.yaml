@@ -32,10 +32,20 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-  worker:
+  # One service per worker pool. Each worker claims from its pool's queue first, then the other
+  # pool's queue, then scheduled work.
+  worker-priority:
     <<: *service
-    command: ["netops-executor", "worker"]
+    command: ["netops-executor", "worker", "--pool", "priority"]
     stop_grace_period: 2h
+    deploy:
+      replicas: ${NETOPS_PRIORITY_WORKERS:-2}
+  worker-upgrade:
+    <<: *service
+    command: ["netops-executor", "worker", "--pool", "upgrade"]
+    stop_grace_period: 2h
+    deploy:
+      replicas: ${NETOPS_UPGRADE_WORKERS:-1}
 volumes:
   data:
   backups:

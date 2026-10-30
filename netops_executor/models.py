@@ -15,6 +15,12 @@ from pydantic import (
 Name = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$")]
 Version = Annotated[str, Field(pattern=r"^\d+(?:\.\d+){1,5}$")]
 Volume = Annotated[str, Field(pattern=r"^(?:HD|MD)\d+\.\d+$")]
+# Worker queues in default claim order: operator-initiated work, firmware upgrades, then recurring
+# bulk work, which workers take whenever the other two queues are empty.
+QUEUES = ("priority", "upgrade", "scheduled")
+# Worker pools: the queue a worker claims from first. Scheduled work has no pool of its own.
+POOLS = ("priority", "upgrade")
+Queue = Literal["priority", "upgrade", "scheduled"]
 
 
 class Model(BaseModel):
@@ -31,6 +37,10 @@ class ScheduledRequest(Model):
         default=None,
         description="Latest allowed start, inclusive (ISO 8601 with timezone). An unstarted queued job past this time becomes expired. Does not interrupt a started job or its manual-validation continuation.",
         examples=["2026-11-01T04:00:00Z"],
+    )
+    queue: Queue | None = Field(
+        default=None,
+        description="Worker queue. priority: operator-initiated work that must not wait behind bulk jobs; scheduled: recurring bulk work; upgrade: firmware upgrades. Priority and upgrade pool workers claim from their own queue first, then the other, then scheduled. Omitted: upgrades and upgrade batches use upgrade, rollbacks use priority, all other jobs use scheduled.",
     )
 
     @field_validator("start_at", "latest_start_at", mode="before")

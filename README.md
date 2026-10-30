@@ -24,7 +24,8 @@ pair/batch to one remote and prevent overlap across remotes.
 All `/api/v1` routes require `Authorization: Bearer <NETOPS_API_TOKEN>`. The token
 is a shared service identity loaded from `.env` or the service environment.
 `/docs` and `/openapi.json` expose the schema; `/healthz` reports API availability.
-`GET /api/v1/workers` reports worker heartbeats separately. The web console at `/`
+`GET /api/v1/workers` reports worker heartbeats and claim order, and `GET /api/v1/queues`
+the backlog per queue. The web console at `/`
 keeps the token only in tab memory and uses the same API.
 
 | Method | Endpoint | Purpose |
@@ -59,6 +60,7 @@ keeps the token only in tab memory and uses the same API.
 | GET | `/api/v1/snmp/walks/{id}` | Walk status and per-root progress |
 | GET | `/api/v1/snmp/walks/{id}/results?after=0&limit=500` | Paginated partial/final rows |
 | GET | `/api/v1/jobs?limit=100&offset=0` or `/jobs/{id}` | Jobs and full results/credential audit |
+| GET | `/api/v1/queues` | Queued, due and running jobs and workers per queue |
 | GET | `/api/v1/jobs/{id}/events?after=0&limit=500` | Ordered events; advance cursor to last `seq` |
 | GET | `/api/v1/jobs/{id}/backup` | Download completed UCS backup (or the first PAN-OS config backup) |
 | GET | `/api/v1/jobs/{id}/artifacts/{name}` | Download a saved PAN-OS running config or tech support file |
@@ -170,6 +172,62 @@ existing behavior. For legacy jobs already started or completed, `started_at`
 is backfilled from `created` because the exact historical start was not stored.
 Deploy API and workers together using the existing stop/drain deployment flow;
 older workers do not enforce start windows.
+
+## Job queues and worker pools
+
+Every job is in one of three queues, so a manual run never waits behind a large
+recurring backlog:
+
+| Queue | Use | Default for |
+| --- | --- | --- |
+| `priority` | Operator-initiated work that must start next ("run now") | Rollbacks |
+| `upgrade` | Firmware upgrades | F5, PAN-OS, EOS, IOS XE, IOS and FortiGate jobs and batches |
+| `scheduled` | Recurring bulk work, such as nightly SNMP walks for every device | SSH, HTTP, SNMP and cipher-scan jobs |
+
+Every submission, batch and rollback accepts `"queue"` to override the default. A
+batch's `queue` applies to its members; a member's `defaults` or `overrides` entry
+can set its own. The central application should send `"queue": "priority"` for
+manual runs; unmarked SSH, HTTP, SNMP and cipher-scan jobs land in `scheduled`.
+Responses report the queue the job is in. Omitting `queue` keeps the stored request,
+and therefore idempotent replays, identical to earlier releases.
+
+Workers come in two pools. Each claims from its pool's queue first, then from the
+other pool's queue, then scheduled work, so no worker idles while any queue has an
+eligible job:
+
+| Pool | Claim order |
+| --- | --- |
+| `priority` | priority, upgrade, scheduled |
+| `upgrade` | upgrade, priority, scheduled |
+| none | priority, upgrade, scheduled |
+
+Scheduled work has no pool of its own: every worker takes it once the priority and
+upgrade queues have nothing eligible. Within a queue, jobs run oldest first. Start
+windows, device and HA reservations, wave `upgrade_at_a_time` limits and validation
+pauses still apply, and a running job is never interrupted for a higher-priority one,
+so a new priority job starts when the next worker finishes its current job. A
+priority worker that takes an upgrade is busy until that upgrade finishes, which can
+be hours. A worker started with `--queue` claims from exactly the listed queues in
+that order, for example `--queue priority,scheduled` for a worker that never takes
+upgrades.
+
+Set pool sizes with `executor_workers` in Ansible, or `NETOPS_PRIORITY_WORKERS` and
+`NETOPS_UPGRADE_WORKERS` for Docker Compose. With systemd alone, the instance name
+selects the pool:
+
+```bash
+systemctl enable --now netops-executor-worker@priority-{1..4} netops-executor-worker@upgrade-1
+```
+
+`GET /api/v1/queues` (CLI `netops-executor queues`) reports per queue the `queued`
+jobs, the `due` ones whose start time has passed, `running` jobs, the age of the
+oldest due job (`oldest_due_wait_seconds`), the pool's `workers` and
+`busy_workers`, and `fallback_workers` (other online workers that also claim from
+it). `GET /api/v1/workers` shows each worker's claim order.
+
+Upgrading adds the queue column and assigns existing jobs their default queue.
+Workers from earlier releases, and numbered instances such as
+`netops-executor-worker@1`, have no pool and claim in the default order.
 
 ## SSH and HTTPS cipher scans
 
@@ -711,9 +769,10 @@ For one firewall, send the defaults plus `"serial"` to `/api/v1/panos/jobs`.
 **An HA pair is one unit of work.** The job for either member upgrades both, one at
 a time, and reserves both. When the batch also lists the peer, the peer's item runs
 afterwards, finds the pair on the target and only validates. A job holds a worker
-while it waits for backups, transfers, installs and reboots, so run at least as many
-workers as the largest `upgrade_at_a_time` (`executor_workers`, or
-`--scale worker=N`).
+while it waits for backups, transfers, installs and reboots, so give the upgrade pool
+at least as many workers as the largest `upgrade_at_a_time` (`executor_workers.upgrade`
+or `NETOPS_UPGRADE_WORKERS`); priority workers take upgrades only when the priority
+queue is empty.
 
 | Option | Behavior/default |
 | --- | --- |
@@ -1492,7 +1551,9 @@ Credential tasks have `no_log:true`; only the API token/key path is in service.e
 ```yaml
 # Encrypt this file with ansible-vault before storing it.
 executor_api_token: REPLACE_WITH_RANDOM_TOKEN_AT_LEAST_32_CHARACTERS
-executor_workers: 3
+executor_workers:      # workers per pool; see "Job queues and worker pools"
+  priority: 4
+  upgrade: 2
 executor_credentials:
   ssh-tacacs:
     kind: ssh
@@ -1611,7 +1672,9 @@ docker compose run --rm --no-deps --user "$(id -u):$(id -g)" \
 # Set private key/config ownership to container UID 10001; never world-readable.
 # Also grant UID 10001 write access to images/ for the cache.
 chmod 600 .env
-docker compose up -d --scale worker=3
+# Pool sizes come from NETOPS_PRIORITY_WORKERS and NETOPS_UPGRADE_WORKERS in .env.
+# --remove-orphans removes the single "worker" service of releases before 0.15.
+docker compose up -d --remove-orphans
 ```
 
 Use an HTTPS reverse proxy for central API access; default bind is loopback.

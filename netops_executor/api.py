@@ -20,7 +20,7 @@ from .fortigate_models import FortigateBatch, FortigateUpgradeRequest
 from .ios_models import IosBatch, IosUpgradeRequest
 from .iosxe_config import compare as compare_configs
 from .iosxe_models import ConfigComparison, IosxeBatch, IosxeUpgradeRequest
-from .models import JobRequest, Model, Name, RecoveryResolution, RollbackRequest
+from .models import JobRequest, Model, Name, Queue, RecoveryResolution, RollbackRequest
 from .panos_models import PanosBatch, PanosUpgradeRequest
 from .platforms import NETWORK_TYPES, validate_commands
 from .snmp_models import SnmpResults, SnmpWalkRequest
@@ -45,6 +45,7 @@ class JobResponse(Model):
         "ios_upgrade",
         "fortigate_upgrade",
     ]
+    queue: Queue
     parent: str | None
     request: dict
     status: Literal[
@@ -78,6 +79,21 @@ class JobResponse(Model):
     validation_gates: list[dict] = Field(default_factory=list)
 
 
+class QueueStatus(Model):
+    queue: Queue
+    queued: int = Field(description="Queued jobs, including those waiting for a future start_at")
+    due: int = Field(description="Queued jobs whose start_at has passed or is unset")
+    running: int
+    oldest_due_wait_seconds: float | None = Field(
+        description="Age of the oldest due queued job; null when none is waiting"
+    )
+    workers: int = Field(description="Online workers in this queue's pool (this queue is their first choice)")
+    busy_workers: int = Field(description="Pool workers running a job from any queue")
+    fallback_workers: int = Field(
+        description="Other online workers that claim from this queue when theirs is empty"
+    )
+
+
 class CipherScanJobResponse(JobResponse):
     request: CipherScanRequest
     result: CipherScanResult
@@ -87,6 +103,7 @@ class BatchItem(Model):
     id: str
     device: str
     kind: str = "upgrade"
+    queue: Queue = "upgrade"
     status: str
     result: dict
     wave: int
@@ -521,6 +538,11 @@ def create_app(settings=None):
     @app.get("/api/v1/workers", dependencies=authenticated)
     def workers():
         return store.worker_list(settings.stale_seconds)
+
+    @app.get("/api/v1/queues", dependencies=authenticated, response_model=list[QueueStatus])
+    def queues():
+        store.reap(settings.stale_seconds)
+        return store.queue_summary(settings.stale_seconds)
 
     @app.get("/api/v1/ssh/device-types", dependencies=authenticated)
     def ssh_device_types():

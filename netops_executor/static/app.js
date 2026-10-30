@@ -88,7 +88,7 @@ async function refresh() {
       const b = document.createElement("button");
       b.className = "job";
       const title = document.createElement("strong");
-      title.textContent = `${j.device} · ${j.kind}`;
+      title.textContent = `${j.device} · ${j.kind} · ${j.queue}`;
       const detail = document.createElement("span");
       detail.className = "status";
       detail.textContent = `${j.status.replaceAll("_", " ")} · ${new Date(j.created * 1000).toLocaleString()} · ${j.id.slice(0, 8)}`;
@@ -477,9 +477,11 @@ const examples = {
     device: "192.0.2.10",
     device_type: "cisco_ios",
     commands: [{ command: "show version", timeout_seconds: 60 }],
+    queue: "priority",
   },
   "http/jobs": {
     target: "panorama",
+    queue: "priority",
     requests: [
       {
         method: "POST",
@@ -492,7 +494,11 @@ const examples = {
       },
     ],
   },
-  "snmp/walks": { device_ip: "192.0.2.10", oids: ["1.3.6.1.2.1.1"] },
+  "snmp/walks": {
+    device_ip: "192.0.2.10",
+    oids: ["1.3.6.1.2.1.1"],
+    queue: "priority",
+  },
 };
 $("json-example").onclick = () => {
   $("json-body").value = JSON.stringify(
