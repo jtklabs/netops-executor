@@ -322,6 +322,10 @@ $("backup").onclick = async () => {
   }
 };
 setInterval(refresh, 5000);
+fetch("healthz")
+  .then((r) => r.json())
+  .then((h) => ($("version").textContent = h.version ? "v" + h.version : ""))
+  .catch(() => {});
 
 const examples = {
   "upgrade-batches": {

@@ -198,7 +198,8 @@ def test_legacy_database_backfills_queues(tmp_path):
         "back": "priority",
         "walk": "scheduled",
     }
-    assert store.worker_list(10**10)[0]["queues"] == ["priority", "upgrade", "scheduled"]
+    legacy = store.worker_list(10**10)[0]
+    assert legacy["queues"] == ["priority", "upgrade", "scheduled"] and legacy["version"] is None
     assert store.claim("scheduled-1", ("scheduled",))["id"] == "walk"
 
 

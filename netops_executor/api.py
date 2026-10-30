@@ -329,7 +329,7 @@ def create_app(settings=None):
 
     @app.get("/healthz")
     def healthz():
-        return {"status": "ok", "api_version": "v1"}
+        return {"status": "ok", "api_version": "v1", "version": __version__}
 
     @app.get("/api/v1/devices", dependencies=authenticated)
     def devices() -> list[dict]:

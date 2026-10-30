@@ -5,6 +5,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from netops_executor import __version__
 from netops_executor.api import create_app
 from netops_executor.store import Conflict, LostOwnership, Store
 
@@ -51,6 +52,18 @@ def test_idempotency_reuses_payload_and_rejects_conflict(store):
     assert a["id"] == b["id"]
     with pytest.raises(Conflict):
         store.submit({"device": "other"}, "device:other", "same")
+
+
+def test_release_version_is_reported(settings, store):
+    c = TestClient(create_app(settings))
+    assert c.get("/healthz").json() == {"status": "ok", "api_version": "v1", "version": __version__}
+    assert c.get("/openapi.json").json()["info"]["version"] == __version__
+    store.worker_seen("w1", queues=("priority", "upgrade", "scheduled"))
+    store.worker_seen("w1", "job", "busy")
+    c.headers["Authorization"] = "Bearer " + settings.token
+    assert c.get("/api/v1/workers").json()[0]["version"] == __version__
+    index = c.get("/").text
+    assert 'id="version"' in index
 
 
 def test_api_auth_plan_and_submit(settings):

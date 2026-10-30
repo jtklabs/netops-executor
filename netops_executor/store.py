@@ -8,6 +8,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from . import __version__
 from .models import QUEUES, ScheduledRequest
 
 UPGRADE_KINDS = (
@@ -126,8 +127,10 @@ class Store:
                     UPGRADE_KINDS,
                 )
             db.execute("CREATE INDEX IF NOT EXISTS jobs_queue_order ON jobs(status,queue,created)")
-            if "queues" not in {row["name"] for row in db.execute("PRAGMA table_info(workers)")}:
-                db.execute("ALTER TABLE workers ADD COLUMN queues TEXT")
+            worker_columns = {row["name"] for row in db.execute("PRAGMA table_info(workers)")}
+            for column in ("queues", "version"):
+                if column not in worker_columns:
+                    db.execute(f"ALTER TABLE workers ADD COLUMN {column} TEXT")
 
     @staticmethod
     def scheduled_request(request):
@@ -856,12 +859,13 @@ class Store:
                 raise KeyError(key)
 
     def worker_seen(self, worker, job=None, state="available", queues=None):
+        # Each heartbeat carries the release of the code running in that worker process.
         with self.connect() as db:
             db.execute(
-                """INSERT INTO workers(id,heartbeat,job,state,queues) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE
-                SET heartbeat=excluded.heartbeat,job=excluded.job,state=excluded.state,
-                queues=coalesce(excluded.queues,workers.queues)""",
-                (worker, time.time(), job, state, json.dumps(list(queues)) if queues else None),
+                """INSERT INTO workers(id,heartbeat,job,state,queues,version) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET heartbeat=excluded.heartbeat,job=excluded.job,
+                state=excluded.state,queues=coalesce(excluded.queues,workers.queues),version=excluded.version""",
+                (worker, time.time(), job, state, json.dumps(list(queues)) if queues else None, __version__),
             )
 
     def worker_list(self, seconds=120):

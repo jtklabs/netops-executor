@@ -23,8 +23,9 @@ pair/batch to one remote and prevent overlap across remotes.
 
 All `/api/v1` routes require `Authorization: Bearer <NETOPS_API_TOKEN>`. The token
 is a shared service identity loaded from `.env` or the service environment.
-`/docs` and `/openapi.json` expose the schema; `/healthz` reports API availability.
-`GET /api/v1/workers` reports worker heartbeats and claim order, and `GET /api/v1/queues`
+`/docs` and `/openapi.json` expose the schema; `/healthz` reports API availability and
+the release `version`, which the console header also shows. `GET /api/v1/workers`
+reports worker heartbeats, claim order and the release each worker runs, and `GET /api/v1/queues`
 the backlog per queue. The web console at `/`
 keeps the token only in tab memory and uses the same API.
 

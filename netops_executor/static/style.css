@@ -31,6 +31,12 @@ h2 {
 h3 {
   font-size: 15px;
 }
+.version {
+  color: #a9bbd1;
+  font-size: 15px;
+  font-weight: 400;
+  letter-spacing: 0;
+}
 .eyebrow {
   color: #6de0c1;
   font-size: 11px;
