@@ -25,6 +25,9 @@
     executor_webhook_url: ""
     executor_webhook_token: ""
     executor_webhook_secret: ""
+    # Other NETOPS_* settings for service.env, which every run rewrites, for example
+    # {NETOPS_STAGING_ADDRESS: 192.0.2.5, NETOPS_SSH_HOST_KEYS: pin}.
+    executor_environment: {}
     executor_python: "{{ 'python3.11' if ansible_facts.os_family == 'RedHat' else 'python3' }}"
   pre_tasks:
     - name: Validate supported OS and required secret
@@ -36,6 +39,8 @@
           - executor_worker_instances | length > 0
           - executor_webhook_url == '' or executor_webhook_token is match('^[!-~]{16,}$')
           - executor_webhook_secret == '' or executor_webhook_secret | length >= 32
+          - executor_environment | dict2items | rejectattr('key', 'match', '^NETOPS_[A-Z0-9_]+$') | list | length == 0
+          - executor_environment.values() | map('string') | select('search', '[\r\n]') | list | length == 0
       no_log: true
   tasks:
     - name: Install Python and Nmap on Ubuntu
@@ -62,7 +67,7 @@
         name: "{{ item }}"
         state: stopped
         enabled: false
-      loop: "{{ ansible_facts.services.keys() | select('match', '^(netops-executor|f5-upgrade)-worker@.*\\.service$') | list }}"
+      loop: "{{ ansible_facts.services.keys() | select('match', '^(netops-executor|f5-upgrade)-worker@.+\\.service$') | list }}"
     - name: Stop and disable existing and legacy APIs
       ansible.builtin.systemd_service:
         name: "{{ item }}"
@@ -124,15 +129,16 @@
       ansible.builtin.command:
         argv: ["{{ executor_python }}", -m, venv, /opt/netops-executor/.venv]
         creates: /opt/netops-executor/.venv/bin/python
-    - name: Install pinned dependencies and application
-      ansible.builtin.pip:
-        requirements: /opt/netops-executor/requirements.lock
-        virtualenv: /opt/netops-executor/.venv
+    # The virtual environment's own pip: Ansible's pip module needs python3-packaging on the
+    # host's system Python, which minimal RHEL 9 installs lack.
+    - name: Install pinned dependencies
+      ansible.builtin.command:
+        argv: [/opt/netops-executor/.venv/bin/python, -m, pip, install, --no-cache-dir, --disable-pip-version-check, -r, /opt/netops-executor/requirements.lock]
+      register: executor_dependencies
+      changed_when: "'Successfully installed' in executor_dependencies.stdout"
     - name: Install application package
-      ansible.builtin.pip:
-        name: /opt/netops-executor
-        extra_args: --no-deps --force-reinstall
-        virtualenv: /opt/netops-executor/.venv
+      ansible.builtin.command:
+        argv: [/opt/netops-executor/.venv/bin/python, -m, pip, install, --no-cache-dir, --disable-pip-version-check, --no-deps, --force-reinstall, /opt/netops-executor]
     - name: Generate credential encryption key once
       become_user: netopsexecutor
       ansible.builtin.command:
@@ -173,6 +179,9 @@
           NETOPS_WEBHOOK_SECRET={{ executor_webhook_secret }}
           {% endif %}
           {% endif %}
+          {% for name, value in executor_environment.items() %}
+          {{ name }}={{ value }}
+          {% endfor %}
       no_log: true
     - name: Configure inventories
       ansible.builtin.copy:

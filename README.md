@@ -14,7 +14,8 @@ For generic commands, the main application interprets the returned output and
 submits a **separate** remediation job, optionally linked with `parent_job_id`.
 
 API and worker processes share one local SQLite database, image cache, backup
-root and credential keyring. Scale workers on **one host** with Docker or systemd.
+root and credential keyring. Production remotes run natively under systemd on
+**Ubuntu 24.04 or RHEL 9**, all on **one host**; Docker Compose is for local testing.
 SQLite WAL must not be placed on NFS/SMB or shared between hosts. Separate remotes
 have independent reservations: the central application must assign an entire HA
 pair/batch to one remote and prevent overlap across remotes.
@@ -1625,6 +1626,10 @@ Credential tasks have `no_log:true`; only the API token/key path is in service.e
 ```yaml
 # Encrypt this file with ansible-vault before storing it.
 executor_api_token: REPLACE_WITH_RANDOM_TOKEN_AT_LEAST_32_CHARACTERS
+executor_webhook_url: https://central.example/netops/webhook
+executor_webhook_token: REPLACE_WITH_TOKEN_ISSUED_BY_THE_CENTRAL_APPLICATION
+executor_environment:  # other NETOPS_* settings; service.env is rewritten on every run
+  NETOPS_STAGING_ADDRESS: 192.0.2.5
 executor_workers:      # workers per pool; see "Job queues and worker pools"
   priority: 4
   upgrade: 2
@@ -1725,16 +1730,71 @@ Cancellation retains committed rows. Job/result retention is manual.
 
 ## Deployment and CLI
 
-Python 3.11+ is required. Ubuntu 24.04 supplies 3.12; use the Python 3.11 suite
-on RHEL 9.2+. Install pinned `requirements.lock`, then the package with `--no-deps`.
-Native systemd units and environment example are in `deploy/`; the Ansible
-playbook automates this setup. API/workers must share the same paths and user.
-The image/cache directory must be writable for URL downloads.
+Production remotes are native installs on **Ubuntu 24.04** or **RHEL 9**, run by
+systemd. Docker Compose is kept for local testing only.
 
-The container image is built on Ubuntu 24.04 with its Python 3.12 and Nmap packages; the
-service runs from a virtual environment in `/opt/venv` as UID 10001.
+### Native install (Ubuntu 24.04, RHEL 9)
 
-Docker, from this directory:
+`deploy/ansible/deploy.yml` is the supported install and upgrade path; its variables
+are under "Encrypted credentials and Ansible". It installs Python (Ubuntu's 3.12, or
+`python3.11` on RHEL 9) and Nmap from the OS repositories, creates the
+`netopsexecutor` system account, copies the code to `/opt/netops-executor`, builds a
+virtual environment there from the pinned `requirements.lock` (the host needs PyPI
+or a pip mirror), writes `/etc/netops-executor/service.env` and the inventories,
+generates the credential key only if it is missing, and starts the units in
+`deploy/`. Re-running it upgrades in place: running workers drain first (each
+finishes its job; `TimeoutStopSec=2h`), and instances removed from
+`executor_workers` are stopped and disabled. `service.env` is rewritten on every run,
+so put other `NETOPS_*` settings in `executor_environment`.
+
+| Path | Contents |
+| --- | --- |
+| `/opt/netops-executor` | Code and `.venv` |
+| `/etc/netops-executor` | `service.env`, `devices.json`, `http-targets.json`, `known_hosts`, `credentials.key` (all 0600) |
+| `/var/lib/netops-executor` | `jobs.sqlite3` and its WAL files; back up together with `credentials.key` |
+| `/var/backups/netops-executor` | UCS and configuration backups |
+| `/srv/f5-images` | Image cache |
+
+Without Ansible, the same steps by hand:
+
+```bash
+sudo apt-get install -y python3 python3-venv nmap      # Ubuntu 24.04
+sudo dnf install -y python3.11 nmap                    # RHEL 9
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin netopsexecutor
+sudo install -d -m 0700 -o netopsexecutor -g netopsexecutor /opt/netops-executor \
+  /etc/netops-executor /var/lib/netops-executor /var/backups/netops-executor /srv/f5-images
+sudo cp -r netops_executor pyproject.toml requirements.lock /opt/netops-executor/
+sudo python3 -m venv /opt/netops-executor/.venv        # python3.11 on RHEL 9
+sudo /opt/netops-executor/.venv/bin/python -m pip install -r /opt/netops-executor/requirements.lock
+sudo /opt/netops-executor/.venv/bin/python -m pip install --no-deps /opt/netops-executor
+sudo -u netopsexecutor /opt/netops-executor/.venv/bin/netops-executor init-key /etc/netops-executor/credentials.key
+# Create service.env from deploy/service.env.example, plus devices.json, http-targets.json
+# and a verified known_hosts, all owned by netopsexecutor with mode 0600.
+sudo cp deploy/netops-executor-api.service 'deploy/netops-executor-worker@.service' /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now netops-executor-api netops-executor-worker@priority-{1,2} netops-executor-worker@upgrade-1
+```
+
+To upgrade by hand, stop the workers (they drain) and the API, copy the new code,
+repeat both `pip install` steps with `--force-reinstall` on the second, and start
+them again. The API and every worker must use the same paths and user.
+
+The API listens on `127.0.0.1:8080`. Publish it to the central application through
+an HTTPS reverse proxy: `deploy/apache-netops-executor.conf` is a tested Apache
+httpd 2.4 configuration that serves it under `https://<server>/netops-executor/`
+with `NETOPS_ROOT_PATH=/netops-executor`, so `/docs` and batch `status_url` values
+carry the prefix (the console already uses relative links). The proxy may strip the
+prefix or pass it through, and direct requests to the listener (health checks, the
+CLI on the host) keep working without it. On RHEL 9 with SELinux enforcing, Apache
+may need `setsebool -P httpd_can_network_connect 1` to reach the local listener.
+FortiGate preloads listen on `NETOPS_STAGING_PORTS` (default 2121-2140) at
+`NETOPS_STAGING_ADDRESS`; RHEL 9 enables firewalld by default, so open them there
+(`firewall-cmd --permanent --add-port=2121-2140/tcp && firewall-cmd --reload`).
+
+### Docker (local testing)
+
+The image is built on Ubuntu 24.04 with its Python 3.12 and Nmap packages and runs
+from `/opt/venv` as UID 10001. From this directory:
 
 ```bash
 cp .env.example .env
@@ -1754,15 +1814,10 @@ chmod 600 .env
 docker compose up -d --remove-orphans
 ```
 
-Use an HTTPS reverse proxy for central API access; default bind is loopback.
-To publish it under a path such as `https://<server>/netops-executor/`, set
-`NETOPS_ROOT_PATH=/netops-executor` and restart the API, so `/docs` and batch
-`status_url` values carry the prefix; the console already uses relative links.
-`deploy/apache-netops-executor.conf` is a tested Apache httpd 2.4 configuration for
-that layout. The proxy may strip the prefix or pass it through, and direct requests to
-the listener (health checks, the CLI on the host) keep working without it.
-Persist `data`, `backups`, and the external keyring. Do not use `down -v` if job
-history is needed. SELinux mounts use `:z` for sharing. Containers run as UID 10001.
+Compose keeps `data` and `backups` in named volumes; do not use `down -v` if job
+history is needed. SELinux mounts use `:z` for sharing.
+
+### CLI
 
 SSH uses verified known_hosts and rejects unknown/changed keys. The device account
 needs bash, SFTP, tmsh administrator rights and filesystem access for images/UCS;

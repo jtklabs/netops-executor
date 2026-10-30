@@ -1,3 +1,5 @@
+# Local testing only. Production remotes are native systemd installs on Ubuntu 24.04 or
+# RHEL 9 (deploy/ansible/deploy.yml).
 # Preserve existing default named volumes across the directory rename.
 name: ${NETOPS_COMPOSE_PROJECT:-f5-upgrade}
 x-service: &service
