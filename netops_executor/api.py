@@ -1,5 +1,7 @@
 import hmac
 import os
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -8,6 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
+from httpx import HTTPError
 from pydantic import AwareDatetime, Field
 
 from . import __version__
@@ -25,6 +28,7 @@ from .panos_models import PanosBatch, PanosUpgradeRequest
 from .platforms import NETWORK_TYPES, validate_commands
 from .snmp_models import SnmpResults, SnmpWalkRequest
 from .store import Conflict, Store
+from .webhooks import Rejected, WebhookSender, redacted
 
 
 class JobResponse(Model):
@@ -185,6 +189,21 @@ def create_app(settings=None):
     os.umask(0o077)
     settings = settings or Settings.load()
     store = Store(settings.data_dir / "jobs.sqlite3")
+    webhooks = WebhookSender(settings, store) if settings.webhook_url else None
+    store.set_webhooks(webhooks is not None)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        # The API delivers webhooks for jobs that workers finish; deliveries wait while it is down.
+        stop = threading.Event()
+        sender = threading.Thread(target=webhooks.run, args=(stop,), daemon=True) if webhooks else None
+        if sender:
+            sender.start()
+        yield
+        stop.set()
+        if sender:
+            sender.join(15)
+
     # Behind a reverse proxy at a sub-path, root_path makes /docs and status URLs include the prefix.
     app = FastAPI(
         title="NetOps Executor API",
@@ -192,8 +211,10 @@ def create_app(settings=None):
         docs_url="/docs",
         redoc_url=None,
         root_path=settings.root_path,
+        lifespan=lifespan,
     )
     app.state.store = store
+    app.state.webhooks = webhooks
     vault = Vault(store, settings.credential_key_file)
     bearer = HTTPBearer(auto_error=False)
 
@@ -538,6 +559,33 @@ def create_app(settings=None):
     @app.get("/api/v1/workers", dependencies=authenticated)
     def workers():
         return store.worker_list(settings.stale_seconds)
+
+    @app.get("/api/v1/webhooks", dependencies=authenticated, tags=["Webhooks"])
+    def webhook_status() -> dict:
+        return {
+            "enabled": webhooks is not None,
+            "url": redacted(settings.webhook_url) if webhooks else None,
+            "max_rows": settings.webhook_max_rows,
+            **store.webhook_summary(),
+        }
+
+    @app.post("/api/v1/webhooks/retry", dependencies=authenticated, tags=["Webhooks"])
+    def webhook_retry() -> dict:
+        if not webhooks:
+            raise Conflict("no webhook is configured")
+        return {"requeued": store.webhook_retry()}
+
+    @app.post("/api/v1/webhooks/test", dependencies=authenticated, tags=["Webhooks"])
+    def webhook_test() -> dict:
+        if not webhooks:
+            raise Conflict("no webhook is configured")
+        try:
+            return {"delivered": True, "status_code": webhooks.ping(), "error": None}
+        except (HTTPError, Rejected) as exc:
+            return {
+                "delivered": False,
+                "error": str(exc) if isinstance(exc, Rejected) else type(exc).__name__,
+            }
 
     @app.get("/api/v1/queues", dependencies=authenticated, response_model=list[QueueStatus])
     def queues():

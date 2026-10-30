@@ -93,6 +93,14 @@ class Settings:
     # firmware staging servers (FortiGate alternate-partition preloads).
     staging_address: str | None = None
     staging_ports: range = range(2121, 2141)
+    # Signed POST to the central application whenever a job finishes or needs review.
+    webhook_url: str | None = None
+    # Sent as Authorization: Bearer; the optional secret also signs each body with HMAC-SHA256.
+    webhook_token: str | None = None
+    webhook_secret: str | None = None
+    webhook_ca_file: Path | None = None
+    # SNMP rows included in a walk's webhook; the rest are read from the results endpoint.
+    webhook_max_rows: int = 10000
 
     def device(self, identifier):
         if identifier in self.devices:
@@ -140,6 +148,22 @@ class Settings:
         if not match or not 1024 <= int(match[1]) < int(match[2]) <= 65535:
             raise ValueError("NETOPS_STAGING_PORTS must be a range such as 2121-2140")
         result.staging_ports = range(int(match[1]), int(match[2]) + 1)
+        if env("NETOPS_WEBHOOK_URL"):
+            result.webhook_url = webhook_url(env("NETOPS_WEBHOOK_URL"))
+            result.webhook_token = env("NETOPS_WEBHOOK_TOKEN", "")
+            if not re.fullmatch(r"[\x21-\x7e]{16,}", result.webhook_token):
+                raise ValueError(
+                    "NETOPS_WEBHOOK_TOKEN must be at least 16 printable characters without spaces"
+                )
+            result.webhook_secret = env("NETOPS_WEBHOOK_SECRET") or None
+            if result.webhook_secret is not None and len(result.webhook_secret) < 32:
+                raise ValueError("NETOPS_WEBHOOK_SECRET must contain at least 32 characters")
+            if env("NETOPS_WEBHOOK_CA_FILE"):
+                result.webhook_ca_file = Path(env("NETOPS_WEBHOOK_CA_FILE"))
+            rows = env("NETOPS_WEBHOOK_MAX_ROWS", "10000")
+            if not rows.isdigit() or int(rows) > 100000:
+                raise ValueError("NETOPS_WEBHOOK_MAX_ROWS must be a number from 0 to 100000")
+            result.webhook_max_rows = int(rows)
         result.ssh_host_keys = env("NETOPS_SSH_HOST_KEYS", "known_hosts")
         if result.ssh_host_keys not in ("known_hosts", "pin"):
             raise ValueError("NETOPS_SSH_HOST_KEYS must be known_hosts or pin")
@@ -171,6 +195,24 @@ class Settings:
         result.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         result.backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         return result
+
+
+def webhook_url(url):
+    """Job results go to the webhook, so require HTTPS except to this host."""
+    parsed = urlsplit(url)
+    try:
+        loopback = parsed.hostname == "localhost" or ip_address(parsed.hostname or "").is_loopback
+    except ValueError:
+        loopback = False
+    if (
+        not (parsed.scheme == "https" or (parsed.scheme == "http" and loopback))
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+    ):
+        raise ValueError("NETOPS_WEBHOOK_URL must be an HTTPS URL without credentials or fragment")
+    return url
 
 
 def under(root: Path, relative: str) -> Path:

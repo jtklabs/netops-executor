@@ -21,6 +21,21 @@ UPGRADE_KINDS = (
 )
 
 
+# Statuses that end a job or wait for the caller; entering one queues a webhook delivery.
+WEBHOOK_STATUSES = (
+    "succeeded",
+    "completed_with_warnings",
+    "failed",
+    "cancelled",
+    "expired",
+    "recovery_required",
+    "resolved",
+    "manually_completed",
+    "needs_review",
+)
+WEBHOOK_RETRY_SECONDS = 72 * 3600
+
+
 def default_queue(kind):
     """Rollbacks are operator recovery; upgrades get their own pool; everything else is bulk."""
     return "priority" if kind == "rollback" else "upgrade" if kind in UPGRADE_KINDS else "scheduled"
@@ -98,6 +113,14 @@ class Store:
                 CREATE TABLE IF NOT EXISTS pins (
                     key TEXT PRIMARY KEY, kind TEXT NOT NULL, fingerprint TEXT NOT NULL,
                     first_seen REAL NOT NULL, last_seen REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS options (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, job TEXT NOT NULL,
+                    status TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, next_attempt REAL NOT NULL,
+                    expires REAL NOT NULL, last_attempt REAL, last_error TEXT, delivered REAL);
+                CREATE INDEX IF NOT EXISTS webhook_due ON webhook_deliveries(state,next_attempt,seq);
+                CREATE INDEX IF NOT EXISTS webhook_job ON webhook_deliveries(job,state);
                 CREATE INDEX IF NOT EXISTS resources_job ON resources(job);
                 CREATE INDEX IF NOT EXISTS gates_job ON gates(job);
                 CREATE INDEX IF NOT EXISTS batch_members_batch ON batch_members(batch,wave);
@@ -131,6 +154,22 @@ class Store:
             for column in ("queues", "version"):
                 if column not in worker_columns:
                     db.execute(f"ALTER TABLE workers ADD COLUMN {column} TEXT")
+            # Queue a delivery in the same transaction as every status change that finishes a job,
+            # whichever process or code path makes it. A delivery that was never attempted takes the
+            # newer status instead of adding another; one already sent stays as it is.
+            db.execute("DROP TRIGGER IF EXISTS jobs_webhook")
+            db.execute(f"""CREATE TRIGGER jobs_webhook AFTER UPDATE OF status ON jobs
+                WHEN NEW.status IS NOT OLD.status AND NEW.status IN ({",".join(f"'{s}'" for s in WEBHOOK_STATUSES)})
+                AND EXISTS(SELECT 1 FROM options WHERE key='webhooks')
+                BEGIN
+                    UPDATE webhook_deliveries SET status=NEW.status
+                    WHERE job=NEW.id AND state='pending' AND attempts=0;
+                    INSERT INTO webhook_deliveries(id,job,status,created,next_attempt,expires)
+                    SELECT lower(hex(randomblob(16))),NEW.id,NEW.status,NEW.updated,0,
+                    NEW.updated+{WEBHOOK_RETRY_SECONDS}
+                    WHERE NOT EXISTS(SELECT 1 FROM webhook_deliveries
+                        WHERE job=NEW.id AND state='pending' AND attempts=0);
+                END""")
 
     @staticmethod
     def scheduled_request(request):
@@ -857,6 +896,85 @@ class Store:
         with self.connect() as db:
             if not db.execute("DELETE FROM pins WHERE key=?", (key,)).rowcount:
                 raise KeyError(key)
+
+    def set_webhooks(self, enabled):
+        """Finishing jobs queue deliveries only while a webhook is configured on the API."""
+        with self.connect() as db:
+            if enabled:
+                db.execute("INSERT OR IGNORE INTO options VALUES ('webhooks','enabled')")
+            else:
+                db.execute("DELETE FROM options WHERE key='webhooks'")
+                db.execute("DELETE FROM webhook_deliveries WHERE state='pending'")
+
+    def webhook_due(self, now, limit=50):
+        with self.connect() as db:
+            db.execute(
+                """DELETE FROM webhook_deliveries WHERE (state='delivered' AND delivered<?)
+                OR (state='failed' AND last_attempt<?)""",
+                (now - 7 * 86400, now - 30 * 86400),
+            )
+            return [
+                dict(r)
+                for r in db.execute(
+                    "SELECT * FROM webhook_deliveries WHERE state='pending' AND next_attempt<=? ORDER BY seq LIMIT ?",
+                    (now, limit),
+                )
+            ]
+
+    def webhook_attempt(self, delivery, now):
+        # Count the attempt before sending, so a later status change queues a new delivery rather
+        # than renaming one the receiver may already have processed.
+        with self.connect() as db:
+            db.execute(
+                "UPDATE webhook_deliveries SET attempts=attempts+1,last_attempt=? WHERE id=?", (now, delivery)
+            )
+            return dict(db.execute("SELECT * FROM webhook_deliveries WHERE id=?", (delivery,)).fetchone())
+
+    def webhook_delivered(self, delivery, now):
+        with self.connect() as db:
+            db.execute(
+                "UPDATE webhook_deliveries SET state='delivered',delivered=?,last_error=NULL WHERE id=?",
+                (now, delivery),
+            )
+
+    def webhook_failed(self, delivery, error, retry_at):
+        with self.connect() as db:
+            db.execute(
+                """UPDATE webhook_deliveries SET last_error=?,next_attempt=?,
+                state=CASE WHEN ?>=expires THEN 'failed' ELSE 'pending' END WHERE id=?""",
+                (error, retry_at, retry_at, delivery),
+            )
+
+    def webhook_retry(self, now=None):
+        now = time.time() if now is None else now
+        with self.connect() as db:
+            return db.execute(
+                "UPDATE webhook_deliveries SET state='pending',next_attempt=?,expires=? WHERE state='failed'",
+                (now, now + WEBHOOK_RETRY_SECONDS),
+            ).rowcount
+
+    def webhook_summary(self, now=None, limit=20):
+        now = time.time() if now is None else now
+        with self.connect() as db:
+            counts = dict(
+                db.execute("SELECT state,count(*) FROM webhook_deliveries GROUP BY state").fetchall()
+            )
+            oldest = db.execute(
+                "SELECT min(created) FROM webhook_deliveries WHERE state='pending'"
+            ).fetchone()[0]
+            failures = [
+                dict(r)
+                for r in db.execute(
+                    """SELECT id,job,status,state,attempts,created,last_attempt,next_attempt,last_error
+                    FROM webhook_deliveries WHERE last_error IS NOT NULL ORDER BY last_attempt DESC LIMIT ?""",
+                    (limit,),
+                )
+            ]
+        return {
+            **{state: counts.get(state, 0) for state in ("pending", "delivered", "failed")},
+            "oldest_pending_seconds": round(now - oldest, 1) if oldest is not None else None,
+            "recent_failures": failures,
+        }
 
     def worker_seen(self, worker, job=None, state="available", queues=None):
         # Each heartbeat carries the release of the code running in that worker process.

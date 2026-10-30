@@ -20,6 +20,11 @@
     executor_known_hosts: ""
     # Set to /netops-executor when a reverse proxy publishes the API under that path.
     executor_root_path: ""
+    # Completion webhook to the central application, sent with this bearer token (from Ansible
+    # Vault). The optional secret also signs each body.
+    executor_webhook_url: ""
+    executor_webhook_token: ""
+    executor_webhook_secret: ""
     executor_python: "{{ 'python3.11' if ansible_facts.os_family == 'RedHat' else 'python3' }}"
   pre_tasks:
     - name: Validate supported OS and required secret
@@ -29,6 +34,8 @@
           - executor_api_token | default('') is match('^[A-Za-z0-9_.~-]{32,}$')
           - executor_workers is not mapping or executor_workers | list | difference(['priority', 'upgrade']) | length == 0
           - executor_worker_instances | length > 0
+          - executor_webhook_url == '' or executor_webhook_token is match('^[!-~]{16,}$')
+          - executor_webhook_secret == '' or executor_webhook_secret | length >= 32
       no_log: true
   tasks:
     - name: Install Python and Nmap on Ubuntu
@@ -159,6 +166,13 @@
           NETOPS_HTTP_TARGETS_FILE=/etc/netops-executor/http-targets.json
           NETOPS_KNOWN_HOSTS=/etc/netops-executor/known_hosts
           NETOPS_ROOT_PATH={{ executor_root_path }}
+          {% if executor_webhook_url %}
+          NETOPS_WEBHOOK_URL={{ executor_webhook_url }}
+          NETOPS_WEBHOOK_TOKEN={{ executor_webhook_token }}
+          {% if executor_webhook_secret %}
+          NETOPS_WEBHOOK_SECRET={{ executor_webhook_secret }}
+          {% endif %}
+          {% endif %}
       no_log: true
     - name: Configure inventories
       ansible.builtin.copy:

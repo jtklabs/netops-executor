@@ -62,6 +62,8 @@ keeps the token only in tab memory and uses the same API.
 | GET | `/api/v1/snmp/walks/{id}/results?after=0&limit=500` | Paginated partial/final rows |
 | GET | `/api/v1/jobs?limit=100&offset=0` or `/jobs/{id}` | Jobs and full results/credential audit |
 | GET | `/api/v1/queues` | Queued, due and running jobs and workers per queue |
+| GET | `/api/v1/webhooks` | Webhook configuration and delivery backlog |
+| POST | `/api/v1/webhooks/test` or `/retry` | Send a signed `ping`, or requeue failed deliveries |
 | GET | `/api/v1/jobs/{id}/events?after=0&limit=500` | Ordered events; advance cursor to last `seq` |
 | GET | `/api/v1/jobs/{id}/backup` | Download completed UCS backup (or the first PAN-OS config backup) |
 | GET | `/api/v1/jobs/{id}/artifacts/{name}` | Download a saved PAN-OS running config or tech support file |
@@ -229,6 +231,77 @@ it). `GET /api/v1/workers` shows each worker's claim order.
 Upgrading adds the queue column and assigns existing jobs their default queue.
 Workers from earlier releases, and numbered instances such as
 `netops-executor-worker@1`, have no pool and claim in the default order.
+
+## Completion webhooks
+
+Set `NETOPS_WEBHOOK_URL` and `NETOPS_WEBHOOK_TOKEN` and the remote POSTs each job to
+the central application when it finishes, with `Authorization: Bearer <token>`, so the
+application does not have to keep polling a large backlog. The token is at least 16
+printable characters without spaces, issued by the receiving application. In Ansible,
+set `executor_webhook_url` and `executor_webhook_token` (from Vault). The URL must be
+HTTPS, except to this host; `NETOPS_WEBHOOK_CA_FILE` trusts a private CA. Polling keeps
+working unchanged.
+
+A delivery is queued in the same database transaction as the status change, whichever
+worker or API call makes it:
+
+| Event | Sent when the job becomes |
+| --- | --- |
+| `job.finished` | `succeeded`, `completed_with_warnings`, `failed`, `cancelled`, `expired`, `recovery_required`, `resolved` or `manually_completed` |
+| `job.needs_review` | `needs_review` (an upgrade waiting for a validation decision) |
+
+```json
+{
+  "event": "job.finished",
+  "delivery_id": "6f1c0e...",
+  "status": "succeeded",
+  "executor_version": "0.16.0",
+  "job": {"id": "...", "kind": "snmp_walk", "status": "succeeded", "queue": "scheduled", "result": {}},
+  "snmp_results": {"id": "...", "status": "succeeded", "finished": true, "rows": [], "next_cursor": 3900, "has_more": false}
+}
+```
+
+`job` is the same record as `GET /api/v1/jobs/{id}`, read when the webhook is sent;
+`status` is the status that queued it. If the job has moved on since (for example
+`recovery_required` then `resolved`), `job` shows the newer state and a later delivery
+follows. SNMP walks add `snmp_results`, the first `NETOPS_WEBHOOK_MAX_ROWS` rows
+(default 10,000; 0 sends none) in the same shape as the results endpoint. When
+`has_more` is true, read the rest with `?after=<next_cursor>`.
+
+Headers: `Authorization: Bearer <token>`, `X-NetOps-Event`, `X-NetOps-Delivery` (the
+same on every retry) and `X-NetOps-Timestamp` (Unix seconds). Optionally set
+`NETOPS_WEBHOOK_SECRET` (at least 32 characters; `executor_webhook_secret` in Ansible)
+to also send `X-NetOps-Signature`: `sha256=` and the hex HMAC-SHA256 of
+`<timestamp>.<raw body>` keyed with the secret, which proves the body was not altered.
+Verify it against the raw request bytes and reject old timestamps:
+
+```python
+import hashlib, hmac, time
+
+
+def verified(secret: bytes, headers, body: bytes) -> bool:
+    timestamp = headers["X-NetOps-Timestamp"]
+    expected = "sha256=" + hmac.new(secret, timestamp.encode() + b"." + body, hashlib.sha256).hexdigest()
+    return (
+        hmac.compare_digest(expected, headers["X-NetOps-Signature"])
+        and abs(time.time() - int(timestamp)) < 300
+    )
+```
+
+Any 2xx response is success. Anything else, a timeout (10 seconds) or a connection
+error is retried after 5, 10, 20 seconds and so on, up to every 10 minutes, for 72
+hours; while the receiver is failing, the remote pauses all deliveries for the same
+backoff instead of trying each one. Delivery is at least once: deduplicate on
+`delivery_id`, and treat the job's `updated` time as the order. The API process sends
+webhooks, so deliveries wait while it is stopped and resume when it starts.
+Redirects are not followed.
+
+`GET /api/v1/webhooks` reports `pending`, `delivered` and `failed` counts, the oldest
+pending delivery's age and the most recent errors. `POST /api/v1/webhooks/retry`
+requeues deliveries that gave up, for another 72 hours, and `POST /api/v1/webhooks/test`
+sends a signed `{"event": "ping"}` and returns the receiver's status. Delivered records
+are kept for 7 days and failed ones for 30. Jobs that finish while no webhook is
+configured are not sent later.
 
 ## SSH and HTTPS cipher scans
 
