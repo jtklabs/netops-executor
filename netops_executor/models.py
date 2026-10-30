@@ -40,6 +40,7 @@ class ScheduledRequest(Model):
     )
     queue: Queue | None = Field(
         default=None,
+        examples=["priority"],
         description="Worker queue. priority: operator-initiated work that must not wait behind bulk jobs; scheduled: recurring bulk work; upgrade: firmware upgrades. Priority and upgrade pool workers claim from their own queue first, then the other, then scheduled. Omitted: upgrades and upgrade batches use upgrade, rollbacks use priority, all other jobs use scheduled.",
     )
 

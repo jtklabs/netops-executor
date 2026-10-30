@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from .models import JobRequest, Model, Name, ScheduledRequest
+from .models import JobRequest, Model, Name, Queue, ScheduledRequest
 from .panos_models import within_window
 from .platforms import DeviceType
 
@@ -113,6 +113,10 @@ class ValidationDecision(Model):
     validation_revision: int = Field(ge=1)
     operator: str = Field(min_length=1, max_length=128)
     reason: str = Field(min_length=5, max_length=1000)
+    queue: Queue | None = Field(
+        default=None,
+        description="Worker queue the resumed job waits in. Omitted: the queue it was submitted to.",
+    )
 
 
 class ManualCompletion(Model):

@@ -56,6 +56,7 @@ function request() {
       .map((x) => x.trim())
       .filter(Boolean),
   };
+  if ($("queue").value) r.queue = $("queue").value;
   bools.forEach((k) => (r[k] = $(k).checked));
   numbers.forEach((k) => {
     if ($(k).value !== "") r[k] = Number($(k).value);
@@ -329,6 +330,7 @@ fetch("healthz")
 
 const examples = {
   "upgrade-batches": {
+    queue: "upgrade",
     name: "Change123",
     defaults: {
       install: true,
@@ -359,6 +361,7 @@ const examples = {
     ],
   },
   "panos/upgrade-batches": {
+    queue: "upgrade",
     name: "Change456",
     defaults: {
       panorama: "panorama",
@@ -372,6 +375,7 @@ const examples = {
     ],
   },
   "panos/jobs": {
+    queue: "upgrade",
     serial: "007951000123456",
     panorama: "panorama",
     target_version: "11.1.6-h3",
@@ -379,6 +383,7 @@ const examples = {
     f5_drain: { device: "192.0.2.51", remaining_connections: 50 },
   },
   "eos/upgrade-batches": {
+    queue: "upgrade",
     name: "Change789",
     defaults: {
       target_version: "4.32.2F",
@@ -392,12 +397,14 @@ const examples = {
     ],
   },
   "eos/jobs": {
+    queue: "upgrade",
     device: "192.0.2.31",
     target_version: "4.32.2F",
     allowed_source_versions: ["4.30.5M"],
     image: { name: "EOS-4.32.2F.swi", sha256: "REPLACE_WITH_SHA256" },
   },
   "iosxe/upgrade-batches": {
+    queue: "upgrade",
     name: "Change790",
     defaults: {
       target_version: "17.12.6",
@@ -418,12 +425,14 @@ const examples = {
     ],
   },
   "iosxe/jobs": {
+    queue: "upgrade",
     device: "192.0.2.41",
     target_version: "17.12.6",
     allowed_source_versions: ["17.9.5"],
     image: { name: "cat9k_iosxe.17.12.06.SPA.bin", sha256: "REPLACE_WITH_SHA256" },
   },
   "ios/upgrade-batches": {
+    queue: "upgrade",
     name: "Change791",
     defaults: {
       target_version: "15.2(7)E10",
@@ -441,12 +450,14 @@ const examples = {
     ],
   },
   "ios/jobs": {
+    queue: "upgrade",
     device: "192.0.2.51",
     target_version: "15.2(7)E10",
     allowed_source_versions: ["15.2(7)E3"],
     image: { name: "c2960x-universalk9-tar.152-7.E10.tar", sha256: "REPLACE_WITH_SHA256" },
   },
   "fortigate/upgrade-batches": {
+    queue: "upgrade",
     name: "Change792",
     defaults: {
       allowed_source_versions: ["7.4.4"],
@@ -461,6 +472,7 @@ const examples = {
     waves: [{ wave: 1, upgrade_at_a_time: 20, devices: ["192.0.2.61", "192.0.2.62"] }],
   },
   "fortigate/jobs": {
+    queue: "upgrade",
     device: "192.0.2.61",
     software_source: "fortimanager",
     fortimanager: "fortimanager",

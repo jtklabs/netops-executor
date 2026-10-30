@@ -489,6 +489,12 @@ def test_api_plans_queues_and_validates(settings, store, staging):
     batch = client.post("/api/v1/fortigate/upgrade-batches", json=body)
     assert batch.status_code == 202, batch.text
     assert batch.json()["kind"] == "fortigate_upgrade" and batch.json()["device_count"] == 2
+    assert {j["queue"] for j in batch.json()["jobs"]} == {"upgrade"}
+    single = client.post(
+        "/api/v1/fortigate/jobs", json={**defaults, "device": "192.0.2.65", "queue": "priority"}
+    )
+    assert single.status_code == 202, single.text
+    assert single.json()["queue"] == "priority"
     steps = client.post("/api/v1/fortigate/plan", json={**defaults, "device": "192.0.2.61"}).json()["steps"]
     assert steps[-1] == "validate_traffic" and "stage_alternate_partition_over_one_time_ftp" in steps
     assert client.post("/api/v1/fortigate/jobs", json={**defaults, "device": "eos1"}).status_code == 422

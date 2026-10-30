@@ -799,7 +799,8 @@ class Store:
         raise NeedsReview()
 
     def decide(self, job, decision, key=None):
-        payload = decision.model_dump_json()
+        # Decisions recorded before queues existed stay idempotent: omit an unset queue.
+        payload = decision.model_dump_json(exclude={"queue"} if decision.queue is None else None)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             gate = db.execute("SELECT * FROM gates WHERE id=? AND job=?", (decision.gate_id, job)).fetchone()
@@ -816,7 +817,10 @@ class Store:
                 "UPDATE gates SET state='pending',decision=?,decision_key=? WHERE id=?",
                 (payload, key, gate["id"]),
             )
-            db.execute("UPDATE jobs SET status='queued',worker=NULL,heartbeat=NULL WHERE id=?", (job,))
+            db.execute(
+                "UPDATE jobs SET status='queued',worker=NULL,heartbeat=NULL,queue=coalesce(?,queue) WHERE id=?",
+                (decision.queue, job),
+            )
         return {"gate_id": decision.gate_id, "state": "pending"}
 
     def apply_decision(self, job, worker):

@@ -75,6 +75,7 @@ def parser():
             control.add_argument("--action", choices=["accept", "retry"], required=True)
             control.add_argument("--gate-id", required=True)
             control.add_argument("--revision", type=int, required=True)
+            control.add_argument("--queue", choices=QUEUES, help="Queue the resumed job waits in")
             control.add_argument("--idempotency-key")
     for command in ("job", "events", "cancel", "rollback", "resolve"):
         sub = commands.add_parser(command)
@@ -213,6 +214,8 @@ def main():
             )
             if args.command == "validation":
                 body.update(action=args.action, gate_id=args.gate_id, validation_revision=args.revision)
+                if args.queue:
+                    body["queue"] = args.queue
         elif args.command == "job":
             path = "/api/v1/jobs/" + args.id
         elif args.command in ("events", "rollback", "cancel", "resolve"):

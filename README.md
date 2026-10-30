@@ -188,9 +188,11 @@ recurring backlog:
 | `upgrade` | Firmware upgrades | F5, PAN-OS, EOS, IOS XE, IOS and FortiGate jobs and batches |
 | `scheduled` | Recurring bulk work, such as nightly SNMP walks for every device | SSH, HTTP, SNMP and cipher-scan jobs |
 
-Every submission, batch and rollback accepts `"queue"` to override the default. A
-batch's `queue` applies to its members; a member's `defaults` or `overrides` entry
-can set its own. The central application should send `"queue": "priority"` for
+Every submission accepts `"queue"` to override the default: single jobs of every
+kind, batches, rollbacks and validation decisions, where it moves the resumed job
+(omitted, the job stays in its queue). A batch's `queue` applies to its members; a
+member's `defaults` or `overrides` entry can set its own. The console's upgrade form
+has a queue selector and every JSON example shows the field. The central application should send `"queue": "priority"` for
 manual runs; unmarked SSH, HTTP, SNMP and cipher-scan jobs land in `scheduled`.
 Responses report the queue the job is in. Omitting `queue` keeps the stored request,
 and therefore idempotent replays, identical to earlier releases.

@@ -135,9 +135,10 @@ def test_preload_batch_through_the_api(settings, store, image):
         "defaults": {"stage_only": True, "images": [image]},
         "waves": [{"wave": 1, "upgrade_at_a_time": 20, "ips": ["192.0.2.10", "192.0.2.11"]}],
     }
-    response = client.post("/api/v1/upgrade-batches", json=body)
+    response = client.post("/api/v1/upgrade-batches", json={**body, "queue": "priority"})
     assert response.status_code == 202, response.text
     assert response.json()["device_count"] == 2
+    assert {j["queue"] for j in response.json()["jobs"]} == {"priority"}
     plan = client.post("/api/v1/plan", json={"device": "lab", "stage_only": True, "images": [image]}).json()
     assert plan["steps"] == ["preload_checks", "transfer", "verify_images"]
 

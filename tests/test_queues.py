@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from types import SimpleNamespace
 
@@ -8,7 +9,7 @@ from netops_executor import store as store_module
 from netops_executor.api import create_app
 from netops_executor.cli import parser
 from netops_executor.config import HTTPTarget
-from netops_executor.execution_models import Batch
+from netops_executor.execution_models import Batch, ValidationDecision
 from netops_executor.store import Conflict, Store
 from netops_executor.worker import worker_queues
 
@@ -290,3 +291,71 @@ def test_cli_exposes_queues():
     assert parser().parse_args(["queues"]).command == "queues"
     with pytest.raises(SystemExit):
         parser().parse_args(["submit", "--device", "lab", "--queue", "urgent"])
+
+
+def test_every_job_submission_accepts_a_queue(client):
+    # Anything that creates or resumes a job must take a queue, including endpoints added later.
+    spec = client.get("/openapi.json").json()
+    schemas = spec["components"]["schemas"]
+    jobs = {"JobResponse", "CipherScanJobResponse", "BatchResponse"}
+    checked = []
+    for path, operations in spec["paths"].items():
+        operation = operations.get("post")
+        if not operation or "requestBody" not in operation:
+            continue
+        responses = json.dumps(operation["responses"])
+        if not any(name in responses for name in jobs) and not path.endswith("/validation-decisions"):
+            continue
+        name = operation["requestBody"]["content"]["application/json"]["schema"]["$ref"].split("/")[-1]
+        if name in ("RecoveryResolution", "ManualCompletion"):
+            continue  # Resolving or completing a job never queues work.
+        assert "queue" in schemas[name]["properties"], path
+        checked.append(path)
+    assert len(checked) == 18
+    for example in schemas["CipherScanRequest"]["examples"]:
+        assert example["queue"] in ("priority", "scheduled")
+
+
+def decision(gate, queue=None):
+    return ValidationDecision(
+        action="accept",
+        gate_id=gate["id"],
+        validation_revision=gate["revision"],
+        operator="operator",
+        reason="checked manually",
+        queue=queue,
+    )
+
+
+def gated(store, device):
+    job = store.submit({"device": device}, "device:" + device)
+    store.claim("upgrade-1", worker_queues(pool="upgrade"))
+    with pytest.raises(store_module.NeedsReview):
+        store.open_gate(job["id"], "upgrade-1", "post_validation", {"critical": ["review"]}, {})
+    return job, store.get(job["id"])["validation_gates"][0]
+
+
+def test_validation_decision_can_move_the_resumed_job(client):
+    store = client.app.state.store
+    moved, gate = gated(store, "lab")
+    response = client.post(
+        f"/api/v1/jobs/{moved['id']}/validation-decisions", json=decision(gate, "priority").model_dump()
+    )
+    assert response.status_code == 202, response.text
+    assert store.get(moved["id"])["queue"] == "priority"
+    assert store.claim("upgrade-only", ("upgrade",)) is None
+    assert store.claim("priority-1", ("priority",))["id"] == moved["id"]
+
+    kept, gate = gated(store, "other")
+    store.decide(kept["id"], decision(gate))
+    assert store.get(kept["id"])["queue"] == "upgrade"
+    # A decision without a queue stores the same payload as before queues existed, so replays match.
+    with store.connect() as db:
+        stored = db.execute("SELECT decision FROM gates WHERE id=?", (gate["id"],)).fetchone()[0]
+    assert "queue" not in json.loads(stored)
+    assert store.decide(kept["id"], decision(gate)) == {"gate_id": gate["id"], "state": "pending"}
+    args = parser().parse_args(
+        ["validation", "id", "--operator", "o", "--reason", "fine now", "--action", "accept"]
+        + ["--gate-id", "g", "--revision", "1", "--queue", "priority"]
+    )
+    assert args.queue == "priority"

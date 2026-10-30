@@ -411,6 +411,12 @@ def test_batch_api_queues_eos_waves_and_validates_peers(settings, store):
     assert response.status_code == 202, response.text
     batch = response.json()
     assert batch["kind"] == "eos_upgrade" and batch["device_count"] == 3
+    assert {j["queue"] for j in batch["jobs"]} == {"upgrade"}
+    single = client.post(
+        "/api/v1/eos/jobs", json={**body["defaults"], "device": "192.0.2.34", "queue": "priority"}
+    )
+    assert single.status_code == 202, single.text
+    assert single.json()["queue"] == "priority"
     assert [j["device"] for j in batch["jobs"] if j["wave"] == 1] == ["192.0.2.31"]
     assert (
         client.post("/api/v1/eos/plan", json={**body["defaults"], "device": "192.0.2.31"}).json()["steps"][-1]

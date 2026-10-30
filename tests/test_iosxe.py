@@ -783,10 +783,9 @@ def test_api_plans_queues_batches_and_compares(settings, store):
     steps = client.post("/api/v1/iosxe/plan", json={**defaults, "device": "192.0.2.41"}).json()["steps"]
     assert steps[-1] == "write_memory_after_validation" and "install_add_activate_commit" in steps
     assert client.post("/api/v1/iosxe/jobs", json={**defaults, "device": "eos1"}).status_code == 422
-    assert (
-        client.post("/api/v1/iosxe/jobs", json={**defaults, "device": "192.0.2.41"}).json()["kind"]
-        == "iosxe_upgrade"
-    )
+    single = client.post("/api/v1/iosxe/jobs", json={**defaults, "device": "192.0.2.41", "queue": "priority"})
+    assert (single.json()["kind"], single.json()["queue"]) == ("iosxe_upgrade", "priority")
+    assert {j["queue"] for j in batch["jobs"]} == {"upgrade"}
     compared = client.post("/api/v1/iosxe/config-compare", json={"before": BEFORE, "after": AFTER}).json()
     assert compared["equivalent"] and compared["tolerated"]
     with pytest.raises(ValueError):

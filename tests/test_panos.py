@@ -827,6 +827,7 @@ def test_batch_api_queues_panos_waves(settings, store, panorama):
     batch = response.json()
     assert batch["kind"] == "panos_upgrade" and batch["device_count"] == 3
     assert {j["kind"] for j in batch["jobs"]} == {"panos_upgrade"}
+    assert {j["queue"] for j in batch["jobs"]} == {"upgrade"}
     again = client.post("/api/v1/panos/upgrade-batches", json=body, headers={"Idempotency-Key": "c456"})
     assert again.json()["id"] == batch["id"]
     claimed = [store.claim("w1"), store.claim("w2"), store.claim("w3")]
@@ -841,6 +842,11 @@ def test_batch_api_queues_panos_waves(settings, store, panorama):
         "/api/v1/panos/jobs", json={**body["defaults"], "serial": "0079510001", "panorama": "other"}
     )
     assert bad.status_code == 422
+    single = client.post(
+        "/api/v1/panos/jobs", json={**body["defaults"], "serial": "0079510009", "queue": "priority"}
+    )
+    assert single.status_code == 202, single.text
+    assert single.json()["queue"] == "priority"
     with pytest.raises(ValueError):
         PanosBatch.model_validate({**body, "overrides": {"0079519999": {}}})
 

@@ -18,8 +18,9 @@ class CipherScanRequest(ScheduledRequest):
                     "port": 8443,
                     "server_name": "management.example.com",
                     "job_timeout": 300,
+                    "queue": "priority",
                 },
-                {"device_ip": "192.0.2.10", "protocol": "ssh"},
+                {"device_ip": "192.0.2.10", "protocol": "ssh", "queue": "scheduled"},
             ]
         }
     )

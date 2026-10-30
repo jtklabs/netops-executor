@@ -402,8 +402,7 @@ def test_api_plans_queues_and_checks_device_type(settings, store):
     steps = client.post("/api/v1/ios/plan", json={**defaults, "device": "192.0.2.51"}).json()["steps"]
     assert steps.index("archive_download_sw") < steps.index("reload")
     assert client.post("/api/v1/ios/jobs", json={**defaults, "device": "xe1"}).status_code == 422
-    assert (
-        client.post("/api/v1/ios/jobs", json={**defaults, "device": "192.0.2.53"}).json()["kind"]
-        == "ios_upgrade"
-    )
+    single = client.post("/api/v1/ios/jobs", json={**defaults, "device": "192.0.2.53", "queue": "priority"})
+    assert (single.json()["kind"], single.json()["queue"]) == ("ios_upgrade", "priority")
+    assert {j["queue"] for j in batch.json()["jobs"]} == {"upgrade"}
     assert isinstance(IosBatch.model_validate(body).request_for("192.0.2.51"), IosUpgradeRequest)
