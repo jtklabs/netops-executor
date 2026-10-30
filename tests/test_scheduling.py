@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -295,6 +296,26 @@ def test_legacy_database_migration_is_additive_and_concurrent(tmp_path):
     assert store.get("review")["started_at"] == 2
     assert store.claim("worker")["id"] == "old"
     assert Store(path).get("old")["status"] == "running"
+
+
+def open_store(path, barrier):
+    barrier.wait(30)
+    Store(path)
+
+
+def test_processes_starting_together_initialize_a_new_database(tmp_path):
+    # Processes, not threads: SQLite shares locks within one process, which hides the race.
+    context = multiprocessing.get_context("spawn")
+    for attempt in range(3):
+        path = tmp_path / f"new-{attempt}.sqlite3"
+        barrier = context.Barrier(6)
+        processes = [context.Process(target=open_store, args=(path, barrier)) for _ in range(6)]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(60)
+        assert [process.exitcode for process in processes] == [0] * 6
+        assert Store(path).claim("worker") is None
 
 
 def test_swagger_and_cli_expose_schedule(client):

@@ -1,5 +1,6 @@
 """SQLite queue. No automatic replay of ambiguous device operations."""
 
+import fcntl
 import json
 import sqlite3
 import time
@@ -47,6 +48,15 @@ class NeedsReview(Exception):
 class Store:
     def __init__(self, path):
         self.path = str(path)
+        # Initialize one process at a time. A new database switches to WAL under an exclusive lock,
+        # and SQLite fails that switch with "database is locked" instead of waiting while another
+        # process creates the schema, so an API and workers starting together could crash. The lock
+        # is a separate file: closing any descriptor of the database would drop SQLite's own locks.
+        with open(self.path + ".init-lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.initialize()
+
+    def initialize(self):
         with self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
