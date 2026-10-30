@@ -1,8 +1,10 @@
-FROM python:3.12-slim
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+FROM ubuntu:24.04
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH=/opt/venv/bin:$PATH
+# Ubuntu's Python 3.12 is externally managed (PEP 668), so the service runs from its own venv.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nmap \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends python3 python3-venv nmap ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/venv
 WORKDIR /app
 COPY requirements.lock pyproject.toml ./
 RUN pip install --no-cache-dir -r requirements.lock

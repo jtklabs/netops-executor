@@ -1731,6 +1731,9 @@ Native systemd units and environment example are in `deploy/`; the Ansible
 playbook automates this setup. API/workers must share the same paths and user.
 The image/cache directory must be writable for URL downloads.
 
+The container image is built on Ubuntu 24.04 with its Python 3.12 and Nmap packages; the
+service runs from a virtual environment in `/opt/venv` as UID 10001.
+
 Docker, from this directory:
 
 ```bash
