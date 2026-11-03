@@ -24,6 +24,7 @@ from .ios_models import IosBatch, IosUpgradeRequest
 from .iosxe_config import compare as compare_configs
 from .iosxe_models import ConfigComparison, IosxeBatch, IosxeUpgradeRequest
 from .models import JobRequest, Model, Name, Queue, RecoveryResolution, RollbackRequest
+from .opengear_models import OpengearBatch, OpengearUpgradeRequest
 from .panos_models import PanosBatch, PanosUpgradeRequest
 from .platforms import NETWORK_TYPES, validate_commands
 from .snmp_models import SnmpResults, SnmpWalkRequest
@@ -48,6 +49,7 @@ class JobResponse(Model):
         "iosxe_upgrade",
         "ios_upgrade",
         "fortigate_upgrade",
+        "opengear_upgrade",
     ]
     queue: Queue
     parent: str | None
@@ -120,7 +122,13 @@ class BatchItem(Model):
 class BatchResponse(Model):
     id: str
     kind: Literal[
-        "upgrade", "panos_upgrade", "eos_upgrade", "iosxe_upgrade", "ios_upgrade", "fortigate_upgrade"
+        "upgrade",
+        "panos_upgrade",
+        "eos_upgrade",
+        "iosxe_upgrade",
+        "ios_upgrade",
+        "fortigate_upgrade",
+        "opengear_upgrade",
     ] = "upgrade"
     name: str
     status: Literal["completed", "needs_attention", "in_progress"]
@@ -163,6 +171,12 @@ class PanosPlanResponse(Model):
 
 class EosPlanResponse(Model):
     request: EosUpgradeRequest
+    steps: list[str]
+    lock_key: str
+
+
+class OpengearPlanResponse(Model):
+    request: OpengearUpgradeRequest
     steps: list[str]
     lock_key: str
 
@@ -312,6 +326,17 @@ def create_app(settings=None):
             except ValueError:
                 raise HTTPException(422, "backup directory escapes BACKUP_ROOT") from None
         return EosPlanResponse(request=request, steps=request.plan(), lock_key=lock_key(request.device))
+
+    def opengear_planned(request):
+        try:
+            device = settings.device(request.device)
+            if request.backup_directory:
+                under(settings.backup_root, request.backup_directory)
+        except ValueError:
+            raise HTTPException(422, "invalid device or backup directory") from None
+        if device.id in settings.devices and device.device_type not in ("linux", "opengear"):
+            raise HTTPException(422, "device is not an opengear device")
+        return OpengearPlanResponse(request=request, steps=request.plan(), lock_key=lock_key(request.device))
 
     def fortigate_planned(request):
         try:
@@ -596,7 +621,7 @@ def create_app(settings=None):
     def ssh_device_types():
         return [
             {"device_type": name, "modes": ["exec", "config"] if name in NETWORK_TYPES else ["exec"]}
-            for name in ["linux", "f5", "cisco_ios", "cisco_nxos", "arista_eos", "fortinet"]
+            for name in ["linux", "f5", "cisco_ios", "cisco_nxos", "arista_eos", "fortinet", "opengear"]
         ]
 
     @app.post("/api/v1/ssh/jobs", dependencies=authenticated, status_code=202, response_model=JobResponse)
@@ -753,6 +778,54 @@ def create_app(settings=None):
             for device in wave.devices:
                 eos_planned(request.request_for(device))
         return published(store.create_batch(request, idempotency_key, lock_key, kind="eos_upgrade"))
+
+    opengear_tags = ["Opengear IM7200 upgrades"]
+
+    @app.post(
+        "/api/v1/opengear/plan",
+        dependencies=authenticated,
+        response_model=OpengearPlanResponse,
+        tags=opengear_tags,
+        summary="Normalize an Opengear IM7200 upgrade and show its steps without device access",
+    )
+    def opengear_plan(request: OpengearUpgradeRequest):
+        return opengear_planned(request)
+
+    @app.post(
+        "/api/v1/opengear/jobs",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=JobResponse,
+        tags=opengear_tags,
+        summary="Queue one Opengear IM7200 upgrade over SSH",
+        description="Root-shell prechecks, configuration backup, SCP and SHA-256 verification, netflash with reboot, and post-validation. stage_only preloads without reboot. No automatic rollback. Poll GET /api/v1/jobs/{job_id}. Supports Idempotency-Key.",
+    )
+    def opengear_job(
+        request: OpengearUpgradeRequest,
+        idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
+    ):
+        p = opengear_planned(request)
+        return store.submit(
+            request.model_dump(mode="json"), p.lock_key, idempotency_key, kind="opengear_upgrade"
+        )
+
+    @app.post(
+        "/api/v1/opengear/upgrade-batches",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=BatchResponse,
+        tags=opengear_tags,
+        summary="Queue ordered waves of Opengear IM7200 upgrades",
+        description="Each wave starts only after every earlier item passed validation or was marked done.",
+    )
+    def opengear_batch(
+        request: OpengearBatch,
+        idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
+    ):
+        for wave in request.waves:
+            for device in wave.devices:
+                opengear_planned(request.request_for(device))
+        return published(store.create_batch(request, idempotency_key, lock_key, kind="opengear_upgrade"))
 
     iosxe_tags = ["IOS XE upgrades"]
 

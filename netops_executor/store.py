@@ -18,6 +18,7 @@ UPGRADE_KINDS = (
     "iosxe_upgrade",
     "ios_upgrade",
     "fortigate_upgrade",
+    "opengear_upgrade",
 )
 
 

@@ -4,7 +4,7 @@ A standalone remote for a central controller, with a versioned API, web console,
 CLI and durable SQLite queue. It runs F5 upgrades over **SSH/SFTP only**, PAN-OS
 firewall upgrades through **Panorama's XML API**, Arista EOS, Cisco IOS XE
 (Catalyst 9300, 9350, 3650 and 3850) and classic IOS (Catalyst 2960-X/2960-XR) switch
-upgrades and FortiGate (FortiOS 7.4) upgrades over **SSH**, arbitrary SSH commands, HTTPS
+upgrades, FortiGate (FortiOS 7.4), and Opengear IM7200 upgrades over **SSH**, arbitrary SSH commands, HTTPS
 requests (including Panorama requests targeting a firewall), asynchronous SNMP v3
 walks, and Nmap SSH/HTTPS cipher scans. It has no NetBox dependency.
 
@@ -50,6 +50,9 @@ keeps the token only in tab memory and uses the same API.
 | POST | `/api/v1/ios/plan` | Normalize a Catalyst 2960-X classic IOS upgrade and show its steps without device access |
 | POST | `/api/v1/ios/jobs` | Queue one Catalyst 2960-X switch or stack upgrade |
 | POST | `/api/v1/ios/upgrade-batches` | Queue ordered 2960-X waves by inventory ID or IP with per-wave concurrency |
+| POST | `/api/v1/opengear/plan` | Normalize an IM7200 upgrade without device access |
+| POST | `/api/v1/opengear/jobs` | Queue one IM7200 firmware upgrade or preload |
+| POST | `/api/v1/opengear/upgrade-batches` | Queue ordered IM7200 waves with per-wave concurrency |
 | POST | `/api/v1/fortigate/plan` | Normalize a FortiGate upgrade and show its steps without device access |
 | POST | `/api/v1/fortigate/jobs` | Queue one FortiGate or FGCP cluster upgrade |
 | POST | `/api/v1/fortigate/upgrade-batches` | Queue ordered FortiGate waves with per-wave concurrency |
@@ -185,7 +188,7 @@ recurring backlog:
 | Queue | Use | Default for |
 | --- | --- | --- |
 | `priority` | Operator-initiated work that must start next ("run now") | Rollbacks |
-| `upgrade` | Firmware upgrades | F5, PAN-OS, EOS, IOS XE, IOS and FortiGate jobs and batches |
+| `upgrade` | Firmware upgrades | F5, PAN-OS, EOS, IOS XE, IOS, FortiGate and Opengear jobs and batches |
 | `scheduled` | Recurring bulk work, such as nightly SNMP walks for every device | SSH, HTTP, SNMP and cipher-scan jobs |
 
 Every submission accepts `"queue"` to override the default: single jobs of every
@@ -1306,6 +1309,115 @@ install, so recovery is another job to the previous release's `.tar`. 2960-X upg
 tested against simulated stacks only; lab acceptance is required, especially for the
 `archive download-sw` output, `show boot` on a stack, member flash names and the reload
 prompt.
+
+## Opengear IM7200 upgrades
+
+The legacy IM7208, IM7216, IM7232 and IM7248 family uses a Linux shell and
+`netflash`, not the newer Operations Manager `ogcli`/RAUC firmware process.
+Submit to `POST /api/v1/opengear/jobs`, or send the same body to
+`POST /api/v1/opengear/plan` to inspect the steps without contacting the device:
+
+```json
+{
+  "device": "192.0.2.72",
+  "target_version": "5.3.3",
+  "allowed_source_versions": ["5.3.1"],
+  "image": {
+    "name": "im72xx-5.3.3.flash",
+    "sha256": "REPLACE_WITH_APPROVED_IMAGE_SHA256"
+  },
+  "config_backup": true,
+  "backup_directory": "opengear/change-123",
+  "stage_only": false,
+  "validation_policy": {
+    "noncritical_differences": "warn",
+    "restore_interfaces": false,
+    "on_timeout": "needs_review"
+  }
+}
+```
+
+Versions are illustrative; supply an approved vendor firmware image and digest in
+`IMAGE_ROOT`, or its HTTPS `image.source_url`. The executor does not choose an
+upgrade path or download a latest release automatically. `allowed_source_versions`
+is an exact allowlist. Downgrades are rejected. An upgrade from below 4.13.3 to
+5.x or later is rejected: upgrade to a vendor-approved intermediate release first.
+An already-target device is validated without reflashing.
+
+Inventory may use `device_type: opengear`; raw management IPs also work. A root
+shell (UID 0), SCP, `config`, `netflash`, and `sha256sum` are required. The worker
+identifies the IM7200 model/version from `/etc/version` (and `/etc/issue` when
+needed), records the Ethernet MAC and Linux boot ID, and verifies the approved
+model allowlist when `approved_models` is provided. An unidentified device or
+another Opengear family fails before flashing. Omit `credential_profiles` for the
+normal SSH profile selection/fallback, including after reboot; profile usage is
+reported with the job. A successful login without root privilege fails preflight.
+
+The workflow exports `config -e <file>.opg`, copies the configuration back over
+SCP, verifies its SHA-256, and records a downloadable artifact. This native backup
+is **unencrypted**, stored with mode 0600 under `BACKUP_ROOT`; protect the backup
+storage. Configuration contents are not put in job output. Download through
+`GET /api/v1/jobs/{id}/backup` or the artifact endpoint.
+
+Firmware is staged in a private device directory, checked against the approved
+SHA-256, and checked again immediately before `netflash <local-image-path>`.
+The installer retains netflash's native image checks; it never passes product,
+version or checksum bypass flags. The command flashes and reboots as one step.
+There is no separate install-without-reboot mode or target partition selection.
+Use `stage_only: true` to preload without configuration backup, flash or reboot.
+A later job reuses a verified image under the same staging directory by digest.
+The default `staging_directory: /tmp` is lost on reboot and consumes temporary
+storage. For persistent preloads, specify an existing, mounted directory such as
+`/var/mnt/storage.usb`. The worker checks free space plus `minimum_free_bytes`
+(default 32 MiB) and never deletes unrelated files to make room.
+
+After flashing, the same model and MAC must return on a **new boot ID** running
+the exact target version within `reboot_timeout` (default 900 seconds). Command
+rejection, an unverified reboot, or loss of the worker requires recovery and keeps
+the device reserved. A flash command is never automatically replayed. Cancellation
+before flashing stops at a checkpoint; after flashing starts the worker observes
+the reboot before stopping and retaining the recovery reservation.
+
+Post-validation records system identity, configuration checksum and physical
+Ethernet interface states. Configuration changes (including firmware migrations)
+and lost Ethernet links are warnings by default. Set `restore_interfaces: true`
+to require previously up links, or `noncritical_differences: require_review` to
+review differences. Validation is bounded by `validation_timeout` (600 seconds).
+Use the existing validation decision endpoint to accept or retry a gate; completed
+flash steps are not repeated. These checks do not prove serial-console access,
+cellular connectivity, Lighthouse enrollment or end-to-end reachability; check
+those from the controller with separate SSH/SNMP jobs when required.
+
+There is **no automatic IM7200 partition rollback** in this workflow. The source
+version is recorded and the config backup retained for operator recovery. Firmware
+recovery and any downgrade follow the vendor's procedure.
+
+For batches, use `/api/v1/opengear/upgrade-batches` with `name`, shared `defaults`,
+optional per-device `overrides`, and `waves`:
+
+```json
+{"name": "console-servers", "defaults": {
+  "target_version": "5.3.3", "allowed_source_versions": ["5.3.1"],
+  "image": {"name": "im72xx-5.3.3.flash", "sha256": "REPLACE_WITH_APPROVED_IMAGE_SHA256"}
+}, "waves": [
+  {"wave": 1, "upgrade_at_a_time": 1, "devices": ["192.0.2.72"]},
+  {"wave": 2, "upgrade_at_a_time": 2, "devices": ["192.0.2.73", "192.0.2.74"]}
+]}
+```
+
+Jobs and batches support `start_at`, `latest_start_at`, explicit `queue` (default
+`upgrade`), and `Idempotency-Key`. Shared worker leases, reservations, manual
+completion, completion webhooks, job/events/artifact polling and Swagger schemas
+apply. CLI submission uses `netops-executor request --kind opengear --file job.json`
+or `--kind opengear-batch` (see `request --help`). The web console includes both
+payload examples.
+
+Vendor references: [console-server user manual](https://ftp.opengear.com/download/documentation/manual/current/ACM/Opengear%20User%20Manual.pdf),
+[CLI and scripting reference](https://ftp.opengear.com/download/documentation/manual/previous%20versions/Opengear%20CLI%20and%20Scripting%20Reference_4-5.pdf),
+and [upgrade prerequisites](https://ftp.opengear.com/download/opengear_appliances/end_of_sale_products/current/readme-prior-to-upgrade.pdf).
+Automated tests simulate firmware/reboot behavior; a physical IM7200 upgrade has
+not been validated as part of this implementation. Exercise one lab unit with your
+exact source/target release before widening a wave.
 
 ## FortiGate upgrades (FortiOS 7.4)
 

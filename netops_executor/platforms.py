@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-DeviceType = Literal["linux", "f5", "cisco_ios", "cisco_nxos", "arista_eos", "fortinet"]
+DeviceType = Literal["linux", "f5", "cisco_ios", "cisco_nxos", "arista_eos", "fortinet", "opengear"]
 NETWORK_TYPES = {"cisco_ios", "cisco_nxos", "arista_eos", "fortinet"}
 
 

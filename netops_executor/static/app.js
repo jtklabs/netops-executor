@@ -382,6 +382,28 @@ const examples = {
     allowed_source_versions: ["10.2.9-h1"],
     f5_drain: { device: "192.0.2.51", remaining_connections: 50 },
   },
+  "opengear/jobs": {
+    queue: "upgrade",
+    device: "192.0.2.72",
+    target_version: "5.3.3",
+    allowed_source_versions: ["5.3.1"],
+    image: { name: "im72xx-5.3.3.flash", sha256: "REPLACE_WITH_SHA256" },
+    config_backup: true,
+    stage_only: false,
+  },
+  "opengear/upgrade-batches": {
+    queue: "upgrade",
+    name: "console-servers",
+    defaults: {
+      target_version: "5.3.3",
+      allowed_source_versions: ["5.3.1"],
+      image: { name: "im72xx-5.3.3.flash", sha256: "REPLACE_WITH_SHA256" },
+    },
+    waves: [
+      { wave: 1, upgrade_at_a_time: 1, devices: ["192.0.2.72"] },
+      { wave: 2, upgrade_at_a_time: 2, devices: ["192.0.2.73", "192.0.2.74"] },
+    ],
+  },
   "eos/upgrade-batches": {
     queue: "upgrade",
     name: "Change789",

@@ -311,7 +311,7 @@ def test_every_job_submission_accepts_a_queue(client):
             continue  # Resolving or completing a job never queues work.
         assert "queue" in schemas[name]["properties"], path
         checked.append(path)
-    assert len(checked) == 18
+    assert len(checked) == 20
     for example in schemas["CipherScanRequest"]["examples"]:
         assert example["queue"] in ("priority", "scheduled")
 
