@@ -1344,6 +1344,83 @@ is an exact allowlist. Downgrades are rejected. An upgrade from below 4.13.3 to
 5.x or later is rejected: upgrade to a vendor-approved intermediate release first.
 An already-target device is validated without reflashing.
 
+### Stage firmware, then upgrade
+
+These calls use the same device, image and checksum but create **separate jobs**.
+Replace `REMOTE_IP`, the device IP, versions, filename and checksum with your
+values. Set `NETOPS_API_TOKEN` in the calling shell. The image must be in the
+remote executor's `IMAGE_ROOT`, or add an HTTPS `source_url` inside `image`.
+
+First, stage and verify the firmware without a configuration backup, flash or
+reboot:
+
+```bash
+curl -X POST "http://REMOTE_IP:8080/api/v1/opengear/jobs" \
+  -H "Authorization: Bearer $NETOPS_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: opengear-192.0.2.72-stage-5.3.3" \
+  -d '{
+    "device": "192.0.2.72",
+    "target_version": "5.3.3",
+    "allowed_source_versions": ["5.3.1"],
+    "image": {
+      "name": "im72xx-5.3.3.flash",
+      "sha256": "REPLACE_WITH_64_CHARACTER_SHA256"
+    },
+    "stage_only": true
+  }'
+```
+
+When ready to upgrade, submit a new job with `stage_only: false`. This backs up
+the configuration, verifies the staged image, flashes the firmware, reboots,
+and validates the device:
+
+```bash
+curl -X POST "http://REMOTE_IP:8080/api/v1/opengear/jobs" \
+  -H "Authorization: Bearer $NETOPS_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: opengear-192.0.2.72-upgrade-5.3.3" \
+  -d '{
+    "device": "192.0.2.72",
+    "target_version": "5.3.3",
+    "allowed_source_versions": ["5.3.1"],
+    "image": {
+      "name": "im72xx-5.3.3.flash",
+      "sha256": "REPLACE_WITH_64_CHARACTER_SHA256"
+    },
+    "stage_only": false,
+    "config_backup": true,
+    "reboot_timeout": 900,
+    "validation_timeout": 600
+  }'
+```
+
+Use a **different idempotency key** for staging and upgrading. Reuse a key only
+when retrying the identical request; changing the payload with the same key
+returns a conflict. A prior staging job is optional: the upgrade job transfers
+the firmware when a verified copy is not already present.
+
+Both examples use the default device staging directory `/tmp`, which is cleared
+on reboot. For persistent staging, add `"staging_directory": "/var/mnt/storage.usb"`
+to **both** payloads if that storage is mounted. A later upgrade reuses the image
+only when it is still present in the same staging directory and its checksum
+matches.
+
+Each submission returns a job `id`. Replace `JOB_ID` with that value to poll
+staging or upgrade progress:
+
+```bash
+curl "http://REMOTE_IP:8080/api/v1/jobs/JOB_ID" \
+  -H "Authorization: Bearer $NETOPS_API_TOKEN"
+```
+
+Wait for staging to finish successfully before submitting the upgrade. Check the
+job status and result; accepting a request with HTTP 202 does not mean the device
+operation has completed. Credentials are selected automatically when
+`credential_profiles` is omitted.
+
+### Upgrade behavior and prerequisites
+
 Inventory may use `device_type: opengear`; raw management IPs also work. A root
 shell (UID 0), SCP, `config`, `netflash`, and `sha256sum` are required. The worker
 identifies the IM7200 model/version from `/etc/version` (and `/etc/issue` when
