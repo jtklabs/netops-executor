@@ -1328,7 +1328,6 @@ token. Swagger at `/docs` includes the request schema and an example.
   "username": "automation",
   "password": "REPLACE_WITH_DESIRED_PASSWORD",
   "create_if_missing": true,
-  "new_account": {"groups": ["admin"]},
   "verification": "ssh_login",
   "queue": "priority"
 }
@@ -1341,11 +1340,25 @@ IP defaults to `linux`, so specify the type for a network appliance. The usernam
 identifies the account to create or update; it does not rename another account.
 This manages local accounts, not TACACS/RADIUS/LDAP identities or AAA order.
 
-Existing accounts retain their roles, groups and access settings. `new_account`
-is used only when the account is missing and must explicitly provide its creation
-privileges. If omitted, a missing account fails before a write. Set
-`create_if_missing: false` to require an existing account. Examples of creation
-options (choose privileges appropriate to the account):
+Existing accounts retain their roles, groups and access settings. When the account
+is missing, omitting `new_account` (or setting it to null) creates a **full
+administrator** by default. Set `create_if_missing: false` to require an existing
+account. Supply `new_account` to override creation privileges; explicit options
+must include the platform's required role, privilege or groups and are not merged
+with administrator defaults.
+
+Defaults are `sudo` membership on Ubuntu/Debian, `wheel` on RHEL-family Linux,
+`admin` group on Opengear, F5 `admin` across all partitions with `bash` shell,
+IOS privilege 15, NX-OS `network-admin`, EOS `network-admin` with privilege 15,
+and FortiGate `super_admin` with the `root` VDOM. Linux defaults require an
+installed `sudo` and the existing administrative group; the worker checks full
+sudo access after creation and requires recovery if local policy does not grant it.
+Unknown Linux distributions require explicit `new_account` options. The worker
+does not edit sudoers policy. See the standard administrative-group configuration
+for [Ubuntu](https://ubuntu.com/server/docs/security-users/) and
+[RHEL](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/configuring_basic_system_settings/managing-sudo-access_configuring-basic-system-settings).
+
+Examples of explicit creation options:
 
 | `device_type` | `new_account` example | Operation and persistence |
 |---|---|---|

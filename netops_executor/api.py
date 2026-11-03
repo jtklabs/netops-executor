@@ -670,7 +670,7 @@ def create_app(settings=None):
         response_model=JobResponse,
         tags=["Password rotation"],
         summary="Create or update a local account password over SSH",
-        description="Existing privileges are preserved. New accounts require explicit new_account privileges. Passwords are encrypted with the credential keyring, never included in public job metadata. Poll GET /api/v1/jobs/{id}. Verification gates resume without replaying a password write. Existing credential profiles are not modified.",
+        description="Existing privileges are preserved. Missing accounts default to full administrator access when new_account is omitted; supply new_account to override creation privileges. Passwords are encrypted with the credential keyring, never included in public job metadata. Poll GET /api/v1/jobs/{id}. Verification gates resume without replaying a password write. Existing credential profiles are not modified.",
     )
     def password_job(
         request: PasswordRotationRequest,

@@ -19,6 +19,23 @@ class AccountCreation(Model):
     partition: Name = "all-partitions"
     vdom: Name = "root"
 
+    @classmethod
+    def administrator(cls, platform, linux_group=None):
+        if platform == "linux":
+            if linux_group not in ("sudo", "wheel"):
+                raise ValueError("Linux administrator group must be resolved on the device")
+            return cls(groups=[linux_group], shell="/bin/bash")
+        return cls.model_validate(
+            {
+                "opengear": {"groups": ["admin"]},
+                "f5": {"role": "admin", "partition": "all-partitions", "shell": "bash"},
+                "cisco_ios": {"privilege": 15},
+                "cisco_nxos": {"role": "network-admin"},
+                "arista_eos": {"role": "network-admin", "privilege": 15},
+                "fortinet": {"role": "super_admin", "vdom": "root"},
+            }[platform]
+        )
+
     def for_platform(self, platform):
         allowed = {
             "linux": {"groups", "shell"},
@@ -63,7 +80,8 @@ class PasswordRotationOptions(ScheduledRequest):
     credential_profiles: list[Name] | None = Field(default=None, min_length=1, max_length=10)
     create_if_missing: bool = True
     new_account: AccountCreation | None = Field(
-        default=None, description="Explicit privileges for a missing account; ignored for existing accounts"
+        default=None,
+        description="Creation privileges for a missing account. Omitted/null defaults to full administrator access for the platform; existing accounts keep their privileges. Linux defaults use sudo on Ubuntu/Debian or wheel on RHEL-family systems, with full sudo access checked after creation.",
     )
     verification: Literal["ssh_login", "local_hash"] = Field(
         default="ssh_login",
@@ -98,7 +116,6 @@ class PasswordRotationRequest(PasswordRotationOptions):
                     "device_type": "opengear",
                     "username": "automation",
                     "password": "REPLACE_WITH_DESIRED_PASSWORD",
-                    "new_account": {"groups": ["admin"]},
                     "verification": "ssh_login",
                     "queue": "priority",
                 }

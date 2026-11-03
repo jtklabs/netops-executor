@@ -9,6 +9,7 @@ from passlib.hash import md5_crypt, sha256_crypt, sha512_crypt
 
 from .device import blocks, field
 from .network_ssh import CLI_ERROR, NetworkSSH
+from .password_models import AccountCreation
 from .pins import PinnedHostKeys
 from .platforms import NETWORK_TYPES
 from .ssh import SSH, DeviceError
@@ -170,6 +171,30 @@ class AccountDevice:
         self.before = None
         self.vdoms = False
         self.index = self.total = None
+        self.creation = request.new_account
+
+    def administrator_defaults(self):
+        group = None
+        if self.platform == "linux":
+            # Parse data; never source a remote os-release file as shell code.
+            release = {}
+            for line in self.shell("cat /etc/os-release").splitlines():
+                key, sep, value = line.partition("=")
+                if sep and key in ("ID", "ID_LIKE"):
+                    try:
+                        words = shlex.split(value)
+                    except ValueError:
+                        raise DeviceError("Linux distribution could not be determined") from None
+                    release[key] = " ".join(words).split()
+            families = release.get("ID", []) + release.get("ID_LIKE", [])
+            if set(families) & {"ubuntu", "debian"}:
+                group = "sudo"
+            elif set(families) & {"rhel", "centos", "fedora", "rocky", "almalinux", "ol"}:
+                group = "wheel"
+            else:
+                raise DeviceError("Linux administrator defaults are unknown; supply new_account privileges")
+            self.shell("command -v sudo >/dev/null")
+        return AccountCreation.administrator(self.platform, group)
 
     def shell(self, command, stdin=None):
         result = self.ssh.execute(command, timeout=self.request.command_timeout, stdin_text=stdin)
@@ -220,15 +245,13 @@ class AccountDevice:
         if self.before is None:
             if not self.request.create_if_missing:
                 raise DeviceError("local account is missing and create_if_missing is false")
-            if self.request.new_account is None:
-                raise DeviceError(
-                    "local account is missing; new_account must explicitly specify its privileges"
-                )
             if self.request.username == "root" and p in ("linux", "opengear", "f5"):
                 raise DeviceError("missing built-in root account cannot be created by this job")
+            if self.creation is None:
+                self.creation = self.administrator_defaults()
             if p in ("linux", "opengear"):
                 groups = {line.split(":", 1)[0] for line in self.shell("cat /etc/group").splitlines()}
-                if not set(self.request.new_account.groups or []) <= groups:
+                if not set(self.creation.groups or []) <= groups:
                     raise DeviceError("a requested account group does not exist")
             if p == "linux":
                 result = self.ssh.execute("getent passwd " + self.request.username, timeout=30)
@@ -299,7 +322,7 @@ class AccountDevice:
         return network_account(self.cli("show running-config | include ^username"), user)
 
     def apply(self):
-        p, user, password, new = self.platform, self.request.username, self.password, self.request.new_account
+        p, user, password, new = self.platform, self.request.username, self.password, self.creation
         if self.read() != self.before:
             raise DeviceError("account changed since precheck; submit a new job")
         if p == "linux":
@@ -378,6 +401,12 @@ class AccountDevice:
             raise DeviceError("account is not present after write")
         if self.before is not None and self.access(self.before) != self.access(after):
             raise DeviceError("account privileges changed unexpectedly; inspect before recovery")
+        if p == "linux" and self.before is None and self.request.new_account is None:
+            sudo = self.shell("LC_ALL=C sudo -l -U " + user)
+            if not re.search(
+                r"(?m)^\s*\(ALL(?:\s*:\s*ALL)?\)\s+(?:(?:NOPASSWD|PASSWD|SETENV):\s*)*ALL\s*$", sudo
+            ):
+                raise DeviceError("created administrator does not have full sudo access; inspect sudo policy")
 
     def access(self, record):
         """Compare access settings without retaining password/hash values in a report."""

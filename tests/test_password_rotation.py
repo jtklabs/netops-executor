@@ -375,19 +375,86 @@ def test_native_account_commands_create_or_preserve_access(platform, existing, m
 
 
 @pytest.mark.parametrize("platform", list(CREATION))
-def test_missing_account_requires_explicit_creation_privileges(platform):
+def test_missing_account_defaults_to_administrator(platform):
     shell = Shell(
         {
             "id -u": "0",
             "cat /etc/version": "OpenGear/IM7248 version 5.3.3",
             "get system status": "Virtual domain configuration: disable",
+            "cat /etc/os-release": "ID=ubuntu\nID_LIKE=debian",
+            "cat /etc/group": "sudo:x:27:\nadmin:x:100:",
+            "getent passwd automation": {"stdout": "", "exit_code": 2},
         }
     )
     client = device(platform, shell)
     client.read = lambda: None
-    with pytest.raises(DeviceError, match="new_account"):
-        client.preflight()
+    assert client.preflight() is False
+    for key, value in CREATION[platform].items():
+        assert getattr(client.creation, key) == value
+    client.creation.for_platform(platform)
+    if platform == "f5":
+        assert client.creation.partition == "all-partitions" and client.creation.shell == "bash"
     assert not any("password " in c or c == "chpasswd" for c, _ in shell.calls)
+
+
+@pytest.mark.parametrize(
+    "release,group",
+    [("ID=ubuntu", "sudo"), ("ID=rhel", "wheel"), ('ID=rocky\nID_LIKE="rhel centos fedora"', "wheel")],
+)
+@pytest.mark.parametrize("sudo_access", ["(ALL : ALL) ALL", "(ALL) NOPASSWD: ALL", "(root) /usr/bin/id"])
+def test_default_linux_creation_checks_administrator_access(release, group, sudo_access):
+    shell = Shell(
+        {
+            "id -u": "0",
+            "cat /etc/os-release": release,
+            "cat /etc/group": group + ":x:27:",
+            "getent passwd automation": {"stdout": "", "exit_code": 2},
+            "LC_ALL=C sudo -l -U automation": "User automation may run the following commands:\n    "
+            + sudo_access,
+        }
+    )
+    client = device("linux", shell)
+    records = iter([None, None, "automation:x:1000:1000::/home/automation:/bin/bash"])
+    client.read = lambda: next(records)
+    assert client.preflight() is False
+    if sudo_access.endswith("/usr/bin/id"):
+        with pytest.raises(DeviceError, match="full sudo access"):
+            client.apply()
+    else:
+        client.apply()
+    assert any(command == "useradd -m -s /bin/bash -G " + group + " automation" for command, _ in shell.calls)
+
+
+def test_creation_override_and_existing_account_do_not_use_admin_defaults():
+    shell = Shell(
+        {"id -u": "0", "cat /etc/group": "", "getent passwd automation": {"stdout": "", "exit_code": 2}}
+    )
+    client = device("linux", shell, new_account={"groups": []})
+    client.read = lambda: None
+    assert client.preflight() is False and client.creation.groups == []
+    existing = device("linux", shell)
+    existing.read = lambda: "automation:x:1000:1000::/home/automation:/bin/sh"
+    assert existing.preflight() is True and existing.creation is None
+    assert all(command != "cat /etc/os-release" for command, _ in shell.calls)
+
+
+def test_unknown_linux_and_missing_admin_group_fail_before_creation():
+    shell = Shell({"id -u": "0", "cat /etc/os-release": "ID=unknown"})
+    client = device("linux", shell)
+    client.read = lambda: None
+    with pytest.raises(DeviceError, match="defaults are unknown"):
+        client.preflight()
+    shell.outputs["cat /etc/os-release"] = "ID=rhel"
+    with pytest.raises(DeviceError, match="group does not exist"):
+        client.preflight()
+    assert all(not command.startswith("useradd ") for command, _ in shell.calls)
+
+
+def test_create_if_missing_false_still_rejects_missing_account():
+    client = device("linux", Shell({"id -u": "0"}), create_if_missing=False)
+    client.read = lambda: None
+    with pytest.raises(DeviceError, match="create_if_missing is false"):
+        client.preflight()
 
 
 def test_parsers_require_complete_local_account_output():

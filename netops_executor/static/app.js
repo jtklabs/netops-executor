@@ -388,7 +388,6 @@ const examples = {
     device_type: "opengear",
     username: "automation",
     password: "REPLACE_WITH_DESIRED_PASSWORD",
-    new_account: { groups: ["admin"] },
     verification: "ssh_login",
   },
   "opengear/jobs": {
