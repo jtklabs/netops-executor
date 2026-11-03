@@ -382,6 +382,15 @@ const examples = {
     allowed_source_versions: ["10.2.9-h1"],
     f5_drain: { device: "192.0.2.51", remaining_connections: 50 },
   },
+  "password-rotation/jobs": {
+    queue: "priority",
+    device: "192.0.2.72",
+    device_type: "opengear",
+    username: "automation",
+    password: "REPLACE_WITH_DESIRED_PASSWORD",
+    new_account: { groups: ["admin"] },
+    verification: "ssh_login",
+  },
   "opengear/jobs": {
     queue: "upgrade",
     device: "192.0.2.72",
@@ -561,6 +570,7 @@ $("json-submit").onsubmit = async (e) => {
     $("json-result").textContent = JSON.stringify(result, null, 2);
     jsonPending = "";
     jsonKey = "";
+    if (path === "password-rotation/jobs") $("json-body").value = "";
     if (!path.endsWith("upgrade-batches")) selected = result.id;
     message("Queued: " + result.id);
     await refresh();

@@ -26,6 +26,8 @@ from .iosxe_models import ConfigComparison, IosxeBatch, IosxeUpgradeRequest
 from .models import JobRequest, Model, Name, Queue, RecoveryResolution, RollbackRequest
 from .opengear_models import OpengearBatch, OpengearUpgradeRequest
 from .panos_models import PanosBatch, PanosUpgradeRequest
+from .password_devices import check_password_syntax
+from .password_models import PasswordRotationOptions, PasswordRotationRequest
 from .platforms import NETWORK_TYPES, validate_commands
 from .snmp_models import SnmpResults, SnmpWalkRequest
 from .store import Conflict, Store
@@ -50,6 +52,7 @@ class JobResponse(Model):
         "ios_upgrade",
         "fortigate_upgrade",
         "opengear_upgrade",
+        "password_rotation",
     ]
     queue: Queue
     parent: str | None
@@ -171,6 +174,12 @@ class PanosPlanResponse(Model):
 
 class EosPlanResponse(Model):
     request: EosUpgradeRequest
+    steps: list[str]
+    lock_key: str
+
+
+class PasswordRotationPlanResponse(Model):
+    request: PasswordRotationOptions
     steps: list[str]
     lock_key: str
 
@@ -623,6 +632,61 @@ def create_app(settings=None):
             {"device_type": name, "modes": ["exec", "config"] if name in NETWORK_TYPES else ["exec"]}
             for name in ["linux", "f5", "cisco_ios", "cisco_nxos", "arista_eos", "fortinet", "opengear"]
         ]
+
+    def password_planned(request):
+        try:
+            device = settings.device(request.device)
+            request.device_type = request.device_type or device.device_type
+            request.for_platform(request.device_type)
+            check_password_syntax(request.device_type, request.password.get_secret_value())
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        return PasswordRotationPlanResponse(
+            request=PasswordRotationOptions.model_validate(request.model_dump()),
+            steps=[
+                "reserve_device",
+                "read_local_account",
+                "create_or_update_password",
+                "save_configuration",
+                "verify_account",
+            ],
+            lock_key=lock_key(request.device),
+        )
+
+    @app.post(
+        "/api/v1/password-rotation/plan",
+        dependencies=authenticated,
+        response_model=PasswordRotationPlanResponse,
+        tags=["Password rotation"],
+        summary="Validate a local-account rotation request without device access",
+    )
+    def password_plan(request: PasswordRotationRequest):
+        return password_planned(request)
+
+    @app.post(
+        "/api/v1/password-rotation/jobs",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=JobResponse,
+        tags=["Password rotation"],
+        summary="Create or update a local account password over SSH",
+        description="Existing privileges are preserved. New accounts require explicit new_account privileges. Passwords are encrypted with the credential keyring, never included in public job metadata. Poll GET /api/v1/jobs/{id}. Verification gates resume without replaying a password write. Existing credential profiles are not modified.",
+    )
+    def password_job(
+        request: PasswordRotationRequest,
+        idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
+    ):
+        plan = password_planned(request)
+        cipher = vault.cipher()
+        secret = request.password.get_secret_value().encode()
+        return store.submit(
+            plan.request.model_dump(mode="json"),
+            plan.lock_key,
+            idempotency_key,
+            kind="password_rotation",
+            secret=cipher.encrypt(secret),
+            secret_matches=lambda saved: hmac.compare_digest(vault.decrypt(cipher, saved), secret),
+        )
 
     @app.post("/api/v1/ssh/jobs", dependencies=authenticated, status_code=202, response_model=JobResponse)
     def ssh_job(

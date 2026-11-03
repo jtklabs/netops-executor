@@ -38,8 +38,14 @@ WEBHOOK_RETRY_SECONDS = 72 * 3600
 
 
 def default_queue(kind):
-    """Rollbacks are operator recovery; upgrades get their own pool; everything else is bulk."""
-    return "priority" if kind == "rollback" else "upgrade" if kind in UPGRADE_KINDS else "scheduled"
+    """Recovery and account rotation are priority; upgrades get their own pool; other work is bulk."""
+    return (
+        "priority"
+        if kind in ("rollback", "password_rotation")
+        else "upgrade"
+        if kind in UPGRADE_KINDS
+        else "scheduled"
+    )
 
 
 class Conflict(Exception):
@@ -98,6 +104,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS credentials (
                     id TEXT PRIMARY KEY, kind TEXT NOT NULL, priority INTEGER NOT NULL,
                     enabled INTEGER NOT NULL, revision INTEGER NOT NULL, secret BLOB NOT NULL, updated REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS job_secrets (job TEXT PRIMARY KEY, secret BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS credential_cooldowns (key TEXT PRIMARY KEY, until REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS credential_attempts (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT, job TEXT NOT NULL, time REAL NOT NULL, data TEXT NOT NULL);
@@ -290,7 +297,9 @@ class Store:
                 )
             ]
 
-    def submit(self, request, lock_key, key=None, kind="upgrade", parent=None):
+    def submit(
+        self, request, lock_key, key=None, kind="upgrade", parent=None, *, secret=None, secret_matches=None
+    ):
         request, start_at, latest_start_at = self.scheduled_request(request)
         payload = json.dumps(request, sort_keys=True)
         with self.connect() as db:
@@ -306,6 +315,13 @@ class Store:
                         existing["request"] != payload
                         or existing["kind"] != kind
                         or existing["parent"] != parent
+                    ):
+                        raise Conflict("idempotency key was used with different parameters")
+                    saved = db.execute(
+                        "SELECT secret FROM job_secrets WHERE job=?", (existing["id"],)
+                    ).fetchone()
+                    if (saved is not None) != (secret is not None) or (
+                        saved is not None and (secret_matches is None or not secret_matches(saved["secret"]))
                     ):
                         raise Conflict("idempotency key was used with different parameters")
                     return self.decode(existing)
@@ -345,6 +361,8 @@ class Store:
                     request.get("queue") or default_queue(kind),
                 ),
             )
+            if secret is not None:
+                db.execute("INSERT INTO job_secrets(job,secret) VALUES (?,?)", (job_id, secret))
             self.expire_pending(db, now)
         return self.get(job_id)
 

@@ -16,6 +16,7 @@ from .iosxe_engine import IosxeRunner
 from .models import POOLS, QUEUES
 from .opengear_engine import OpengearRunner
 from .panos_engine import PanosRunner
+from .password_engine import PasswordRotationRunner
 from .snmp import SnmpRunner
 from .store import Store
 
@@ -70,6 +71,8 @@ def process(settings, store, job, worker):
             if job["kind"] == "fortigate_upgrade"
             else OpengearRunner
             if job["kind"] == "opengear_upgrade"
+            else PasswordRotationRunner
+            if job["kind"] == "password_rotation"
             else Runner
         )
         runner(settings, store, job, worker).run()

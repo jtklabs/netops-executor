@@ -166,6 +166,13 @@ class Vault:
                 result.append({**payload, "id": row["id"], "revision": row["revision"]})
         return result
 
+    def job_password(self, job_id):
+        with self.store.connect() as db:
+            row = db.execute("SELECT secret FROM job_secrets WHERE job=?", (job_id,)).fetchone()
+        if row is None:
+            raise Conflict("job password is unavailable")
+        return self.decrypt(self.cipher(), row["secret"]).decode()
+
     def rotate(self):
         cipher = self.cipher()
         with self.store.connect() as db:
@@ -173,6 +180,10 @@ class Vault:
             for row in db.execute("SELECT id,secret FROM credentials").fetchall():
                 db.execute(
                     "UPDATE credentials SET secret=? WHERE id=?", (cipher.rotate(row["secret"]), row["id"])
+                )
+            for row in db.execute("SELECT job,secret FROM job_secrets").fetchall():
+                db.execute(
+                    "UPDATE job_secrets SET secret=? WHERE job=?", (cipher.rotate(row["secret"]), row["job"])
                 )
         return {"rotated": True}
 

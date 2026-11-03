@@ -56,6 +56,8 @@ keeps the token only in tab memory and uses the same API.
 | POST | `/api/v1/fortigate/plan` | Normalize a FortiGate upgrade and show its steps without device access |
 | POST | `/api/v1/fortigate/jobs` | Queue one FortiGate or FGCP cluster upgrade |
 | POST | `/api/v1/fortigate/upgrade-batches` | Queue ordered FortiGate waves with per-wave concurrency |
+| POST | `/api/v1/password-rotation/plan` | Validate an account rotation request without device access |
+| POST | `/api/v1/password-rotation/jobs` | Queue local account creation or password rotation over SSH |
 | POST | `/api/v1/ssh/jobs` | Queue one or more SSH commands |
 | POST | `/api/v1/http/jobs` | Queue one or more HTTPS requests |
 | GET | `/api/v1/http/targets` | Configured HTTP targets |
@@ -187,7 +189,7 @@ recurring backlog:
 
 | Queue | Use | Default for |
 | --- | --- | --- |
-| `priority` | Operator-initiated work that must start next ("run now") | Rollbacks |
+| `priority` | Operator-initiated work that must start next ("run now") | Rollbacks and password rotations |
 | `upgrade` | Firmware upgrades | F5, PAN-OS, EOS, IOS XE, IOS, FortiGate and Opengear jobs and batches |
 | `scheduled` | Recurring bulk work, such as nightly SNMP walks for every device | SSH, HTTP, SNMP and cipher-scan jobs |
 
@@ -1309,6 +1311,138 @@ install, so recovery is another job to the previous release's `.tar`. 2960-X upg
 tested against simulated stacks only; lab acceptance is required, especially for the
 `archive download-sw` output, `show boot` on a stack, member flash names and the reload
 prompt.
+
+## Local account password rotation
+
+`POST /api/v1/password-rotation/jobs` changes a local account password or creates
+the account if it is missing. It supports every generic SSH device type: `linux`,
+`f5`, `opengear`, `cisco_ios`, `cisco_nxos`, `arista_eos`, and `fortinet`.
+Use `POST /api/v1/password-rotation/plan` with the same body to validate the request
+and inspect the steps without contacting the device. Both require the API bearer
+token. Swagger at `/docs` includes the request schema and an example.
+
+```json
+{
+  "device": "192.0.2.72",
+  "device_type": "opengear",
+  "username": "automation",
+  "password": "REPLACE_WITH_DESIRED_PASSWORD",
+  "create_if_missing": true,
+  "new_account": {"groups": ["admin"]},
+  "verification": "ssh_login",
+  "queue": "priority"
+}
+```
+
+Supply the desired **new** password in `password`. The connection uses the
+existing SSH credentials, selected automatically when `credential_profiles` is
+omitted. `device_type` is inherited from inventory when omitted; an unregistered
+IP defaults to `linux`, so specify the type for a network appliance. The username
+identifies the account to create or update; it does not rename another account.
+This manages local accounts, not TACACS/RADIUS/LDAP identities or AAA order.
+
+Existing accounts retain their roles, groups and access settings. `new_account`
+is used only when the account is missing and must explicitly provide its creation
+privileges. If omitted, a missing account fails before a write. Set
+`create_if_missing: false` to require an existing account. Examples of creation
+options (choose privileges appropriate to the account):
+
+| `device_type` | `new_account` example | Operation and persistence |
+|---|---|---|
+| `linux` | `{"groups": ["sudo"], "shell": "/bin/bash"}` | Root shell; `useradd` for creation and `chpasswd` via stdin. On RHEL, use the configured group such as `wheel`. `{"groups": []}` explicitly creates an ordinary user. Groups must exist. |
+| `f5` | `{"role": "admin", "partition": "all-partitions", "shell": "tmsh"}` | Native `auth user` create/modify, then `save sys config`. Existing `root` uses the native password prompt. |
+| `opengear` | `{"groups": ["admin"]}` | Root shell on legacy IM7200/CM7100/ACM7000; config user slots, native password prompt and `config -a`. For ordinary users, select the existing `users` group and arrange required port access separately. |
+| `cisco_ios` | `{"privilege": 15}` | IOS/IOS XE `username ... secret`, then `write memory` and running/startup account comparison. |
+| `cisco_nxos` | `{"role": "network-admin"}` | Native username with SHA-256 hash input; copy running to startup and compare the account. |
+| `arista_eos` | `{"role": "network-admin", "privilege": 15}` | Native username with SHA-512 hash input; `write memory` and running/startup account comparison. |
+| `fortinet` | `{"role": "super_admin", "vdom": "root"}` | Local administrator in `config system admin`; `next`/`end` persists it. Handles global scope when VDOMs are enabled. |
+
+For rotation of an existing F5 account without allowing creation:
+
+```json
+{
+  "device": "192.0.2.10",
+  "device_type": "f5",
+  "username": "admin",
+  "password": "REPLACE_WITH_DESIRED_PASSWORD",
+  "create_if_missing": false,
+  "verification": "local_hash"
+}
+```
+
+The default `verification: ssh_login` makes a fresh, password-only SSH
+connection with exactly the requested username/password and the same host-key
+trust policy. It never uses fallback credentials to verify the new password.
+A rejected authentication stops after one attempt: it opens a review gate by
+default, or fails when `validation_policy.on_timeout` is `fail`. Transport
+failures may retry within `validation_timeout` (default 60 seconds). SSH login can
+be controlled by remote AAA, SSH access restrictions or MFA; this job does not
+change those settings to make verification pass.
+
+`verification: local_hash` checks the local password without a login attempt on
+Linux, F5 or Opengear. F5 non-root and Opengear use supported SHA-crypt/MD5-crypt
+formats; Linux and F5 root require target-side Python with `crypt` and `spwd`
+modules (available in Python 3.9–3.12, removed in 3.13). Unsupported verification
+fails or opens review; it is never reported as verified. This option is useful
+for local fallback accounts or an F5 admin account without SSH access.
+
+IOS defaults to `ios_algorithm: scrypt`. Use `sha256` when that is the approved
+supported algorithm, or explicitly select `legacy` for older releases requiring
+the device's default secret algorithm. The job does not silently downgrade the
+hash algorithm. IOS accounts using `username ... password` must be migrated to
+`secret` separately; the job does not delete/recreate them and lose their settings.
+EOS/NX-OS accept locally generated hash input; ensure the supplied plaintext meets
+your password policy, since the device may not enforce complexity on imported
+hashes. NX-OS encrypted account creation does not create a matching SNMP user.
+FortiGate remote/wildcard administrators and Linux directory-account collisions
+are refused. Password changes follow the native platform’s password-aging behavior. SSH access policy and MFA are not changed.
+
+Passwords must contain 1–256 UTF-8 bytes without control characters. IOS additionally
+requires a single ASCII token of at most 128 characters; whitespace, quotes,
+backslash, `?`, pipe and semicolon are rejected before submission. Other native
+platform password limits and policies still apply. No raw password commands,
+password hashes or account configuration are included in job results.
+
+Rotation requires `NETOPS_CREDENTIAL_KEY_FILE`. The desired password is encrypted
+in a separate `job_secrets` SQLite table, outside the public job request. Responses,
+events and completion webhooks omit it. `/api/v1/credentials/rotate` re-encrypts
+both credential profiles and job secrets when rotating the keyring. Keep the
+keyring available for queued jobs and verification continuations; job passwords
+remain encrypted at rest with the retained job history. Idempotency checks include
+the decrypted password, so replaying a key with a different password returns 409.
+
+A submission returns HTTP 202 and a job `id`. Poll `GET /api/v1/jobs/{id}` and its
+`/events`; results include `username`, `device_type`, `action` (`created` or
+`updated`), `saved`, `verification`, and `verified`. An accepted manual review is
+recorded separately and does not set `verified: true`. Validation decisions resume
+verification without resending the password change. Unknown write/save outcomes,
+worker loss, or cancellation after a write retain the recovery reservation. A
+started password change finishes its save before acknowledging cancellation.
+No password write is automatically replayed or rolled back.
+
+Jobs support `start_at`, `latest_start_at`, queue selection (default `priority`),
+`Idempotency-Key`, completion webhooks, and the existing cancellation/recovery
+controls. Submit from the CLI with `netops-executor request --kind password-rotation --file rotation.json`, or use the web console's password-rotation example. Protect
+any client-side input file; the server's encrypted storage does not encrypt files
+created by the caller. The console clears its request editor after successful
+submission.
+
+Device password changes **do not overwrite credential profiles** automatically:
+a profile may be shared by multiple devices. After successful verification, update
+the intended target-scoped profile through `PUT /api/v1/credentials/{profile}` from
+the controller. The existing credential selection/usage audit records which
+profile performed the operation.
+
+References: [F5 auth user](https://clouddocs.f5.com/cli/tmsh-reference/v16/modules/auth/auth_user.html),
+[Opengear CLI reference](https://ftp.opengear.com/download/documentation/manual/previous%20versions/Opengear%20CLI%20and%20Scripting%20Reference_4-5.pdf),
+[Cisco IOS username](https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/security/s1/sec-s1-cr-book/sec-cr-t2.html),
+[NX-OS accounts](https://www.cisco.com/c/en/us/td/docs/dcn/nx-os/nexus9000/105x/configuration/security/cisco-nexus-9000-series-nx-os-security-configuration-guide-release-105x/m-configuring-user-accounts-and-rbac.html),
+[EOS user security](https://www.arista.com/en/um-eos/eos-user-security),
+[FortiGate local administrators](https://docs.fortinet.com/document/fortigate/7.4.2/administration-guide/562247/local-authentication),
+and [Linux chpasswd](https://man7.org/linux/man-pages/man8/chpasswd.8.html).
+Automated coverage uses simulated device CLI responses and real loopback SSH
+authentication. Validate account behavior on your exact vendor releases before a
+fleet rollout; no production device passwords were changed during implementation.
 
 ## Opengear IM7200 upgrades
 
