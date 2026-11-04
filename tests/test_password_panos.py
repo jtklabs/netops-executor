@@ -1,6 +1,7 @@
 import copy
 import json
 import xml.etree.ElementTree as ET
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -15,7 +16,14 @@ from netops_executor.config import Device, HTTPTarget
 from netops_executor.credentials import Credential
 from netops_executor.network_ssh import NetworkSSH
 from netops_executor.password_models import AccountCreation, PasswordRotationOptions
-from netops_executor.password_panos import PanosAccountDevice, SshAccounts, account, canonical, config_xml
+from netops_executor.password_panos import (
+    SESSION_SETTINGS,
+    PanosAccountDevice,
+    SshAccounts,
+    account,
+    canonical,
+    config_xml,
+)
 from netops_executor.ssh import DeviceError
 
 SERIAL = "012345678901"
@@ -283,6 +291,7 @@ def test_panos_real_ssh_driver_supports_operational_and_configuration_modes(sett
         "wrong_hash",
         "lock_denied",
         "extra_change",
+        "lost_poll",
     ],
 )
 def test_panorama_rotation_uses_serial_proxy_and_http_fallback_without_ssh(
@@ -353,6 +362,9 @@ def test_panorama_rotation_uses_serial_proxy_and_http_fallback_without_ssh(
                         "incorrect" if failure == "wrong_hash" else desired
                     )
                 elif cmd.find("jobs") is not None:
+                    if failure == "lost_poll" and not markers.get("polled"):
+                        markers["polled"] = True
+                        raise httpx.ReadTimeout("lost commit status response", request=req)
                     job = ET.SubElement(body, "job")
                     for k, v in (
                         ("id", "77"),
@@ -386,6 +398,8 @@ def test_panorama_rotation_uses_serial_proxy_and_http_fallback_without_ssh(
         "netops_executor.password_panos.NetworkSSH",
         lambda *a, **k: pytest.fail("Panorama must not connect over SSH"),
     )
+    if failure == "lost_poll":
+        monkeypatch.setattr("netops_executor.password_panos.time.sleep", lambda seconds: None)
     response = api.post(
         "/api/v1/password-rotation/jobs", json=payload(panorama="panorama", serial=SERIAL, password=desired)
     )
@@ -394,7 +408,7 @@ def test_panorama_rotation_uses_serial_proxy_and_http_fallback_without_ssh(
 
     PasswordRotationRunner(settings, store, store.claim("worker"), "worker").run()
     job = store.get(response.json()["id"])
-    if failure is None:
+    if failure in (None, "lost_poll"):
         assert job["result"].get("error") is None
         assert job["status"] == "succeeded", job["result"]
         assert job["result"]["verified"] and job["result"]["saved"]
@@ -403,6 +417,60 @@ def test_panorama_rotation_uses_serial_proxy_and_http_fallback_without_ssh(
         assert not job["result"]["verified"]
     assert [entry["outcome"] for entry in job["credential_usage"]] == ["rejected", "authenticated"]
     assert sum(form["type"] == "commit" for form in calls) == (
-        1 if failure in (None, "commit_failure", "lost_commit") else 0
+        1 if failure in (None, "commit_failure", "lost_commit", "lost_poll") else 0
     )
     assert PASSWORD not in json.dumps(job) and "$5$" not in json.dumps(job)
+
+
+class Session:
+    """Fake NetworkSSH: CLI output settings belong to the connected session, as on PAN-OS."""
+
+    def __init__(self, running):
+        self.selector = SimpleNamespace(secrets=set())
+        self.driver, self.sessions, self.running = None, [], running
+
+    def connect(self):
+        if self.driver is None:
+            self.driver = object()
+            self.sessions.append([])
+        return self.driver
+
+    def execute(self, command, timeout, mode="exec"):
+        self.connect()
+        self.sessions[-1].append(command)
+        stdout = ""
+        if command == "show config running":
+            if "set cli config-output-format xml" in self.sessions[-1]:
+                stdout = ET.tostring(self.running, encoding="unicode")
+            else:
+                stdout = "config {\n  mgt-config {\n  }\n}"
+        elif command == "show system info":
+            stdout = "serial: " + SERIAL
+        return {"stdout": stdout, "cli_error": False}
+
+    def close(self):
+        self.driver = None
+
+
+def test_panos_ssh_continuation_and_reconnect_prepare_each_cli_session(monkeypatch):
+    running = configuration()
+    account(running, "automation").find("phash").text = sha256_crypt.hash(PASSWORD)
+    ssh = Session(running)
+    monkeypatch.setattr("netops_executor.password_panos.NetworkSSH", lambda *a, **k: ssh)
+    # A review continuation builds a new client and only verifies; preflight never ran.
+    backend = SshAccounts(None, None, request(), PASSWORD, lambda: None, None)
+    PanosAccountDevice(None, None, None, request(), PASSWORD, lambda: None, None, backend).verify()
+    assert ssh.sessions[0][: len(SESSION_SETTINGS)] == list(SESSION_SETTINGS)
+    assert backend.prepare() == SERIAL
+    assert ssh.sessions[0].count("set cli config-output-format xml") == 1
+    # Any failed command closes the session; the next one is prepared again.
+    ssh.close()
+    PanosAccountDevice(None, None, None, request(), PASSWORD, lambda: None, None, backend).verify()
+    assert len(ssh.sessions) == 2 and ssh.sessions[1][: len(SESSION_SETTINGS)] == list(SESSION_SETTINGS)
+
+
+def test_panos_running_hash_mismatch_is_definitive():
+    from netops_executor.password_devices import PasswordRejected
+
+    with pytest.raises(PasswordRejected, match="does not match"):
+        client(Backend()).verify()

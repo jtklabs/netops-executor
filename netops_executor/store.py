@@ -35,6 +35,8 @@ WEBHOOK_STATUSES = (
     "needs_review",
 )
 WEBHOOK_RETRY_SECONDS = 72 * 3600
+# Statuses that can still run or resume, and so still need a job's encrypted secret.
+SECRET_STATUSES = "'queued','running','needs_review'"
 
 
 def default_queue(kind):
@@ -162,6 +164,19 @@ class Store:
             for column in ("queues", "version"):
                 if column not in worker_columns:
                     db.execute(f"ALTER TABLE workers ADD COLUMN {column} TEXT")
+            if "digest" not in {row["name"] for row in db.execute("PRAGMA table_info(job_secrets)")}:
+                db.execute("ALTER TABLE job_secrets ADD COLUMN digest TEXT")
+            # A job password is needed only while the job can run or resume after a review gate.
+            # Purge it on every other status change, whichever process or code path makes it,
+            # keeping only the one-way digest that idempotent resubmission compares.
+            db.execute("DROP TRIGGER IF EXISTS job_secrets_purge")
+            db.execute(f"""CREATE TRIGGER job_secrets_purge AFTER UPDATE OF status ON jobs
+                WHEN NEW.status NOT IN ({SECRET_STATUSES})
+                BEGIN
+                    UPDATE job_secrets SET secret=X'' WHERE job=NEW.id AND length(secret)>0;
+                END""")
+            db.execute(f"""UPDATE job_secrets SET secret=X'' WHERE length(secret)>0
+                AND job IN (SELECT id FROM jobs WHERE status NOT IN ({SECRET_STATUSES}))""")
             # Queue a delivery in the same transaction as every status change that finishes a job,
             # whichever process or code path makes it. A delivery that was never attempted takes the
             # newer status instead of adding another; one already sent stays as it is.
@@ -298,8 +313,18 @@ class Store:
             ]
 
     def submit(
-        self, request, lock_key, key=None, kind="upgrade", parent=None, *, secret=None, secret_matches=None
+        self,
+        request,
+        lock_key,
+        key=None,
+        kind="upgrade",
+        parent=None,
+        *,
+        secret=None,
+        secret_digest=None,
+        secret_matches=None,
     ):
+        """secret_matches receives the saved job_secrets row: its secret (empty once purged) and digest."""
         request, start_at, latest_start_at = self.scheduled_request(request)
         payload = json.dumps(request, sort_keys=True)
         with self.connect() as db:
@@ -318,10 +343,10 @@ class Store:
                     ):
                         raise Conflict("idempotency key was used with different parameters")
                     saved = db.execute(
-                        "SELECT secret FROM job_secrets WHERE job=?", (existing["id"],)
+                        "SELECT secret,digest FROM job_secrets WHERE job=?", (existing["id"],)
                     ).fetchone()
                     if (saved is not None) != (secret is not None) or (
-                        saved is not None and (secret_matches is None or not secret_matches(saved["secret"]))
+                        saved is not None and (secret_matches is None or not secret_matches(saved))
                     ):
                         raise Conflict("idempotency key was used with different parameters")
                     return self.decode(existing)
@@ -362,7 +387,10 @@ class Store:
                 ),
             )
             if secret is not None:
-                db.execute("INSERT INTO job_secrets(job,secret) VALUES (?,?)", (job_id, secret))
+                db.execute(
+                    "INSERT INTO job_secrets(job,secret,digest) VALUES (?,?,?)",
+                    (job_id, secret, secret_digest),
+                )
             self.expire_pending(db, now)
         return self.get(job_id)
 

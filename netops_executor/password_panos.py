@@ -12,10 +12,13 @@ import xml.etree.ElementTree as ET
 from ipaddress import ip_address
 
 from .network_ssh import CLI_ERROR, NetworkSSH
-from .panos import SYSTEM_INFO, Firewall, Panorama, PanosError, text
-from .password_devices import crypt_matches, verify_login
+from .panos import SYSTEM_INFO, Firewall, Panorama, PanosError, PanosUnavailable, text
+from .password_devices import PasswordRejected, crypt_matches, verify_login
 from .password_models import AccountCreation
 from .ssh import DeviceError
+
+# CLI output settings belong to one SSH session, so every new session needs them again.
+SESSION_SETTINGS = ("set cli scripting-mode off", "set cli config-output-format xml")
 
 
 def config_xml(value):
@@ -76,8 +79,18 @@ class SshAccounts:
             settings, device, guard, request.credential_profiles, audit, device_type="paloalto_panos"
         )
         self.ssh.selector.secrets.add(password)
+        self.session = None
 
-    def cli(self, command, config=False):
+    def ready(self):
+        # A review continuation, or a reconnect after any failed command, opens a new CLI session
+        # that would otherwise print configuration in the default text format.
+        driver = self.ssh.connect()
+        if self.session is not driver:
+            for command in SESSION_SETTINGS:
+                self.run(command)
+            self.session = driver
+
+    def run(self, command, config=False):
         result = self.ssh.execute(
             command, timeout=self.request.command_timeout, mode="config" if config else "exec"
         )
@@ -85,9 +98,11 @@ class SshAccounts:
             raise DeviceError("PAN-OS account command rejected; output omitted")
         return result["stdout"]
 
+    def cli(self, command, config=False):
+        self.ready()
+        return self.run(command, config)
+
     def prepare(self):
-        self.cli("set cli scripting-mode off")
-        self.cli("set cli config-output-format xml")
         matches = re.findall(r"(?m)^serial:\s*([A-Za-z0-9]{6,32})\s*$", self.cli("show system info"))
         if len(matches) != 1:
             raise DeviceError("PAN-OS serial could not be determined")
@@ -103,6 +118,7 @@ class SshAccounts:
                 raise DeviceError("PAN-OS " + kind + " lock could not be verified")
 
     def set_password(self, username, password, creation):
+        self.ready()
         result, disconnected = self.ssh.dialogue(
             "set mgt-config users " + username + " password",
             [(re.compile(r"(?i)(?:enter|confirm|new|retype) password\s*:\s*$"), password)],
@@ -119,6 +135,7 @@ class SshAccounts:
             )
 
     def commit(self):
+        self.ready()
         result, disconnected = self.ssh.dialogue(
             "commit", [], self.request.commit_timeout, mode="config", max_replies=0
         )
@@ -237,11 +254,18 @@ class PanoramaAccounts:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise DeviceError("PAN-OS commit timed out; inspect before recovery")
-            result = self.safe(
-                self.fw.op,
-                "<show><jobs><id>" + job_id + "</id></jobs></show>",
-                timeout=min(self.request.command_timeout, remaining),
-            )
+            try:
+                result = self.fw.op(
+                    "<show><jobs><id>" + job_id + "</id></jobs></show>",
+                    timeout=min(self.request.command_timeout, remaining),
+                )
+            except PanosUnavailable:
+                # The commit job is already running; a lost status response does not change its
+                # outcome. Keep reading it until the commit deadline.
+                time.sleep(min(2, max(0, deadline - time.monotonic())))
+                continue
+            except PanosError:
+                raise DeviceError("PAN-OS API operation failed; device output omitted") from None
             if text(result, "job/id") != job_id:
                 raise DeviceError("PAN-OS commit job identity could not be verified")
             if text(result, "job/status").upper() == "FIN":
@@ -340,7 +364,7 @@ class PanosAccountDevice:
         else:
             node = account(self.backend.config(running=True), self.request.username)
             if not crypt_matches(self.password, text(node, "phash")):
-                raise DeviceError("PAN-OS running password hash does not match the requested password")
+                raise PasswordRejected("PAN-OS running password hash does not match the requested password")
 
     def close(self):
         self.backend.close()

@@ -12,7 +12,7 @@ from test_ssh_wire import ssh_server
 
 from netops_executor.api import create_app
 from netops_executor.config import Device
-from netops_executor.credentials import Vault
+from netops_executor.credentials import Vault, digest_matches, secret_digest
 from netops_executor.execution_models import ValidationDecision
 from netops_executor.password_devices import (
     AccountDevice,
@@ -167,7 +167,8 @@ def test_atomic_secret_submission_under_concurrent_retries(settings, store, api)
             "same-key",
             kind="password_rotation",
             secret=cipher.encrypt(PASSWORD.encode()),
-            secret_matches=lambda saved: vault.decrypt(cipher, saved) == PASSWORD.encode(),
+            secret_digest=secret_digest(PASSWORD.encode()),
+            secret_matches=lambda saved: digest_matches(saved["digest"], PASSWORD.encode()),
         )["id"]
 
     with ThreadPoolExecutor(max_workers=5) as pool:
@@ -308,6 +309,13 @@ class Shell:
         pass
 
 
+F5_STANDALONE = {
+    "list /cm device all-properties": "cm device a { self-device true management-ip 192.0.2.10 }",
+    "list /cm device-group all-properties": "",
+    "show /cm failover-status field-fmt": "cm failover-status {\n status ACTIVE\n}",
+}
+UNLOCKED = {"LC_ALL=C passwd -S automation": "automation P 2026-01-01 0 99999 7 -1"}
+
 CREATION = {
     "linux": {"groups": ["sudo"]},
     "opengear": {"groups": ["admin"]},
@@ -384,6 +392,7 @@ def test_missing_account_defaults_to_administrator(platform):
             "cat /etc/os-release": "ID=ubuntu\nID_LIKE=debian",
             "cat /etc/group": "sudo:x:27:\nadmin:x:100:",
             "getent passwd automation": {"stdout": "", "exit_code": 2},
+            **F5_STANDALONE,
         }
     )
     client = device(platform, shell)
@@ -427,7 +436,12 @@ def test_default_linux_creation_checks_administrator_access(release, group, sudo
 
 def test_creation_override_and_existing_account_do_not_use_admin_defaults():
     shell = Shell(
-        {"id -u": "0", "cat /etc/group": "", "getent passwd automation": {"stdout": "", "exit_code": 2}}
+        {
+            "id -u": "0",
+            "cat /etc/group": "",
+            "getent passwd automation": {"stdout": "", "exit_code": 2},
+            **UNLOCKED,
+        }
     )
     client = device("linux", shell, new_account={"groups": []})
     client.read = lambda: None
@@ -490,7 +504,8 @@ def test_opengear_reads_username_slot_not_fixed_root_slot_and_checks_groups():
 def test_f5_reads_local_account_and_preserves_partition_role_and_shell():
     shell = Shell(
         {
-            "list /auth user": "auth user automation {\n encrypted-password HASH\n shell tmsh\n partition-access { all-partitions { role operator } }\n}\n"
+            "list /auth user": "auth user automation {\n encrypted-password HASH\n shell tmsh\n partition-access { all-partitions { role operator } }\n}\n",
+            **F5_STANDALONE,
         }
     )
     client = device("f5", shell)
@@ -681,3 +696,242 @@ def test_empty_or_bad_opengear_user_tree_is_not_missing_account():
         client = device("opengear", Shell({"config -g config.users": output}))
         with pytest.raises(DeviceError):
             client.read()
+
+
+def test_fortigate_admin_tables_are_parsed_without_reading_access_from_them():
+    output = """config system admin
+    edit "automation"
+        set accprofile "super_admin"
+        set vdom "root"
+        config gui-dashboard
+            edit 1
+                set name "Status"
+                config widget
+                    edit 1
+                        set type sysinfo
+                    next
+                end
+            next
+        end
+        set password ENC opaque
+    next
+end"""
+    record = forti_accounts(output)["automation"]
+    assert record["accprofile"] == ["super_admin"] and record["password"] == ["ENC", "opaque"]
+    assert record["config gui-dashboard"][0] == ["edit", "1"]
+    client = device("fortinet", Shell())
+    assert client.access(record) == {"accprofile": ["super_admin"], "vdom": ["root"]}
+    # A different dashboard is still a change since precheck; an unterminated table is not trusted.
+    assert forti_accounts(output.replace("Status", "Other")) != forti_accounts(output)
+    with pytest.raises(DeviceError, match="incomplete"):
+        forti_accounts(output.replace("        end\n        set password", "        set password"))
+
+
+def test_fortigate_question_mark_password_is_rejected_before_submission(api):
+    with pytest.raises(ValueError, match="question mark"):
+        check_password_syntax("fortinet", "value?help")
+    check_password_syntax("linux", "value?help")
+    response = api.post("/api/v1/password-rotation/jobs", json=body("fortinet", password="Value?Help-123"))
+    assert response.status_code == 422 and "Value?Help" not in response.text
+
+
+@pytest.mark.parametrize("state", ["L", "LK", "P", "PS", "NP"])
+def test_locked_linux_account_is_not_unlocked_by_rotation(state):
+    shell = Shell(
+        {
+            "id -u": "0",
+            "cat /etc/passwd": "automation:x:1000:1000::/home/automation:/bin/bash",
+            "LC_ALL=C passwd -S automation": "automation " + state + " 2026-01-01 0 99999 7 -1",
+        }
+    )
+    client = device("linux", shell)
+    if state in ("L", "LK"):
+        with pytest.raises(DeviceError, match="locked"):
+            client.preflight()
+    else:
+        assert client.preflight() is True
+    assert all(command != "chpasswd" for command, _ in shell.calls)
+    shell.outputs["LC_ALL=C passwd -S automation"] = "other P"
+    with pytest.raises(DeviceError, match="status is unavailable"):
+        client.preflight()
+
+
+F5_PAIR = {
+    "list /cm device all-properties": "cm device a { self-device true management-ip 192.0.2.10 version 17.1.1 build 0.0.2 }"
+    " cm device b { self-device false management-ip 192.0.2.11 version 17.1.1 build 0.0.2 }",
+    "list /cm device-group all-properties": "cm device-group pair { type sync-failover auto-sync disabled devices { a { } b { } } }",
+    "show /cm failover-status field-fmt": "cm failover-status {\n status ACTIVE\n}",
+    "show /cm sync-status field-fmt": 'cm sync-status {\n status "In Sync"\n}',
+    "list /auth user": "auth user automation {\n encrypted-password HASH\n shell tmsh\n"
+    " partition-access { all-partitions { role admin } }\n}\n",
+}
+
+
+def f5_pair(after_save=('"Changes Pending"', '"In Sync"'), **outputs):
+    shell = Shell({**F5_PAIR, **outputs})
+    request = PasswordRotationOptions.model_validate({k: v for k, v in body("f5").items() if k != "password"})
+    request.for_platform("f5")
+    hosts = {"192.0.2.10": "a", "192.0.2.11": "b"}
+    settings = SimpleNamespace(device=lambda host: SimpleNamespace(id=hosts[host]))
+    client = AccountDevice(settings, None, request, PASSWORD, lambda: None, None, ssh=shell)
+    clock = Clock()
+    client.sleep, client.clock = clock.sleep, clock.clock
+    statuses, read = iter(after_save), shell.tmsh
+
+    def tmsh(command, **kwargs):
+        # Sync status as observed after the account change was saved.
+        if command == "show /cm sync-status field-fmt" and any(
+            c == "save /sys config" for c, _ in shell.calls
+        ):
+            return "cm sync-status {\n status " + next(statuses, '"Changes Pending"') + "\n}"
+        return read(command, **kwargs)
+
+    shell.tmsh = tmsh
+    return client, shell
+
+
+@pytest.mark.parametrize("auto_sync", [False, True])
+def test_f5_pair_account_change_is_synchronized_and_peer_reserved(auto_sync):
+    group = "cm device-group pair { type sync-failover auto-sync enabled devices { a { } b { } } }"
+    client, shell = f5_pair(**({"list /cm device-group all-properties": group} if auto_sync else {}))
+    assert client.preflight() is True
+    keys = set(client.reservations)
+    assert {"endpoint:192.0.2.10", "endpoint:192.0.2.11", "device:a", "device:b"} <= keys
+    assert any(key.startswith("ha:") for key in keys)
+    client.save()
+    commands = [c for c, _ in shell.calls]
+    assert ("run /cm config-sync to-group pair" in commands) is not auto_sync
+    assert commands.index("save /sys config") < len(commands) - 1
+    assert client.report == {"config_sync": "in sync"}
+
+
+@pytest.mark.parametrize(
+    "outputs,message",
+    [
+        ({"show /cm sync-status field-fmt": 'cm sync-status {\n status "Changes Pending"\n}'}, "not in sync"),
+        (
+            {
+                "list /cm device all-properties": F5_PAIR["list /cm device all-properties"].replace(
+                    "self-device false management-ip 192.0.2.11 version 17.1.1",
+                    "self-device false management-ip 192.0.2.11 version 17.5.1",
+                )
+            },
+            "same version",
+        ),
+    ],
+)
+def test_f5_pair_out_of_sync_or_mixed_release_is_refused_before_write(outputs, message):
+    client, shell = f5_pair(**outputs)
+    with pytest.raises(DeviceError, match=message):
+        client.preflight()
+    assert not any(c.startswith(("modify", "create", "save", "run")) for c, _ in shell.calls)
+
+
+def test_f5_pair_sync_that_never_completes_requires_recovery():
+    client, shell = f5_pair(after_save=())
+    client.preflight()
+    with pytest.raises(DeviceError, match="did not complete"):
+        client.save()
+    assert client.clock() >= 120 and "config_sync" not in client.report
+
+
+def test_standalone_f5_reports_and_reserves_nothing_extra():
+    client = device("f5", Shell({**F5_STANDALONE, "list /auth user": F5_PAIR["list /auth user"]}))
+    assert client.preflight() is True
+    assert client.reservations == [] and client.report == {"config_sync": "standalone"}
+
+
+@pytest.mark.parametrize("platform,user", [("linux", "automation"), ("f5", "root")])
+def test_local_hash_mismatch_is_definitive_but_missing_verifier_is_not(platform, user):
+    shell = Shell()
+    client = device(platform, shell, verification="local_hash", username=user)
+    for code, outcome in ((0, None), (3, PasswordRejected), (1, DeviceError), (127, DeviceError)):
+        shell.execute = lambda command, code=code, **kwargs: {"stdout": "", "stderr": "", "exit_code": code}
+        if outcome is None:
+            client.verify()
+            continue
+        with pytest.raises(outcome) as exc:
+            client.verify()
+        assert isinstance(exc.value, PasswordRejected) is (code == 3)
+
+
+def test_hash_mismatch_opens_review_with_its_own_message(settings, store, api):
+    submit(api, verification="local_hash")
+    account = Account()
+    account.verify_error = PasswordRejected("local password hash does not match the requested password")
+    job = work(settings, store, account)
+    assert job["status"] == "needs_review" and account.calls.count("verify") == 1
+    assert job["validation_gates"][-1]["findings"]["critical"] == [
+        "local password hash does not match the requested password"
+    ]
+
+
+def test_discovered_reservations_defer_and_are_kept_for_continuation(settings, store, api):
+    other = store.submit({"device": "peer"}, "device:peer", kind="ssh")
+    assert store.claim("other")["id"] == other["id"]
+    assert store.reserve(other["id"], "other", ["ha:pair"])
+    created = submit(api)
+    account = Account()
+    account.reservations, account.report = ["ha:pair", "endpoint:192.0.2.11"], {"config_sync": "in sync"}
+    job = work(settings, store, account)
+    assert job["id"] == created["id"] and job["status"] == "queued"
+    assert account.calls == ["preflight"] and "mutations" not in job["result"]
+    store.finish(other["id"], "other", "succeeded")
+    with store.connect() as db:
+        db.execute("UPDATE controls SET next_attempt=0 WHERE job=?", (created["id"],))
+    account.verify_error = PasswordRejected("authentication rejected")
+    job = work(settings, store, account)
+    assert job["status"] == "needs_review"
+    assert job["result"]["reservations"] == ["endpoint:192.0.2.11", "ha:pair"]
+    assert job["result"]["config_sync"] == "in sync"
+    with store.connect() as db:
+        held = {r[0] for r in db.execute("SELECT key FROM resources WHERE job=?", (created["id"],))}
+    assert {"ha:pair", "endpoint:192.0.2.11"} <= held
+
+
+def test_job_password_is_purged_when_the_job_can_no_longer_resume(settings, store, api):
+    headers = {"Idempotency-Key": "purge-once"}
+    first = api.post("/api/v1/password-rotation/jobs", json=body(), headers=headers).json()
+    vault = Vault(store, settings.credential_key_file)
+    assert vault.job_password(first["id"]) == PASSWORD
+    account = Account()
+    account.verify_error = PasswordRejected("authentication rejected")
+    assert work(settings, store, account)["status"] == "needs_review"
+    # A review gate still needs the password for its verification continuation.
+    assert vault.job_password(first["id"]) == PASSWORD
+    store.cancel(first["id"])
+    with store.connect() as db:
+        secret, digest = db.execute(
+            "SELECT secret,digest FROM job_secrets WHERE job=?", (first["id"],)
+        ).fetchone()
+    assert secret == b"" and digest.startswith("scrypt$") and PASSWORD not in digest
+    with pytest.raises(Exception, match="unavailable"):
+        vault.job_password(first["id"])
+    # Idempotent replay still recognizes the same password and rejects a different one.
+    again = api.post("/api/v1/password-rotation/jobs", json=body(), headers=headers)
+    assert again.status_code == 202 and again.json()["id"] == first["id"]
+    changed = api.post(
+        "/api/v1/password-rotation/jobs", json=body(password="Other-Secret-345!"), headers=headers
+    )
+    assert changed.status_code == 409
+    # Keyring rotation skips purged rows.
+    old = settings.credential_key_file.read_bytes()
+    settings.credential_key_file.write_bytes(Fernet.generate_key() + b"\n" + old)
+    assert vault.rotate() == {"rotated": True}
+
+
+def test_existing_finished_job_secrets_are_purged_on_upgrade(settings, store, api):
+    from netops_executor.store import Store
+
+    legacy = submit(api)
+    vault = Vault(store, settings.credential_key_file)
+    with store.connect() as db:
+        db.execute("DROP TRIGGER job_secrets_purge")
+        db.execute("UPDATE job_secrets SET digest=NULL WHERE job=?", (legacy["id"],))
+        db.execute("UPDATE jobs SET status='succeeded' WHERE id=?", (legacy["id"],))
+        assert db.execute("SELECT length(secret) FROM job_secrets").fetchone()[0] > 0
+    Store(store.path)
+    with store.connect() as db:
+        assert db.execute("SELECT secret FROM job_secrets WHERE job=?", (legacy["id"],)).fetchone()[0] == b""
+    with pytest.raises(Exception, match="unavailable"):
+        vault.job_password(legacy["id"])

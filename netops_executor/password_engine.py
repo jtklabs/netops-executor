@@ -24,11 +24,17 @@ class PasswordRotationRunner(StepRunner):
 
     def prevalidate(self):
         exists = self.client.preflight()
+        # Resources found on the device: a firewall serial, or an F5 HA peer and pair.
+        keys = list(getattr(self.client, "reservations", []))
         if self.request.device_type == "paloalto_panos":
-            serial = self.client.serial
-            if not self.store.reserve(self.job["id"], self.worker, ["panos:" + serial]):
+            keys.append("panos:" + self.client.serial)
+        if keys:
+            if not self.store.reserve(self.job["id"], self.worker, keys):
                 self.store.defer(self.job["id"], self.worker)
-            self.result["serial"] = serial
+            self.result["reservations"] = sorted(set(keys))
+        if self.request.device_type == "paloalto_panos":
+            self.result["serial"] = self.client.serial
+        self.result.update(getattr(self.client, "report", {}))
         self.result.update(account_existed=exists, action="updated" if exists else "created")
         self.event("account_prevalidated", account_existed=exists)
 
@@ -44,19 +50,21 @@ class PasswordRotationRunner(StepRunner):
         # Once a change starts, finish saving before acknowledging cancellation.
         self.guard()
         self.client.save()
+        self.result.update(getattr(self.client, "report", {}))
         self.result["saved"] = True
 
     def sample(self):
         try:
             self.client.verify()
         except PasswordRejected as exc:
+            # A rejected login or a definite hash mismatch: review it instead of sampling again.
             if self.request.validation_policy.on_timeout == "fail":
                 raise RotationFailure(str(exc)) from None
             self.store.open_gate(
                 self.job["id"],
                 self.worker,
                 "verify_account",
-                {"critical": ["new-account SSH authentication rejected; no automatic retry"]},
+                {"critical": [str(exc)]},
                 self.result,
             )
         self.result["verified"] = True
@@ -72,6 +80,8 @@ class PasswordRotationRunner(StepRunner):
             keys.append("panos:" + r.serial)
         elif self.result.get("serial"):
             keys.append("panos:" + self.result["serial"])
+        # A continuation keeps every resource the first attempt reserved.
+        keys += self.result.get("reservations", [])
         if not self.store.reserve(self.job["id"], self.worker, keys):
             if self.result.get("mutations"):
                 raise DeviceError("reservation changed during password rotation")

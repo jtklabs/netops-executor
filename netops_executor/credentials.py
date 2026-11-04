@@ -1,5 +1,7 @@
 """Encrypted, versioned local credentials and bounded authentication selection."""
 
+import hashlib
+import hmac
 import json
 import os
 import time
@@ -11,6 +13,28 @@ from pydantic import Field, SecretStr, model_validator
 
 from .models import Model, Name
 from .store import Conflict
+
+# Salted scrypt parameters for the one-way job secret digest (16 MiB, tens of milliseconds).
+DIGEST = ("scrypt", 2**14, 8, 1)
+
+
+def secret_digest(value: bytes) -> str:
+    """One-way, salted digest kept after a job's encrypted secret is purged, for idempotency only."""
+    scheme, n, r, p = DIGEST
+    salt = os.urandom(16)
+    derived = hashlib.scrypt(value, salt=salt, n=n, r=r, p=p, dklen=32)
+    return "$".join((scheme, str(n), str(r), str(p), salt.hex(), derived.hex()))
+
+
+def digest_matches(digest: str, value: bytes) -> bool:
+    try:
+        scheme, n, r, p, salt, expected = digest.split("$")
+        if (scheme, int(n), int(r), int(p)) != DIGEST:
+            return False
+        derived = hashlib.scrypt(value, salt=bytes.fromhex(salt), n=int(n), r=int(r), p=int(p), dklen=32)
+    except ValueError:
+        return False
+    return hmac.compare_digest(derived.hex(), expected)
 
 
 class Credential(Model):
@@ -169,7 +193,8 @@ class Vault:
     def job_password(self, job_id):
         with self.store.connect() as db:
             row = db.execute("SELECT secret FROM job_secrets WHERE job=?", (job_id,)).fetchone()
-        if row is None:
+        # Purged once the job can no longer run or resume.
+        if row is None or not row["secret"]:
             raise Conflict("job password is unavailable")
         return self.decrypt(self.cipher(), row["secret"]).decode()
 
@@ -181,7 +206,7 @@ class Vault:
                 db.execute(
                     "UPDATE credentials SET secret=? WHERE id=?", (cipher.rotate(row["secret"]), row["id"])
                 )
-            for row in db.execute("SELECT job,secret FROM job_secrets").fetchall():
+            for row in db.execute("SELECT job,secret FROM job_secrets WHERE length(secret)>0").fetchall():
                 db.execute(
                     "UPDATE job_secrets SET secret=? WHERE job=?", (cipher.rotate(row["secret"]), row["job"])
                 )

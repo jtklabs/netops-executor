@@ -7,7 +7,8 @@ import time
 import paramiko
 from passlib.hash import md5_crypt, sha256_crypt, sha512_crypt
 
-from .device import blocks, field
+from .device import blocks, field, name
+from .f5_operations import qualified, topology
 from .network_ssh import CLI_ERROR, NetworkSSH
 from .password_models import AccountCreation
 from .pins import PinnedHostKeys
@@ -19,10 +20,15 @@ ERROR = re.compile(
     r"(?im)^\s*(?:%.*(?:error|invalid|cannot|failed|denied)|Command fail|Unknown action|command parse error|.*password.*(?:invalid|rejected|requirements|too short))"
 )
 IOS_PASSWORD = re.compile(r"[A-Za-z0-9!@#$%^&*()_+=.,:/~-]{1,128}")
+# The device group must settle after a synchronized account change.
+F5_SYNC_TIMEOUT = 120
+# The target-side verifier's exit status for a readable hash that does not match.
+HASH_MISMATCH = 3
 
 
 class PasswordRejected(DeviceError):
-    """Do not repeat a known-bad authentication and trigger an account lockout."""
+    """A definitive verification failure. Never repeat it automatically: a repeated
+    authentication can lock the account, and a hash mismatch cannot change by itself."""
 
 
 def check_password_syntax(platform, password):
@@ -31,6 +37,9 @@ def check_password_syntax(platform, password):
         raise ValueError(
             "Cisco IOS passwords require 1–128 supported ASCII token characters; whitespace, quotes, backslash, question mark, pipe and semicolon are unsupported"
         )
+    # The FortiOS CLI also answers '?' with help while a line is typed, even inside quotes.
+    if platform == "fortinet" and "?" in password:
+        raise ValueError("FortiGate CLI passwords cannot contain a question mark")
 
 
 def quote(value):
@@ -130,6 +139,7 @@ def network_account(output, username):
 
 def forti_accounts(output):
     records, current, opened, closed = {}, None, False, False
+    block, depth = None, 0
     for line in output.splitlines():
         try:
             words = shlex.split(line.strip())
@@ -137,7 +147,19 @@ def forti_accounts(output):
             raise DeviceError("unrecognized FortiGate administrator configuration") from None
         if not words:
             continue
-        if words == ["config", "system", "admin"] and not opened:
+        if depth:
+            # A per-administrator table such as gui-dashboard. Keep it whole so a concurrent
+            # change is still detected, but never read access settings from inside it.
+            depth += (words[0] == "config") - (words == ["end"])
+            if depth:
+                records[current][block].append(words)
+            continue
+        if words[0] == "config" and len(words) >= 2 and current:
+            block = " ".join(words)
+            if block in records[current]:
+                raise DeviceError("duplicate FortiGate administrator table")
+            records[current][block], depth = [], 1
+        elif words == ["config", "system", "admin"] and not opened:
             opened = True
         elif words[0] == "edit" and len(words) == 2 and current is None and opened and not closed:
             current = words[1]
@@ -152,7 +174,7 @@ def forti_accounts(output):
             closed = True
         else:
             raise DeviceError("unrecognized FortiGate administrator configuration")
-    if not opened or not closed or current:
+    if not opened or not closed or current or depth:
         raise DeviceError("incomplete FortiGate administrator configuration")
     return records
 
@@ -172,6 +194,10 @@ class AccountDevice:
         self.vdoms = False
         self.index = self.total = None
         self.creation = request.new_account
+        self.ha = None
+        # Extra resources discovered during preflight, and public facts for the job result.
+        self.reservations, self.report = [], {}
+        self.sleep, self.clock = time.sleep, time.monotonic
 
     def administrator_defaults(self):
         group = None
@@ -228,8 +254,11 @@ class AccountDevice:
             raise DeviceError("local account management requires a root shell")
         if p == "linux":
             self.shell(
-                "command -v useradd >/dev/null && command -v chpasswd >/dev/null && command -v getent >/dev/null"
+                "command -v useradd >/dev/null && command -v chpasswd >/dev/null"
+                " && command -v getent >/dev/null && command -v passwd >/dev/null"
             )
+        elif p == "f5":
+            self.f5_pair()
         elif p == "opengear":
             version = self.shell("cat /etc/version")
             if not re.search(r"OpenGear/(?:IM72|CM71|ACM7)", version, re.I):
@@ -257,6 +286,16 @@ class AccountDevice:
                 result = self.ssh.execute("getent passwd " + self.request.username, timeout=30)
                 if result["exit_code"] != 2:
                     raise DeviceError("username resolves outside the local passwd file or NSS lookup failed")
+        if p == "linux" and self.before is not None:
+            # chpasswd replaces the whole shadow field, including a '!' lock: it would re-enable a
+            # deliberately locked account (Ubuntu's root, a key-only service account).
+            status = self.shell("LC_ALL=C passwd -S " + self.request.username).split()
+            if len(status) < 2 or status[0] != self.request.username:
+                raise DeviceError("Linux password status is unavailable")
+            if status[1] in ("L", "LK"):
+                raise DeviceError(
+                    "Linux account is locked or has no usable password; unlock it deliberately before rotation"
+                )
         if p == "cisco_ios" and self.before and any(" password " in line for line in self.before):
             raise DeviceError(
                 "IOS account uses password instead of secret; migrate it explicitly before rotation"
@@ -269,6 +308,46 @@ class AccountDevice:
                     "remote or wildcard FortiGate administrators cannot be rotated as local accounts"
                 )
         return self.before is not None
+
+    def f5_pair(self):
+        """Local accounts are synchronized device-group configuration. Require a healthy pair."""
+        self.ha = topology(self)
+        if not self.ha["cluster"]:
+            self.report["config_sync"] = "standalone"
+            return
+        if self.ha["sync"] != "in sync":
+            # Syncing afterwards would also push whatever is already pending on this member.
+            raise DeviceError("F5 HA pair is not in sync; resolve configuration sync before rotation")
+        devices = {
+            qualified(key): row
+            for key, row in blocks(self.ssh.tmsh("list /cm device all-properties"), "cm device").items()
+        }
+        releases = {
+            (field(devices[m["name"]], "version"), field(devices[m["name"]], "build"))
+            for m in self.ha["members"]
+        }
+        if len(releases) != 1 or None in next(iter(releases)):
+            raise DeviceError("F5 HA members must run the same version and build before an account change")
+        # Coordinate with jobs on the peer, as the upgrade workflow does for the whole pair.
+        self.reservations = [self.ha["cluster"]] + [
+            key
+            for member in self.ha["members"]
+            for key in ("endpoint:" + member["host"], "device:" + self.settings.device(member["host"]).id)
+        ]
+
+    def f5_sync(self):
+        if not self.ha["auto_sync"]:
+            for group in self.ha["groups"]:
+                self.ssh.tmsh("run /cm config-sync to-group " + name(group), timeout=180)
+        deadline = self.clock() + F5_SYNC_TIMEOUT
+        while topology(self)["sync"] != "in sync":
+            if self.clock() >= deadline:
+                raise DeviceError(
+                    "F5 HA sync after the account change did not complete; inspect both members"
+                )
+            self.guard()
+            self.sleep(5)
+        self.report["config_sync"] = "in sync"
 
     def read(self):
         p, user = self.platform, self.request.username
@@ -441,6 +520,8 @@ class AccountDevice:
     def save(self):
         if self.platform == "f5":
             self.ssh.tmsh("save /sys config", timeout=self.request.command_timeout)
+            if self.ha and self.ha["cluster"]:
+                self.f5_sync()
         elif self.platform in ("cisco_ios", "cisco_nxos", "arista_eos"):
             self.cli(
                 "copy running-config startup-config" if self.platform == "cisco_nxos" else "write memory"
@@ -465,19 +546,26 @@ class AccountDevice:
             matched = crypt_matches(self.password, (account or {}).get("password", ""))
         else:
             # Linux's own crypt implementation supports its configured hash (including yescrypt).
-            # Only a boolean exit status returns; the password goes on stdin, never argv.
+            # Only an exit status returns; the password goes on stdin, never argv. A mismatch has
+            # its own status so a missing crypt/spwd module (exit 1) is not reported as one.
             script = (
                 "import crypt,hmac,spwd,sys; "
                 "p=sys.stdin.readline().rstrip('\\n'); "
                 "h=spwd.getspnam(sys.argv[1]).sp_pwdp; "
-                "sys.exit(0 if hmac.compare_digest(crypt.crypt(p,h) or '',h) else 1)"
+                f"sys.exit(0 if hmac.compare_digest(crypt.crypt(p,h) or '',h) else {HASH_MISMATCH})"
             )
-            self.shell(
-                "python3 -c " + shlex.quote(script) + " " + self.request.username, self.password + "\n"
+            result = self.ssh.execute(
+                "python3 -c " + shlex.quote(script) + " " + self.request.username,
+                timeout=self.request.command_timeout,
+                stdin_text=self.password + "\n",
             )
-            matched = True
+            if result["exit_code"] not in (0, HASH_MISMATCH):
+                raise DeviceError(
+                    "local password hash cannot be verified on the device; use SSH login verification"
+                )
+            matched = result["exit_code"] == 0
         if not matched:
-            raise DeviceError("local password hash does not match the requested password")
+            raise PasswordRejected("local password hash does not match the requested password")
 
     def close(self):
         self.ssh.close()

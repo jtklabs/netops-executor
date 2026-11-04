@@ -16,7 +16,7 @@ from pydantic import AwareDatetime, Field
 from . import __version__
 from .cipher_models import CipherScanRequest, CipherScanResult
 from .config import Settings, under
-from .credentials import Credential, Vault
+from .credentials import Credential, Vault, digest_matches, secret_digest
 from .eos_models import EosBatch, EosUpgradeRequest
 from .execution_models import Batch, HTTPJob, ManualCompletion, SSHJob, ValidationDecision
 from .fortigate_models import FortigateBatch, FortigateUpgradeRequest
@@ -681,13 +681,24 @@ def create_app(settings=None):
         plan = password_planned(request)
         cipher = vault.cipher()
         secret = request.password.get_secret_value().encode()
+
+        def matches(saved):
+            if saved["digest"]:
+                return digest_matches(saved["digest"], secret)
+            # Jobs submitted before digests existed still hold their encrypted secret until they
+            # finish; once purged, a replay of such a job's key conflicts rather than guessing.
+            return bool(saved["secret"]) and hmac.compare_digest(
+                vault.decrypt(cipher, saved["secret"]), secret
+            )
+
         return store.submit(
             plan.request.model_dump(mode="json"),
             plan.lock_key,
             idempotency_key,
             kind="password_rotation",
             secret=cipher.encrypt(secret),
-            secret_matches=lambda saved: hmac.compare_digest(vault.decrypt(cipher, saved), secret),
+            secret_digest=secret_digest(secret),
+            secret_matches=matches,
         )
 
     @app.post("/api/v1/ssh/jobs", dependencies=authenticated, status_code=202, response_model=JobResponse)

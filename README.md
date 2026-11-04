@@ -1340,7 +1340,10 @@ IP defaults to `linux`, so specify the type for a network appliance. The usernam
 identifies the account to create or update; it does not rename another account.
 This manages local accounts, not TACACS/RADIUS/LDAP identities or AAA order.
 
-Existing accounts retain their roles, groups and access settings. When the account
+Existing accounts retain their roles, groups and access settings. A locked Linux
+account (`passwd -S` state `L`/`LK`, such as Ubuntu's default `root` or a key-only
+service account) is refused before any write, because `chpasswd` would also remove
+the lock; unlock it deliberately first. When the account
 is missing, omitting `new_account` (or setting it to null) creates a **full
 administrator** by default. Set `create_if_missing: false` to require an existing
 account. Supply `new_account` to override creation privileges; explicit options
@@ -1384,6 +1387,17 @@ For rotation of an existing F5 account without allowing creation:
 }
 ```
 
+F5 local accounts are synchronized device-group configuration. On a member of a
+sync-failover pair, the worker requires the pair to be `In Sync` with both members
+on the same version and build before any write, and reserves the peer and pair as
+the upgrade workflow does. After `save sys config` it runs `config-sync to-group`
+(or relies on automatic sync when the group has it enabled) and waits up to 120
+seconds for `In Sync`; `result.config_sync` reports `in sync` or `standalone`.
+A sync that does not complete requires recovery: inspect both members before
+syncing in either direction, since a sync from the peer would restore the old
+password. Confirm on your release whether the `root` password is synchronized;
+if it is not, rotate each member's `root` separately.
+
 The default `verification: ssh_login` makes a fresh, password-only SSH
 connection with exactly the requested username/password and the same host-key
 trust policy. It never uses fallback credentials to verify the new password.
@@ -1397,7 +1411,9 @@ change those settings to make verification pass.
 Linux, F5, Opengear or Palo Alto. F5 non-root, Opengear and Palo Alto use supported SHA-crypt/MD5-crypt
 formats; Linux and F5 root require target-side Python with `crypt` and `spwd`
 modules (available in Python 3.9–3.12, removed in 3.13). Unsupported verification
-fails or opens review; it is never reported as verified. This option is useful
+fails or opens review; it is never reported as verified. A readable hash that does
+not match is definitive: like a rejected login, it opens review (or fails)
+immediately instead of sampling again. This option is useful
 for local fallback accounts or an F5 admin account without SSH access.
 
 IOS defaults to `ios_algorithm: scrypt`. Use `sha256` when that is the approved
@@ -1413,7 +1429,10 @@ are refused. Password changes follow the native platform’s password-aging beha
 
 Passwords must contain 1–256 UTF-8 bytes without control characters. IOS additionally
 requires a single ASCII token of at most 128 characters; whitespace, quotes,
-backslash, `?`, pipe and semicolon are rejected before submission. Other native
+backslash, `?`, pipe and semicolon are rejected before submission. FortiGate
+passwords cannot contain `?`, which the FortiOS CLI treats as a help request even
+inside quotes. FortiGate per-administrator tables such as `config gui-dashboard`
+are preserved and never used as access settings. Other native
 platform password limits and policies still apply. No raw password commands,
 password hashes or account configuration are included in job results.
 
@@ -1421,9 +1440,13 @@ Rotation requires `NETOPS_CREDENTIAL_KEY_FILE`. The desired password is encrypte
 in a separate `job_secrets` SQLite table, outside the public job request. Responses,
 events and completion webhooks omit it. `/api/v1/credentials/rotate` re-encrypts
 both credential profiles and job secrets when rotating the keyring. Keep the
-keyring available for queued jobs and verification continuations; job passwords
-remain encrypted at rest with the retained job history. Idempotency checks include
-the decrypted password, so replaying a key with a different password returns 409.
+keyring available for queued jobs and verification continuations. The encrypted
+password is kept only while the job is `queued`, `running` or `needs_review`; any
+other status (success, failure, cancellation, expiry, `recovery_required`,
+resolution) erases it in the same transaction. A salted scrypt digest remains for
+idempotency checks, so replaying a key with the same password returns the original
+job and a different password returns 409. Upgrading to 0.20.0 erases the passwords of
+jobs that had already finished; replaying the idempotency key of such a job returns 409.
 
 A submission returns HTTP 202 and a job `id`. Poll `GET /api/v1/jobs/{id}` and its
 `/events`; results include `username`, `device_type`, `action` (`created` or
@@ -1524,9 +1547,13 @@ password jobs with PAN-OS upgrade reservations.
 
 Commit completion is bounded by `commit_timeout` (default 600 seconds). The worker
 checks the committed account before reporting `saved: true`, then performs the
-selected verification. A lost commit response is never replayed. Failed or
+selected verification. A lost commit response is never replayed. Through Panorama,
+a lost commit-job status response is read again until the deadline, since the
+commit already runs. Failed or
 interrupted changes retain recovery state; PAN-OS locks and candidate changes may
 also remain for manual inspection. Successful commits release native device locks.
+Direct SSH applies its CLI output settings to every new CLI session, including a
+validation continuation or a reconnect after a failed command.
 Validation continuations only repeat verification, and manual acceptance remains
 distinct from a verified password.
 
