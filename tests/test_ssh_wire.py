@@ -51,7 +51,8 @@ def ssh_server(cli=False):
                 return False
 
             def interact():
-                prompt = "switch#"
+                paloalto = cli == "paloalto"
+                prompt = "admin@firewall>" if paloalto else "switch#"
                 channel.sendall(prompt.encode())
                 buffer = ""
                 try:
@@ -62,9 +63,26 @@ def ssh_server(cli=False):
                         buffer += chunk.decode().replace("\r", "\n")
                         while "\n" in buffer:
                             command, buffer = buffer.split("\n", 1)
+                            if paloalto and state.get("password_prompt"):
+                                state.setdefault("password_inputs", []).append(command)
+                                if state["password_prompt"] == 1 or state.get("repeat_password"):
+                                    state["password_prompt"] = 2
+                                    channel.sendall(b"\r\nConfirm password : ")
+                                else:
+                                    state["password_prompt"] = 0
+                                    channel.sendall(("\r\n[edit]\r\n" + prompt).encode())
+                                continue
                             state["commands"].append(command)
-                            channel.sendall((command + "\r\n").encode())
+                            channel.sendall(((prompt + " " if paloalto else "") + command + "\r\n").encode())
                             if command == "hang":
+                                continue
+                            if (
+                                paloalto
+                                and command.startswith("set mgt-config users ")
+                                and command.endswith(" password")
+                            ):
+                                state["password_prompt"] = 1
+                                channel.sendall(b"Enter password   : ")
                                 continue
                             if command == "configure terminal":
                                 prompt = "switch(config)#"
@@ -72,6 +90,16 @@ def ssh_server(cli=False):
                                 prompt = "switch(config-if)#"
                             elif command == "end":
                                 prompt = "switch#"
+                            elif paloalto and command == "configure":
+                                prompt = "admin@firewall#"
+                            elif paloalto and command == "exit":
+                                prompt = "admin@firewall>"
+                            if paloalto and command == "show system info":
+                                channel.sendall(b"serial: 012345678901\r\noperational-mode: normal\r\n")
+                            if paloalto and command == "commit":
+                                channel.sendall(
+                                    b"Commit job 77 is in progress\r\n100%\r\nConfiguration committed successfully\r\n"
+                                )
                             if command.startswith("terminal width"):
                                 channel.sendall(b"Width set to 511 columns.\r\n")
                             if command == "terminal length 0":
@@ -79,7 +107,13 @@ def ssh_server(cli=False):
                             if command == "show version":
                                 channel.sendall(("version test " + state["password"] + "\r\n").encode())
                             elif command == "bad-command":
-                                channel.sendall(b"% Invalid input detected at '^' marker.\r\n")
+                                channel.sendall(
+                                    b"Invalid syntax.\r\n"
+                                    if paloalto
+                                    else b"% Invalid input detected at '^' marker.\r\n"
+                                )
+                            if paloalto and prompt.endswith("#"):
+                                channel.sendall(b"[edit]\r\n")
                             channel.sendall(prompt.encode())
                 except (OSError, EOFError):
                     pass

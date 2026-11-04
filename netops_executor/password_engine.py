@@ -5,6 +5,7 @@ import time
 from .credentials import Vault
 from .password_devices import AccountDevice, PasswordRejected, check_password_syntax
 from .password_models import PasswordRotationOptions
+from .password_panos import PanosAccountDevice
 from .ssh import DeviceError
 from .stepped import StepRunner
 
@@ -23,6 +24,11 @@ class PasswordRotationRunner(StepRunner):
 
     def prevalidate(self):
         exists = self.client.preflight()
+        if self.request.device_type == "paloalto_panos":
+            serial = self.client.serial
+            if not self.store.reserve(self.job["id"], self.worker, ["panos:" + serial]):
+                self.store.defer(self.job["id"], self.worker)
+            self.result["serial"] = serial
         self.result.update(account_existed=exists, action="updated" if exists else "created")
         self.event("account_prevalidated", account_existed=exists)
 
@@ -62,6 +68,10 @@ class PasswordRotationRunner(StepRunner):
         r.device_type = r.device_type or device.device_type
         r.for_platform(r.device_type)
         keys = [self.job["lock_key"], "endpoint:" + device.host]
+        if r.serial:
+            keys.append("panos:" + r.serial)
+        elif self.result.get("serial"):
+            keys.append("panos:" + self.result["serial"])
         if not self.store.reserve(self.job["id"], self.worker, keys):
             if self.result.get("mutations"):
                 raise DeviceError("reservation changed during password rotation")
@@ -70,7 +80,11 @@ class PasswordRotationRunner(StepRunner):
         password = Vault(self.store, self.settings.credential_key_file).job_password(self.job["id"])
         check_password_syntax(r.device_type, password)
         if self.client is None:
-            self.client = AccountDevice(self.settings, device, r, password, self.guard, self.audit)
+            self.client = (
+                PanosAccountDevice(self.settings, self.store, device, r, password, self.guard, self.audit)
+                if r.device_type == "paloalto_panos"
+                else AccountDevice(self.settings, device, r, password, self.guard, self.audit)
+            )
         self.result.update(username=r.username, device_type=r.device_type, verification=r.verification)
         self.result.setdefault("verified", False)
         self.result.setdefault("progress", {})["steps_total"] = 4

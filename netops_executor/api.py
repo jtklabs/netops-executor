@@ -28,7 +28,7 @@ from .opengear_models import OpengearBatch, OpengearUpgradeRequest
 from .panos_models import PanosBatch, PanosUpgradeRequest
 from .password_devices import check_password_syntax
 from .password_models import PasswordRotationOptions, PasswordRotationRequest
-from .platforms import NETWORK_TYPES, validate_commands
+from .platforms import DEVICE_TYPES, NETWORK_TYPES, validate_commands
 from .snmp_models import SnmpResults, SnmpWalkRequest
 from .store import Conflict, Store
 from .webhooks import Rejected, WebhookSender, redacted
@@ -630,7 +630,7 @@ def create_app(settings=None):
     def ssh_device_types():
         return [
             {"device_type": name, "modes": ["exec", "config"] if name in NETWORK_TYPES else ["exec"]}
-            for name in ["linux", "f5", "cisco_ios", "cisco_nxos", "arista_eos", "fortinet", "opengear"]
+            for name in DEVICE_TYPES
         ]
 
     def password_planned(request):
@@ -638,6 +638,8 @@ def create_app(settings=None):
             device = settings.device(request.device)
             request.device_type = request.device_type or device.device_type
             request.for_platform(request.device_type)
+            if request.panorama and request.panorama not in settings.http_targets:
+                raise ValueError("unknown Panorama HTTP target")
             check_password_syntax(request.device_type, request.password.get_secret_value())
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
@@ -669,7 +671,7 @@ def create_app(settings=None):
         status_code=202,
         response_model=JobResponse,
         tags=["Password rotation"],
-        summary="Create or update a local account password over SSH",
+        summary="Create or update a local account password over SSH or through Panorama",
         description="Existing privileges are preserved. Missing accounts default to full administrator access when new_account is omitted; supply new_account to override creation privileges. Passwords are encrypted with the credential keyring, never included in public job metadata. Poll GET /api/v1/jobs/{id}. Verification gates resume without replaying a password write. Existing credential profiles are not modified.",
     )
     def password_job(

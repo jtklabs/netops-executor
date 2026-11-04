@@ -1316,7 +1316,7 @@ prompt.
 
 `POST /api/v1/password-rotation/jobs` changes a local account password or creates
 the account if it is missing. It supports every generic SSH device type: `linux`,
-`f5`, `opengear`, `cisco_ios`, `cisco_nxos`, `arista_eos`, and `fortinet`.
+`f5`, `opengear`, `cisco_ios`, `cisco_nxos`, `arista_eos`, `fortinet`, and `paloalto_panos`.
 Use `POST /api/v1/password-rotation/plan` with the same body to validate the request
 and inspect the steps without contacting the device. Both require the API bearer
 token. Swagger at `/docs` includes the request schema and an example.
@@ -1350,7 +1350,7 @@ with administrator defaults.
 Defaults are `sudo` membership on Ubuntu/Debian, `wheel` on RHEL-family Linux,
 `admin` group on Opengear, F5 `admin` across all partitions with `bash` shell,
 IOS privilege 15, NX-OS `network-admin`, EOS `network-admin` with privilege 15,
-and FortiGate `super_admin` with the `root` VDOM. Linux defaults require an
+FortiGate `super_admin` with the `root` VDOM, and Palo Alto `superuser`. Linux defaults require an
 installed `sudo` and the existing administrative group; the worker checks full
 sudo access after creation and requires recovery if local policy does not grant it.
 Unknown Linux distributions require explicit `new_account` options. The worker
@@ -1369,6 +1369,7 @@ Examples of explicit creation options:
 | `cisco_nxos` | `{"role": "network-admin"}` | Native username with SHA-256 hash input; copy running to startup and compare the account. |
 | `arista_eos` | `{"role": "network-admin", "privilege": 15}` | Native username with SHA-512 hash input; `write memory` and running/startup account comparison. |
 | `fortinet` | `{"role": "super_admin", "vdom": "root"}` | Local administrator in `config system admin`; `next`/`end` persists it. Handles global scope when VDOMs are enabled. |
+| `paloalto_panos` | `{"role": "superuser"}` | Direct SSH password prompt or Panorama XML API proxy, followed by a checked firewall commit. Other creation roles: `superreader`, `deviceadmin`, `devicereader`. |
 
 For rotation of an existing F5 account without allowing creation:
 
@@ -1393,7 +1394,7 @@ be controlled by remote AAA, SSH access restrictions or MFA; this job does not
 change those settings to make verification pass.
 
 `verification: local_hash` checks the local password without a login attempt on
-Linux, F5 or Opengear. F5 non-root and Opengear use supported SHA-crypt/MD5-crypt
+Linux, F5, Opengear or Palo Alto. F5 non-root, Opengear and Palo Alto use supported SHA-crypt/MD5-crypt
 formats; Linux and F5 root require target-side Python with `crypt` and `spwd`
 modules (available in Python 3.9–3.12, removed in 3.13). Unsupported verification
 fails or opens review; it is never reported as verified. This option is useful
@@ -1456,6 +1457,85 @@ and [Linux chpasswd](https://man7.org/linux/man-pages/man8/chpasswd.8.html).
 Automated coverage uses simulated device CLI responses and real loopback SSH
 authentication. Validate account behavior on your exact vendor releases before a
 fleet rollout; no production device passwords were changed during implementation.
+
+### Palo Alto password rotation: SSH and Panorama
+
+Use `device_type: paloalto_panos` with the same password-rotation endpoint. A
+direct SSH request uses existing SSH credentials and defaults to fresh SSH login
+verification:
+
+```json
+{
+  "device": "192.0.2.10",
+  "device_type": "paloalto_panos",
+  "username": "automation",
+  "password": "REPLACE_WITH_DESIRED_PASSWORD"
+}
+```
+
+To reach the firewall through Panorama, add the configured HTTP target ID and
+firewall serial. The `device` IP (or inventory entry's host) must match the
+management IP Panorama reports for that serial:
+
+```json
+{
+  "device": "192.0.2.10",
+  "device_type": "paloalto_panos",
+  "panorama": "panorama",
+  "serial": "012345678901",
+  "username": "automation",
+  "password": "REPLACE_WITH_DESIRED_PASSWORD",
+  "commit_timeout": 600
+}
+```
+
+Panorama mode uses the existing `http_targets` configuration, TLS verification
+or certificate pinning, and a configured read-only authentication probe. It tries
+eligible HTTP profiles automatically; use `http_credential_profiles` to select
+specific profiles. `credential_profiles` selects SSH profiles and is rejected
+with `panorama` to avoid choosing the wrong credential type. Credential attempts
+and the successful profile are audited through the normal job fields.
+
+Panorama requests proxy to the firewall using `target=<serial>` and update its
+local administrator configuration. This does not edit Panorama templates or push
+template stacks. The default verification for Panorama is `local_hash`: read the
+committed firewall hash through Panorama and compare it with the requested
+password, without a direct firewall connection. This verifies the stored password,
+not SSH access or AAA selection. Explicit `verification: ssh_login` additionally
+requires direct SSH reachability from the executor to the firewall.
+
+Missing accounts default to `superuser`; existing roles and authentication settings
+are preserved. External-authentication and certificate-only administrators are
+refused. Direct SSH uses the native password/confirmation prompt, with at most two
+answers. Panorama requests a native password hash from the firewall, verifies it,
+then sets the account through the XML API. Imported hashes may not enforce the
+same password complexity/history checks as the interactive password prompt, so
+the controller must supply a policy-compliant password. Supported hash formats
+are SHA-256 Crypt, SHA-512 Crypt and MD5 Crypt (maximum one million rounds);
+unsupported or unreadable hashes stop the operation without a blind commit.
+
+The worker requires a clean candidate configuration, acquires and verifies device
+configuration/commit locks, and compares candidate and running configuration before
+committing. It refuses a commit if it detects changes outside the requested account.
+Use a dedicated administrator for automation: PAN-OS locks belong to the administrator
+and cannot isolate concurrent sessions sharing that same identity. The executor
+reserves both the management endpoint and discovered firewall serial, coordinating
+password jobs with PAN-OS upgrade reservations.
+
+Commit completion is bounded by `commit_timeout` (default 600 seconds). The worker
+checks the committed account before reporting `saved: true`, then performs the
+selected verification. A lost commit response is never replayed. Failed or
+interrupted changes retain recovery state; PAN-OS locks and candidate changes may
+also remain for manual inspection. Successful commits release native device locks.
+Validation continuations only repeat verification, and manual acceptance remains
+distinct from a verified password.
+
+References: [PAN-OS administrator CLI](https://knowledgebase.paloaltonetworks.com/KCSArticleDetail?id=kA10g000000ClFrCAK),
+[administrator password XML API](https://knowledgebase.paloaltonetworks.com/KCSArticleDetail?id=kA10g000000ClkTCAS),
+[configuration locks](https://pan.dev/ansible/docs/panos/guides/use-config-lock/),
+and [PAN-OS lock behavior](https://docs.paloaltonetworks.com/ngfw/administration/firewall-administration/launch-the-web-interface/manage-locks-for-restricting-configuration-changes).
+Coverage includes a real loopback SSH CLI/password dialogue and simulated Panorama
+API responses; physical Palo Alto release acceptance remains required before rollout.
 
 ## Opengear IM7200 upgrades
 
@@ -1781,10 +1861,26 @@ the dedicated F5 workflow and need no additional field.
 | `cisco_nxos` | Interactive NX-OS CLI | `show version` |
 | `arista_eos` | Interactive EOS CLI | `show version` |
 | `fortinet` | Interactive FortiOS CLI (Netmiko sets console output to `standard`) | `get system status` |
+| `paloalto_panos` | Interactive PAN-OS CLI, operational and configuration modes | `show system info` |
+| `opengear` | Legacy Opengear Linux shell | `cat /etc/version` |
 
 Discover supported types and modes through authenticated
 `GET /api/v1/ssh/device-types`. Device inventory responses also include the type.
 The F5 profile expects a bash-capable account, as the upgrade workflow does.
+
+Palo Alto operational commands use the generic SSH endpoint too:
+
+```json
+{
+  "device": "192.0.2.10",
+  "device_type": "paloalto_panos",
+  "commands": [{"command": "show system info", "mode": "exec"}]
+}
+```
+
+Use `mode: config` for PAN-OS configuration commands. Generic SSH jobs do not
+commit implicitly; include `commit` in config mode with an appropriate command
+timeout when a commit is intended. PAN-OS upgrade endpoints remain separate.
 
 ```json
 {

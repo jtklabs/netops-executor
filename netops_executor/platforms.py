@@ -1,9 +1,12 @@
 """Explicit platform selection; commands remain native device syntax."""
 
-from typing import Literal
+from typing import Literal, get_args
 
-DeviceType = Literal["linux", "f5", "cisco_ios", "cisco_nxos", "arista_eos", "fortinet", "opengear"]
-NETWORK_TYPES = {"cisco_ios", "cisco_nxos", "arista_eos", "fortinet"}
+DeviceType = Literal[
+    "linux", "f5", "cisco_ios", "cisco_nxos", "arista_eos", "fortinet", "opengear", "paloalto_panos"
+]
+NETWORK_TYPES = {"cisco_ios", "cisco_nxos", "arista_eos", "fortinet", "paloalto_panos"}
+DEVICE_TYPES = get_args(DeviceType)
 
 
 def validate_commands(request, device_type):

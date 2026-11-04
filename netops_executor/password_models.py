@@ -6,6 +6,7 @@ from typing import Annotated, Literal
 from pydantic import Field, SecretStr, field_serializer, model_validator
 
 from .models import Model, Name, ScheduledRequest
+from .panos_models import Serial
 from .platforms import DeviceType
 
 Username = Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")]
@@ -33,6 +34,7 @@ class AccountCreation(Model):
                 "cisco_nxos": {"role": "network-admin"},
                 "arista_eos": {"role": "network-admin", "privilege": 15},
                 "fortinet": {"role": "super_admin", "vdom": "root"},
+                "paloalto_panos": {"role": "superuser"},
             }[platform]
         )
 
@@ -45,6 +47,7 @@ class AccountCreation(Model):
             "cisco_nxos": {"role"},
             "arista_eos": {"role", "privilege"},
             "fortinet": {"role", "vdom"},
+            "paloalto_panos": {"role"},
         }[platform]
         if self.model_fields_set - allowed:
             raise ValueError("new_account contains options for a different device_type")
@@ -63,6 +66,15 @@ class AccountCreation(Model):
             raise ValueError("F5 account shell must be bash, tmsh or none")
         if platform == "opengear" and not self.groups:
             raise ValueError("Opengear new accounts require at least one group")
+        if platform == "paloalto_panos" and self.role not in (
+            "superuser",
+            "superreader",
+            "deviceadmin",
+            "devicereader",
+        ):
+            raise ValueError(
+                "Palo Alto creation role must be superuser, superreader, deviceadmin or devicereader"
+            )
 
 
 class RotationValidation(Model):
@@ -78,6 +90,19 @@ class PasswordRotationOptions(ScheduledRequest):
     device_type: DeviceType | None = None
     username: Username
     credential_profiles: list[Name] | None = Field(default=None, min_length=1, max_length=10)
+    panorama: Name | None = Field(
+        default=None, description="Palo Alto only: configured Panorama HTTP target; omit to use direct SSH"
+    )
+    serial: Serial | None = Field(
+        default=None,
+        description="Managed firewall serial, required with panorama; optional expected serial for direct Palo Alto SSH",
+    )
+    http_credential_profiles: list[Name] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=10,
+        description="Panorama HTTP credentials; omitted selects eligible configured profiles automatically",
+    )
     create_if_missing: bool = True
     new_account: AccountCreation | None = Field(
         default=None,
@@ -85,13 +110,16 @@ class PasswordRotationOptions(ScheduledRequest):
     )
     verification: Literal["ssh_login", "local_hash"] = Field(
         default="ssh_login",
-        description="Fresh password-only SSH authentication, or local hash comparison on Linux/F5/Opengear",
+        description="Fresh password-only SSH authentication, or local hash comparison on Linux/F5/Opengear/Palo Alto. Panorama defaults to local_hash and needs no direct firewall connection.",
     )
     ios_algorithm: Literal["scrypt", "sha256", "legacy"] = Field(
         default="scrypt",
         description="Cisco IOS secret algorithm; legacy explicitly opts into the device default",
     )
     command_timeout: int = Field(default=60, ge=10, le=300)
+    commit_timeout: int = Field(
+        default=600, ge=30, le=1800, description="Palo Alto commit completion deadline in seconds"
+    )
     validation_timeout: int = Field(default=60, ge=0, le=600)
     validation_policy: RotationValidation = Field(default_factory=RotationValidation)
 
@@ -101,10 +129,28 @@ class PasswordRotationOptions(ScheduledRequest):
         return value.model_dump(exclude_unset=True) if value is not None else None
 
     def for_platform(self, platform):
+        if platform != "paloalto_panos" and (self.panorama or self.serial or self.http_credential_profiles):
+            raise ValueError("panorama, serial and http_credential_profiles require paloalto_panos")
+        if self.panorama:
+            if not self.serial:
+                raise ValueError("Panorama password rotation requires the firewall serial")
+            if self.credential_profiles is not None:
+                raise ValueError("use http_credential_profiles for Panorama password rotation")
+            if "verification" not in self.model_fields_set:
+                self.verification = "local_hash"
+        elif self.http_credential_profiles is not None:
+            raise ValueError("http_credential_profiles requires panorama")
         if self.new_account:
             self.new_account.for_platform(platform)
-        if self.verification == "local_hash" and platform not in ("linux", "f5", "opengear"):
-            raise ValueError("local_hash verification is supported on linux, f5 and opengear only")
+        if self.verification == "local_hash" and platform not in (
+            "linux",
+            "f5",
+            "opengear",
+            "paloalto_panos",
+        ):
+            raise ValueError(
+                "local_hash verification is supported on linux, f5, opengear and paloalto_panos only"
+            )
 
 
 class PasswordRotationRequest(PasswordRotationOptions):
@@ -118,7 +164,22 @@ class PasswordRotationRequest(PasswordRotationOptions):
                     "password": "REPLACE_WITH_DESIRED_PASSWORD",
                     "verification": "ssh_login",
                     "queue": "priority",
-                }
+                },
+                {
+                    "device": "192.0.2.10",
+                    "device_type": "paloalto_panos",
+                    "username": "automation",
+                    "password": "REPLACE_WITH_DESIRED_PASSWORD",
+                },
+                {
+                    "device": "192.0.2.10",
+                    "device_type": "paloalto_panos",
+                    "panorama": "panorama",
+                    "serial": "012345678901",
+                    "username": "automation",
+                    "password": "REPLACE_WITH_DESIRED_PASSWORD",
+                    "verification": "local_hash",
+                },
             ]
         }
     }

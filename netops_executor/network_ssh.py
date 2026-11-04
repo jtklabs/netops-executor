@@ -17,7 +17,7 @@ from .ssh import SSH, DeviceError
 # text separately and retain output for the caller's own validation rules.
 CLI_ERROR = re.compile(
     r"(?im)^\s*(?:%\s*(?:invalid|incomplete|ambiguous|error|unknown|unrecognized|"
-    r"authorization|access denied)|(?:syntax error|error:|invalid command))"
+    r"authorization|access denied)|(?:syntax error|error:|invalid command|invalid syntax|server error|commit failed|validation error))"
 )
 # A question the CLI is waiting on; dialogue() answers only the ones it was given.
 QUESTION = re.compile(
@@ -132,7 +132,18 @@ class NetworkSSH(SSH):
         finally:
             self.operation_deadline = None
 
-    def dialogue(self, command, replies, timeout, *, progress=None, disconnect_ok=False, poll=None):
+    def dialogue(
+        self,
+        command,
+        replies,
+        timeout,
+        *,
+        progress=None,
+        disconnect_ok=False,
+        poll=None,
+        mode="exec",
+        max_replies=None,
+    ):
         """Send one command and answer only recognized questions until the prompt returns.
 
         `replies` pairs a pattern for a question at the end of the unanswered output with
@@ -144,11 +155,14 @@ class NetworkSSH(SSH):
         driver = self.connect()
         self.output_bytes = 0
         self.operation_deadline = time.monotonic() + timeout
-        output, answered, disconnected = "", 0, False
+        output, answered, disconnected, answer_count = "", 0, False, 0
         try:
             self.check()
             driver.enable()
-            driver.exit_config_mode()
+            if mode == "config":
+                driver.config_mode()
+            else:
+                driver.exit_config_mode()
             prompt = driver.find_prompt().strip()
             driver.write_channel(command + driver.RETURN)
             while True:
@@ -170,8 +184,11 @@ class NetworkSSH(SSH):
                     progress(self.selector.redact(lines[-1])[:200] if lines else "")
                 reply = next((answer for pattern, answer in replies if pattern.search(tail)), None)
                 if reply is not None:
+                    if max_replies is not None and answer_count >= max_replies:
+                        raise DeviceError("device repeated an interactive prompt; outcome may be unknown")
                     driver.write_channel(reply + driver.RETURN)
                     answered = len(output)
+                    answer_count += 1
                 elif QUESTION.search(tail):
                     raise DeviceError("unrecognized prompt during " + command.split()[0])
                 elif re.search(r"\n" + re.escape(prompt) + r"\s*$", output):
