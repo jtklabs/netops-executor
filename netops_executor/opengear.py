@@ -13,6 +13,7 @@ from pathlib import Path
 import paramiko
 from scp import SCPClient, SCPException
 
+from .opengear_sudo import PROMPT, READY, SudoSCPClient, root_command
 from .ssh import SSH, DeviceError, digest
 
 MODEL = re.compile(r"\b(IM72(?:08|16|32|48)(?:-[A-Za-z0-9]+)*)(?=\s|$)", re.I)
@@ -25,7 +26,7 @@ def parse_version(version, issue=""):
     value = match[1] if match else version.strip()
     if not model or not re.fullmatch(r"\d{1,2}\.\d{1,3}\.\d{1,3}(?:u\d{1,3})?", value):
         raise DeviceError(
-            "cannot identify an IM7200 model and firmware version from /etc/version and /etc/issue"
+            "cannot identify an IM7200 model and firmware version from version and model information"
         )
     return {"model": model[1].upper(), "version": value.lower()}
 
@@ -38,14 +39,50 @@ def version_key(version):
 class Opengear:
     def __init__(self, settings, device, guard, profiles, audit, ssh=None):
         self.ssh = ssh or SSH(settings, device, guard, profiles, audit)
+        self._sudo = None
+
+    def sudo_password(self):
+        """Use only the credential that authenticated this connection."""
+        self.ssh.connect()
+        selector = self.ssh.selector
+        if selector.last and not selector.last.startswith("legacy:"):
+            candidates = selector.vault.candidates(
+                "ssh", [selector.last], (self.ssh.device.host, self.ssh.device.id)
+            )
+            return candidates[0].get("password") if candidates else None
+        return os.environ.get(self.ssh.device.password_env or "")
+
+    def execute(self, command, timeout=120):
+        if self._sudo is None:
+            identity = self.ssh.execute("id -u")
+            if identity["exit_code"] != 0 or not re.fullmatch(r"\d+", identity["stdout"].strip()):
+                raise DeviceError("Opengear shell identity is unavailable")
+            self._sudo = identity["stdout"].strip() != "0"
+        if not self._sudo:
+            return self.ssh.execute(command, timeout=timeout)
+        password = self.sudo_password()
+        # The elevated command cannot read leftover password input if sudo uses a cached ticket.
+        response = self.ssh.execute(
+            root_command("exec sh -c " + shlex.quote(command) + " < /dev/null"),
+            timeout=timeout,
+            stdin_text=password + "\n" if password else None,
+        )
+        prefix = READY + "\n"
+        if not response["stdout"].startswith(prefix):
+            raise DeviceError("Opengear upgrades require a root shell or working sudo authentication")
+        return {
+            **response,
+            "stdout": response["stdout"][len(prefix) :],
+            "stderr": response.get("stderr", "").replace(PROMPT, ""),
+        }
 
     def text(self, command, timeout=120):
         try:
-            response = self.ssh.execute(command, timeout=timeout)
+            response = self.execute(command, timeout=timeout)
         except (EOFError, OSError, paramiko.SSHException):
             self.close()
             raise DeviceError("Opengear SSH command interrupted; device output omitted") from None
-        if response["exit_code"] != 0:
+        if response["exit_code"] != 0 or response.get("stderr", "").strip():
             # Do not return config contents or raw errors containing device secrets.
             raise DeviceError("Opengear command failed; device output omitted")
         return response["stdout"].strip()
@@ -54,13 +91,15 @@ class Opengear:
         if self.text("id -u") != "0":
             raise DeviceError("Opengear upgrades require a root shell (UID 0)")
         self.text(
-            "command -v netflash >/dev/null && command -v config >/dev/null && "
-            "command -v scp >/dev/null && command -v sha256sum >/dev/null"
+            "command -v netflash >/dev/null && command -v config >/dev/null && command -v scp >/dev/null"
         )
+        self.sha256("/etc/version")
 
     def version(self):
         version = self.text("cat /etc/version")
-        info = parse_version(version, self.text("cat /etc/issue") if not MODEL.search(version) else "")
+        info = parse_version(
+            version, self.text("config -g config.system.model") if not MODEL.search(version) else ""
+        )
         mac = self.text("cat /sys/class/net/eth0/address").lower()
         boot = self.text("cat /proc/sys/kernel/random/boot_id").lower()
         if not re.fullmatch(r"(?:[a-f0-9]{2}:){5}[a-f0-9]{2}", mac) or mac == "00:00:00:00:00:00":
@@ -97,16 +136,15 @@ class Opengear:
             + q
             + ") && test -d "
             + q
-            + ' && test "$(stat -c %u '
+            + " && test -O "
             + q
-            + ')" = 0'
             + " && chmod 700 "
             + q
         )
         return directory
 
     def free_bytes(self, directory):
-        output = self.text("df -Pk " + shlex.quote(directory))
+        output = self.text("df -k " + shlex.quote(directory))
         lines = output.splitlines()
         try:
             value = int(lines[-1].split()[3]) * 1024
@@ -117,8 +155,18 @@ class Opengear:
             raise DeviceError("cannot determine free firmware staging space") from None
 
     def sha256(self, path):
-        output = self.text("sha256sum " + shlex.quote(path), timeout=300)
-        match = re.match(r"^([a-fA-F0-9]{64})\s", output)
+        quoted = shlex.quote(path)
+        output = self.text(
+            "if command -v sha256sum >/dev/null; then sha256sum "
+            + quoted
+            + "; else openssl dgst -sha256 "
+            + quoted
+            + "; fi",
+            timeout=300,
+        )
+        match = re.fullmatch(r"([a-fA-F0-9]{64})\s+\*?" + re.escape(path), output)
+        if not match:
+            match = re.fullmatch(r"SHA(?:2-)?256\(" + re.escape(path) + r"\)= ([a-fA-F0-9]{64})", output)
         if not match:
             raise DeviceError("device SHA-256 checksum was unavailable")
         return match[1].lower()
@@ -139,7 +187,13 @@ class Opengear:
             progress(done, size)
 
         try:
-            with SCPClient(self.ssh.connect().get_transport(), socket_timeout=30, progress=updated) as scp:
+            self.text("id -u")
+            password = self.sudo_password() if self._sudo else None
+            client = SudoSCPClient if self._sudo else SCPClient
+            options = {"password": password, "guard": self.ssh.guard} if self._sudo else {}
+            with client(
+                self.ssh.connect().get_transport(), socket_timeout=30, progress=updated, **options
+            ) as scp:
                 if download:
                     scp.get(remote, str(local))
                 else:
@@ -188,10 +242,11 @@ class Opengear:
         # netflash performs its native image checks, writes firmware and reboots.
         # A disconnect is ambiguous; the runner verifies a new boot and never retries this write.
         try:
-            return self.ssh.execute("netflash " + shlex.quote(path), timeout=timeout)["exit_code"]
+            return self.execute("netflash " + shlex.quote(path), timeout=timeout)["exit_code"]
         except (EOFError, OSError, paramiko.SSHException):
             self.close()
             raise DeviceError("Opengear flash connection interrupted; outcome unknown") from None
 
     def close(self):
         self.ssh.close()
+        self._sudo = None

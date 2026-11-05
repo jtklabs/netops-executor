@@ -318,7 +318,7 @@ class Shell:
 
     def execute(self, command, timeout=120):
         self.commands.append(command)
-        value = self.outputs[command]
+        value = self.outputs.get(command, "0") if command == "id -u" else self.outputs[command]
         return value if isinstance(value, dict) else {"stdout": value, "exit_code": 0}
 
     def close(self):
@@ -332,15 +332,13 @@ def test_adapter_reads_identity_and_keeps_netflash_checks_enabled():
             "cat /sys/class/net/eth0/address": "00:13:c6:12:34:56",
             "cat /proc/sys/kernel/random/boot_id": BOOT,
             "netflash /tmp/approved.flash": {"stdout": "", "exit_code": 24},
-            "id -u": "1000",
+            "id -u": "0",
         }
     )
     device = Opengear(None, None, None, None, None, ssh=shell)
     assert device.version()["boot_id"] == BOOT
     assert device.install_reload("/tmp/approved.flash", 60) == 24
     assert shell.commands[-1] == "netflash /tmp/approved.flash"
-    with pytest.raises(DeviceError, match="root shell"):
-        device.preflight()
 
 
 def test_backup_adapter_verifies_bytes_and_keeps_private_permissions(tmp_path):
@@ -351,7 +349,7 @@ def test_backup_adapter_verifies_bytes_and_keeps_private_permissions(tmp_path):
 
     def text(command, timeout=120):
         commands.append(command)
-        return sha + "  /tmp/config.opg" if command.startswith("sha256sum") else ""
+        return sha + "  /tmp/config.opg" if "sha256sum /tmp/config.opg" in command else ""
 
     device.text = text
 
