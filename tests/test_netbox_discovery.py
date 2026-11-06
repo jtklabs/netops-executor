@@ -100,3 +100,53 @@ def test_device_type_lookup_uses_exact_normalized_model_after_punctuation_search
             {"id": 3, "slug": "fortinet"}, "FortiGate-600E"
         )
     assert match["id"] == 1
+
+
+@pytest.mark.parametrize("foreign", [False, True])
+def test_primary_ip_uses_the_interface_vrf_and_preserves_other_assignments(foreign):
+    from netops_executor.netbox_discovery import SyncError
+
+    calls = []
+
+    def handle(request):
+        path = request.url.path.removeprefix("/api/").strip("/")
+        if request.method == "GET":
+            if path == "dcim/interfaces":
+                assert request.url.params["device_id"] == "6"
+                rows = [{"id": 147, "name": "eth0", "vrf": {"id": 10}}]
+            else:
+                assert path == "ipam/ip-addresses"
+                assert request.url.params["address"] == "192.0.2.15"
+                rows = [
+                    {"id": 1, "vrf": None, "address": "192.0.2.15/24", "assigned_object_id": 208},
+                    {
+                        "id": 2,
+                        "vrf": {"id": 10},
+                        "address": "192.0.2.15/24",
+                        "assigned_object_id": 207 if foreign else None,
+                        "assigned_object_type": "dcim.interface" if foreign else None,
+                    },
+                ]
+            return httpx.Response(200, json={"results": rows, "next": None})
+        calls.append((request.method, path, json.loads(request.content)))
+        return httpx.Response(200, json={})
+
+    with httpx.Client(
+        base_url="https://netbox.example/api/", transport=httpx.MockTransport(handle)
+    ) as client:
+        discovery = NetBoxDiscovery(client, lambda: None)
+        management_ip = {"interface": "eth0", "address": "192.0.2.15/24", "dhcp": False}
+        if foreign:
+            with pytest.raises(SyncError, match="already assigned"):
+                discovery.assign_primary_ip({"id": 6}, management_ip)
+            assert calls == []
+        else:
+            assert discovery.assign_primary_ip({"id": 6}, management_ip)
+            assert calls == [
+                (
+                    "PATCH",
+                    "ipam/ip-addresses/2",
+                    {"assigned_object_type": "dcim.interface", "assigned_object_id": 147},
+                ),
+                ("PATCH", "dcim/devices/6", {"primary_ip4": 2}),
+            ]

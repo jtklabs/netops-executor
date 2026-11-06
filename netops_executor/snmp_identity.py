@@ -3,7 +3,7 @@
 import re
 from dataclasses import dataclass
 
-from pysnmp.proto.rfc1902 import OctetString
+from pysnmp.proto.rfc1902 import IpAddress, OctetString
 
 SYSTEM = "1.3.6.1.2.1.1"
 SYS_DESCR, SYS_OBJECT_ID, SYS_NAME = (f"{SYSTEM}.{oid}.0" for oid in (1, 2, 5))
@@ -118,7 +118,7 @@ def platform_for(vendor, description, model):
 def text(value):
     if value is None:
         return ""
-    if isinstance(value, OctetString):
+    if isinstance(value, OctetString) and not isinstance(value, IpAddress):
         value = value.asOctets().decode("utf-8", errors="replace")
     else:
         value = value.prettyPrint()

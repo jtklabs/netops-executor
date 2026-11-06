@@ -11,6 +11,7 @@ from pysnmp.proto import rfc1902, rfc1905
 
 from .credentials import AuthenticationRejected, Selector, Vault
 from .netbox_discovery import SyncError, sync_device
+from .snmp_address import collect_polled_address
 from .snmp_identity import ENTITY_CLASS, collect_identity, text
 from .snmp_models import SnmpWalkRequest
 from .store import CancelRequested, LostOwnership
@@ -304,11 +305,17 @@ class SnmpRunner:
             return await first_value(ENTITY_CLASS, expected="3")
 
         facts = await collect_identity(get, chassis_index, first_value)
+        try:
+            management_ip = await collect_polled_address(get, self.request.device_ip)
+        except WalkError:
+            # Some older agents reject an unsupported table instead of returning noSuchInstance.
+            management_ip = None
         self.result["discovery"] = {
             **facts,
             "address": str(self.request.device_ip),
             "site": self.request.site,
             "poller_instance": self.request.poller_instance,
+            "management_ip": management_ip,
         }
 
     def sync_inventory(self):

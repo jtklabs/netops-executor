@@ -191,6 +191,72 @@ class NetBoxDiscovery:
         return matches[0] if matches else None
 
     def sync(self, site_name, poller, address, facts):
+        action, device = self.sync_inventory(site_name, poller, address, facts)
+        if (management_ip := facts.get("management_ip")) and self.assign_primary_ip(device, management_ip):
+            if action == "unchanged":
+                action = "updated"
+        return action, device["id"]
+
+    def assign_primary_ip(self, device, management_ip):
+        interface_path = "dcim/interfaces/"
+        address_path = "ipam/ip-addresses/"
+        name = management_ip["interface"]
+        cidr = ip_interface(management_ip["address"])
+        device_id = device["id"]
+
+        def find_interface():
+            matches = [
+                row
+                for row in self.records(interface_path, device_id=device_id, name__ie=name)
+                if row["name"].casefold() == name.casefold()
+            ]
+            if len(matches) > 1:
+                raise SyncError("Multiple NetBox interfaces match the interface reported by SNMP")
+            return matches[0] if matches else None
+
+        interface = self.ensure(
+            interface_path, find_interface, {"device": device_id, "name": name, "type": "other"}
+        )
+        vrf_id = (interface.get("vrf") or {}).get("id")
+        assignment = {"assigned_object_type": "dcim.interface", "assigned_object_id": interface["id"]}
+
+        def find_address():
+            matches = [
+                row
+                for row in self.records(address_path, address=str(cidr.ip))
+                if (row.get("vrf") or {}).get("id") == vrf_id and ip_interface(row["address"]).ip == cidr.ip
+            ]
+            if len(matches) > 1:
+                raise SyncError("Multiple NetBox IP records match the polled address in the interface VRF")
+            return matches[0] if matches else None
+
+        address = self.ensure(
+            address_path,
+            find_address,
+            {
+                **assignment,
+                "address": str(cidr),
+                "vrf": vrf_id,
+                "status": "dhcp" if management_ip["dhcp"] else "active",
+            },
+        )
+        ip_data = {}
+        if address["assigned_object_id"] is None:
+            ip_data.update(assignment)
+        elif any(address[key] != value for key, value in assignment.items()):
+            raise SyncError("The polled IP is already assigned to another NetBox object in the interface VRF")
+        if ip_interface(address["address"]) != cidr:
+            ip_data["address"] = str(cidr)
+        if ip_data:
+            self.request("PATCH", f"{address_path}{address['id']}/", json=ip_data)
+
+        primary_field = f"primary_ip{cidr.version}"
+        set_primary = (device.get(primary_field) or {}).get("id") != address["id"]
+        if set_primary:
+            self.request("PATCH", f"dcim/devices/{device_id}/", json={primary_field: address["id"]})
+        return bool(ip_data or set_primary)
+
+    def sync_inventory(self, site_name, poller, address, facts):
         if poller == DISCOVERED_TAG:
             raise SyncError("The poller instance cannot use the reserved discovered tag")
         self.custom_field(DISCOVERY_IP, "SNMP discovery IP", "Address polled by NetOps Executor.")
@@ -227,7 +293,7 @@ class NetBoxDiscovery:
                         "custom_fields": fields,
                     },
                 )
-                return "created", created["id"]
+                return "created", created
             except httpx.HTTPStatusError as error:
                 if error.response.status_code not in (400, 409):
                     raise
@@ -259,4 +325,4 @@ class NetBoxDiscovery:
             data["add_tags"] = missing_tags
         if data:
             self.request("PATCH", f"{path}{current['id']}/", json=data)
-        return ("updated" if data else "unchanged"), current["id"]
+        return ("updated" if data else "unchanged"), current

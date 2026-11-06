@@ -579,3 +579,50 @@ def test_cisco_platform_uses_the_os_family_reported_by_snmp(description, platfor
     from netops_executor.snmp_identity import VENDORS, platform_for
 
     assert platform_for(VENDORS[9], description, "") == platform
+
+
+@pytest.mark.parametrize(
+    ("address", "table", "cidr"),
+    [
+        ("192.0.2.15", "legacy", "192.0.2.15/24"),
+        ("2001:db8::15", "modern", "2001:db8::15/64"),
+        ("2001:db8::15", "no-prefix", None),
+    ],
+)
+def test_discovery_reads_polled_ip_interface_and_prefix(
+    client, settings, store, monkeypatch, address, table, cidr
+):
+    from ipaddress import ip_address
+
+    from netops_executor.snmp_address import IF_NAME, IP_ADDRESS_ENTRY, IP_PREFIX_ENTRY, IPV4_ENTRY
+    from netops_executor.snmp_identity import SYS_DESCR, SYS_NAME, SYS_OBJECT_ID
+
+    settings.netbox_url = "https://netbox.example"
+    settings.netbox_token = "x" * 40
+    settings.poller_instance = "lab"
+    response = client.post("/api/v1/snmp/walks", json={"device_ip": address, "site": "Lab"})
+    assert response.status_code == 202
+    values = {
+        SYS_NAME: rfc1902.OctetString("IM7248-2-DAC"),
+        SYS_OBJECT_ID: rfc1902.ObjectName("1.3.6.1.4.1.25049.1.61"),
+        SYS_DESCR: rfc1902.OctetString("Opengear IM7248-2-DAC, OpenGear/IM72xx Version 5.5.3"),
+        f"{IF_NAME}.2": rfc1902.OctetString("eth0"),
+    }
+    if table == "legacy":
+        values[f"{IPV4_ENTRY}.2.{address}"] = rfc1902.Integer32(2)
+        values[f"{IPV4_ENTRY}.3.{address}"] = rfc1902.IpAddress("255.255.255.0")
+    else:
+        suffix = ".".join(map(str, (2, 16, *ip_address(address).packed)))
+        values[f"{IP_ADDRESS_ENTRY}.3.{suffix}"] = rfc1902.Integer32(2)
+        values[f"{IP_ADDRESS_ENTRY}.6.{suffix}"] = rfc1902.Integer32(4)
+        if table == "modern":
+            network = ".".join(map(str, ip_address("2001:db8::").packed))
+            values[f"{IP_ADDRESS_ENTRY}.5.{suffix}"] = rfc1902.ObjectName(
+                f"{IP_PREFIX_ENTRY}5.2.2.16.{network}.64"
+            )
+    FakeAgent(monkeypatch, values)
+    monkeypatch.setattr(snmp, "sync_device", lambda *_: ("created", 42))
+    process(settings, store, store.claim("worker"), "worker")
+    job = store.get(response.json()["id"])
+    expected = {"interface": "eth0", "address": cidr, "dhcp": table == "modern"} if cidr else None
+    assert job["result"]["discovery"]["management_ip"] == expected
