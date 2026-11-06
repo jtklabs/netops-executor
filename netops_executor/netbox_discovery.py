@@ -21,6 +21,7 @@ ROLE_MODELS = {
         (r"(?:ASR|ISR|CSR)\b|(?:ASR|ISR|CSR)\d|C(?:atalyst[ -]+)?8[235]\d{2}", "Router"),
         (r"(?:ASA|FPR)[ -]?\d", "Firewall"),
     ),
+    "f5": ((r"BIG[- ]?IP\b", "Load Balancer"),),
     "fortinet": ((r"FortiGate\b|FG-", "Firewall"), (r"FortiSwitch\b|FS-", "Switch")),
     "juniper": (
         (r"(?:EX|QFX)[ -]?\d", "Switch"),
