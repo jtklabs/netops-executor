@@ -2223,8 +2223,13 @@ NetBox looks up the device by its reported name and polled IP, using the
 `snmp_discovery_ip` custom field or an existing matching primary IP. The
 executor creates missing sites and poller tags, reuses a matching manufacturer
 and model or part number from the device type catalog, and creates a basic
-device type when no match exists. New devices receive the `SNMP discovered`
-role. Serial numbers go in the native serial field and running versions in
+device type when no match exists. It tags new devices `discovered` and sets a
+functional role such as Switch, Router, Firewall, or Console Server when it
+recognizes the product family. It uses Unclassified when the model is ambiguous.
+The next poll moves devices with the old `SNMP discovered` role to this scheme.
+For other existing devices, discovery preserves their assigned role and adds
+only the poller tag. The name `discovered` is reserved for discovery provenance.
+Serial numbers go in the native serial field and running versions in
 the `software_version` custom field. The executor records the polled address
 without guessing a subnet, VRF, or management interface. NetBox requires unique
 device names within each site and tenant, so a different IP with the same

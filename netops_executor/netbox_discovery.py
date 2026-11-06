@@ -10,6 +10,26 @@ import httpx
 
 DISCOVERY_IP = "snmp_discovery_ip"
 SOFTWARE_VERSION = "software_version"
+DISCOVERED_TAG = "discovered"
+LEGACY_DISCOVERY_ROLE = "snmp-discovered"
+
+# Only infer a role for product families that identify a device function.
+ROLE_MODELS = {
+    "arista": ((r"DCS-", "Switch"),),
+    "cisco": (
+        (r"(?:WS-C|C(?:atalyst[ -]+)?9[23456]\d{2}|N[235679]K-|Nexus\b)", "Switch"),
+        (r"(?:ASR|ISR|CSR)\b|(?:ASR|ISR|CSR)\d|C(?:atalyst[ -]+)?8[235]\d{2}", "Router"),
+        (r"(?:ASA|FPR)[ -]?\d", "Firewall"),
+    ),
+    "fortinet": ((r"FortiGate\b|FG-", "Firewall"), (r"FortiSwitch\b|FS-", "Switch")),
+    "juniper": (
+        (r"(?:EX|QFX)[ -]?\d", "Switch"),
+        (r"(?:MX|PTX|ACX)[ -]?\d", "Router"),
+        (r"SRX[ -]?\d", "Firewall"),
+    ),
+    "opengear": ((r"(?:ACM|CM|IM|OM)\d", "Console Server"),),
+    "palo alto networks": ((r"(?:PA|VM)-\d", "Firewall"),),
+}
 
 
 class SyncError(Exception):
@@ -23,6 +43,13 @@ def slugify(value):
 
 def model_key(value):
     return slugify(value).replace("-", "")
+
+
+def discovery_role(facts):
+    for pattern, role in ROLE_MODELS.get(facts["manufacturer"].casefold(), ()):
+        if re.match(pattern, facts["model"], re.IGNORECASE):
+            return role
+    return "Unclassified"
 
 
 def sync_device(settings, site, poller, address, facts, checkpoint):
@@ -164,6 +191,8 @@ class NetBoxDiscovery:
         return matches[0] if matches else None
 
     def sync(self, site_name, poller, address, facts):
+        if poller == DISCOVERED_TAG:
+            raise SyncError("The poller instance cannot use the reserved discovered tag")
         self.custom_field(DISCOVERY_IP, "SNMP discovery IP", "Address polled by NetOps Executor.")
         self.custom_field(SOFTWARE_VERSION, "Software version", "Running software version reported by SNMP.")
         site = self.named_object("dcim/sites/", site_name)
@@ -181,7 +210,8 @@ class NetBoxDiscovery:
         if facts["software_version"]:
             fields[SOFTWARE_VERSION] = facts["software_version"]
         if current is None:
-            role = self.named_object("dcim/device-roles/", "SNMP discovered")
+            role = self.named_object("dcim/device-roles/", discovery_role(facts))
+            discovered = self.named_object("extras/tags/", DISCOVERED_TAG)
             try:
                 created = self.request(
                     "POST",
@@ -191,7 +221,7 @@ class NetBoxDiscovery:
                         "name": name,
                         "role": role["id"],
                         "status": "active",
-                        "tags": [tag["id"]],
+                        "tags": [tag["id"], discovered["id"]],
                         "custom_fields": fields,
                     },
                 )
@@ -216,8 +246,13 @@ class NetBoxDiscovery:
             data.pop("serial", None)
         if any(current["custom_fields"].get(key) != value for key, value in fields.items()):
             data["custom_fields"] = fields
-        if all(existing["id"] != tag["id"] for existing in current["tags"]):
-            data["add_tags"] = [tag["id"]]
+        tag_ids = [tag["id"]]
+        if current["role"]["slug"] == LEGACY_DISCOVERY_ROLE:
+            data["role"] = self.named_object("dcim/device-roles/", discovery_role(facts))["id"]
+            tag_ids.append(self.named_object("extras/tags/", DISCOVERED_TAG)["id"])
+        existing_tags = {existing["id"] for existing in current["tags"]}
+        if missing_tags := [tag_id for tag_id in tag_ids if tag_id not in existing_tags]:
+            data["add_tags"] = missing_tags
         if data:
             self.request("PATCH", f"{path}{current['id']}/", json=data)
         return ("updated" if data else "unchanged"), current["id"]
