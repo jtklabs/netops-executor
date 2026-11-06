@@ -531,3 +531,33 @@ def test_discovery_configuration_and_required_identity(client, settings, store, 
     assert state["status"] == "failed"
     assert state["result"]["discovery"]["netbox"]["status"] == "failed"
     assert "enough identity" in state["result"]["discovery"]["netbox"]["error"]
+
+
+@pytest.mark.parametrize(("suffix", "version_scalar"), [("", True), (".0", True), ("", False)])
+def test_opengear_discovery_reads_serial_and_appliance_firmware(
+    client, settings, store, monkeypatch, suffix, version_scalar
+):
+    from netops_executor.snmp_identity import SYS_DESCR, SYS_NAME, SYS_OBJECT_ID
+
+    settings.netbox_url = "https://netbox.example"
+    settings.netbox_token = "x" * 40
+    settings.poller_instance = "lab"
+    response = client.post("/api/v1/snmp/walks", json={"device_ip": "192.0.2.15", "site": "Lab"})
+    assert response.status_code == 202
+    values = {
+        SYS_NAME: rfc1902.OctetString("IM7248-2-DAC"),
+        SYS_OBJECT_ID: rfc1902.ObjectName("1.3.6.1.4.1.25049.1.61"),
+        SYS_DESCR: rfc1902.OctetString(
+            "Opengear IM7248-2-DAC, Linux 5.17.0-ac0 armv5tel, OpenGear/IM72xx Version 5.5.3"
+        ),
+        "1.3.6.1.4.1.25049.17.1.2" + suffix: rfc1902.OctetString("TEST-SERIAL"),
+    }
+    if version_scalar:
+        values["1.3.6.1.4.1.25049.17.1.1" + suffix] = rfc1902.OctetString("5.5.3 1954d326 ()")
+    FakeAgent(monkeypatch, values)
+    monkeypatch.setattr(snmp, "sync_device", lambda *_: ("created", 42))
+    process(settings, store, store.claim("worker"), "worker")
+    job = store.get(response.json()["id"])
+    assert job["status"] == "succeeded"
+    assert job["result"]["discovery"]["serial"] == "TEST-SERIAL"
+    assert job["result"]["discovery"]["software_version"] == "5.5.3"

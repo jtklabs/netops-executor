@@ -72,9 +72,11 @@ VENDORS = {
     ),
     25049: Vendor(
         "Opengear",
-        serial=("25049.17.1.2.0",),  # OG-STATUSv2-MIB::ogSerialNumber
+        # IM7200 firmware 5.5.3 serves ogSerialNumber at the bare OID.
+        serial=("25049.17.1.2.0", "25049.17.1.2"),
+        version=("25049.17.1.1.0", "25049.17.1.1"),
         model_pattern=r"\bOpengear(?:\s+Inc\.?)?\s+([A-Z]{2}\d[\w-]*)",
-        version_pattern=r"\b([0-9]+\.[0-9]+\.[0-9]+)\b",
+        version_pattern=r"\bversion\s+([0-9][\w.-]*)",
     ),
 }
 
@@ -136,6 +138,8 @@ async def collect_identity(get, chassis_index, first_value):
     build = fallback.get(ENTERPRISE + vendor.build)
     if version and build and build != "0":
         version = f"{version}-{build}"
+    if vendor.manufacturer == "Opengear" and version:
+        version = version.split(maxsplit=1)[0]
     if vendor.manufacturer == "Fortinet" and version:
         version = extract(VERSION, version) or version
     if enterprise == "14823" and "clearpass" in description.casefold():
