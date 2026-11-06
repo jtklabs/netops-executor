@@ -16,6 +16,7 @@ VERSION = r"\bversion[:\s]+([0-9][\w.()/-]*)|\bv([0-9]+\.[0-9][\w.()/-]*)"
 @dataclass(frozen=True)
 class Vendor:
     manufacturer: str
+    platform: str = ""
     serial: tuple[str, ...] = ()
     model: tuple[str, ...] = ()
     version: tuple[str, ...] = ()
@@ -29,7 +30,7 @@ VENDORS = {
     9: Vendor("Cisco"),
     11: Vendor("HPE"),
     14179: Vendor("Cisco"),
-    30065: Vendor("Arista"),
+    30065: Vendor("Arista", platform="Arista EOS"),
     14823: Vendor(
         "HPE",
         serial=("14823.2.2.1.2.1.11.0",),
@@ -39,12 +40,14 @@ VENDORS = {
     ),
     2636: Vendor(
         "Juniper",
+        platform="Junos",
         serial=("2636.3.1.3.0", "2636.3.1.8.1.7.1.1.0.0", "2636.3.1.8.1.7.1.0.0.0"),
         model=("2636.3.1.2.0",),
         version_pattern=r"\bJUNOS\s+([0-9][\w.-]*)",
     ),
     25461: Vendor(
         "Palo Alto Networks",
+        platform="PAN-OS",
         serial=("25461.2.1.2.1.3.0",),
         version=("25461.2.1.2.1.1.0",),
         model_pattern=r"\b((?:PA|VM|M)-[\w-]+)",
@@ -65,6 +68,7 @@ VENDORS = {
     ),
     7779: Vendor(
         "Infoblox",
+        platform="Infoblox NIOS",
         serial=("7779.3.1.1.2.1.6.0",),
         model=("7779.3.1.1.2.1.4.0",),
         version=("7779.3.1.1.2.1.7.0",),
@@ -72,6 +76,7 @@ VENDORS = {
     ),
     25049: Vendor(
         "Opengear",
+        platform="Opengear",
         # IM7200 firmware 5.5.3 serves ogSerialNumber at the bare OID.
         serial=("25049.17.1.2.0", "25049.17.1.2"),
         version=("25049.17.1.1.0", "25049.17.1.1"),
@@ -79,6 +84,35 @@ VENDORS = {
         version_pattern=r"\bversion\s+([0-9][\w.-]*)",
     ),
 }
+
+# Use the platform names already consumed by the NetBox inventory and standards tools.
+PLATFORM_HINTS = {
+    "Cisco": (
+        (r"\bNX[- ]?OS\b", "Cisco NX-OS"),
+        (r"(?:\b|_)IOS[- ]?XE\b", "Cisco IOS-XE"),
+        (r"(?:\b|_)IOS[- ]?XR\b", "Cisco IOS-XR"),
+        (r"Adaptive Security Appliance|\bASA Software\b", "Cisco ASA"),
+        (r"\bIOS\b", "Cisco IOS"),
+    ),
+    "HPE": (
+        (r"\bArubaOS[- ]?CX\b", "ArubaOS-CX"),
+        (r"\bClearPass\b", "Aruba ClearPass"),
+        (r"\bArubaOS\b", "ArubaOS"),
+    ),
+    "Fortinet": (
+        (r"\bFortiManager\b", "FortiManager"),
+        (r"\bFortiAnalyzer\b", "FortiAnalyzer"),
+        (r"\b(?:FortiGate|FortiOS)\b", "FortiOS"),
+    ),
+    "F5": ((r"\bBIG-IP\b", "F5 TMOS"),),
+}
+
+
+def platform_for(vendor, description, model):
+    for pattern, platform in PLATFORM_HINTS.get(vendor.manufacturer, ()):
+        if re.search(pattern, f"{description}\n{model}", re.IGNORECASE):
+            return platform
+    return vendor.platform
 
 
 def text(value):
@@ -151,6 +185,7 @@ async def collect_identity(get, chassis_index, first_value):
         "name": system.get(SYS_NAME, "").rstrip("."),
         "manufacturer": vendor.manufacturer or chassis.get("manufacturer", ""),
         "model": model,
+        "platform": platform_for(vendor, description, model),
         "serial": serial,
         "software_version": version or extract(VERSION, description) or chassis.get("software_version", ""),
     }

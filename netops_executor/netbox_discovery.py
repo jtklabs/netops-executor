@@ -209,6 +209,8 @@ class NetBoxDiscovery:
             data["serial"] = facts["serial"]
         if facts["software_version"]:
             fields[SOFTWARE_VERSION] = facts["software_version"]
+        if (current is None or not current.get("platform")) and (platform := facts.get("platform")):
+            data["platform"] = self.named_object("dcim/platforms/", platform)["id"]
         if current is None:
             role = self.named_object("dcim/device-roles/", discovery_role(facts))
             discovered = self.named_object("extras/tags/", DISCOVERED_TAG)
@@ -239,6 +241,8 @@ class NetBoxDiscovery:
                             "NetBox already has this name at the site with a different address"
                         ) from None
                     raise
+        if current.get("platform"):
+            data.pop("platform", None)
         for field in ("device_type", "site"):
             if data[field] == current[field]["id"]:
                 del data[field]

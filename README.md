@@ -2230,13 +2230,15 @@ The next poll moves devices with the old `SNMP discovered` role to this scheme.
 For other existing devices, discovery preserves their assigned role and adds
 only the poller tag. The name `discovered` is reserved for discovery provenance.
 Serial numbers go in the native serial field and running versions in
-the `software_version` custom field. The executor records the polled address
+the `software_version` custom field. Discovery fills an unset NetBox platform
+when it identifies the OS family, such as Cisco IOS, Cisco IOS-XE, or Cisco NX-OS.
+It preserves an existing platform assignment. The executor records the polled address
 without guessing a subnet, VRF, or management interface. NetBox requires unique
 device names within each site and tenant, so a different IP with the same
 name in that scope reports a conflict.
 
 The token needs view/add access for sites, manufacturers, device types,
-device roles, tags, and device custom fields, plus view/add/change access
+device roles, platforms, tags, and device custom fields, plus view/add/change access
 for devices. `result.discovery` reports the collected facts, missing fields,
 and whether NetBox created, updated, or already had the device. Name,
 manufacturer, and model are required to write a device. If the agent omits a

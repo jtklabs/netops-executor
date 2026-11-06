@@ -22,6 +22,7 @@ def test_discovery_marks_new_and_legacy_devices_but_preserves_manual_provenance(
         "dcim/manufacturers": [{"id": 3, "name": "Cisco", "slug": "cisco"}],
         "dcim/device-types": [{"id": 4, "model": "Catalyst 9300-48P", "part_number": "C9300-48P"}],
         "dcim/device-roles": [{"id": 5, "name": "Switch", "slug": "switch"}],
+        "dcim/platforms": [{"id": 9, "name": "Cisco IOS-XE", "slug": "cisco-ios-xe"}],
         "dcim/devices": [
             {
                 "id": id_,
@@ -30,6 +31,7 @@ def test_discovery_marks_new_and_legacy_devices_but_preserves_manual_provenance(
                 "site": {"id": 1},
                 "device_type": {"id": 4},
                 "role": {"slug": previous_role},
+                "platform": {"id": 12} if previous_role == "core-switch" else None,
                 "custom_fields": {
                     "snmp_discovery_ip": address,
                     "software_version": "17.9.5",
@@ -53,6 +55,7 @@ def test_discovery_marks_new_and_legacy_devices_but_preserves_manual_provenance(
         "name": "Switch",
         "manufacturer": "Cisco",
         "model": "C9300-48P",
+        "platform": "Cisco IOS-XE",
         "serial": "",
         "software_version": "",
     }
@@ -64,12 +67,14 @@ def test_discovery_marks_new_and_legacy_devices_but_preserves_manual_provenance(
         assert result == ("created", 11)
         method, path, data = calls.pop()
         assert (method, path) == ("POST", "dcim/devices")
-        assert data["role"] == 5 and data["tags"] == [7, 8]
+        assert data["role"] == 5 and data["platform"] == 9 and data["tags"] == [7, 8]
         assert not calls
     else:
         assert result == ("updated", 11)
         expected = (
-            {"role": 5, "add_tags": [7, 8]} if previous_role == "snmp-discovered" else {"add_tags": [7]}
+            {"role": 5, "platform": 9, "add_tags": [7, 8]}
+            if previous_role == "snmp-discovered"
+            else {"add_tags": [7]}
         )
         assert calls == [("PATCH", "dcim/devices/11", expected)]
 

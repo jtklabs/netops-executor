@@ -561,3 +561,21 @@ def test_opengear_discovery_reads_serial_and_appliance_firmware(
     assert job["status"] == "succeeded"
     assert job["result"]["discovery"]["serial"] == "TEST-SERIAL"
     assert job["result"]["discovery"]["software_version"] == "5.5.3"
+    assert job["result"]["discovery"]["platform"] == "Opengear"
+
+
+@pytest.mark.parametrize(
+    ("description", "platform"),
+    [
+        ("Cisco IOS Software, C2960 Software, Version 15.2(7)E", "Cisco IOS"),
+        ("Cisco IOS XE Software, Version 17.09.05", "Cisco IOS-XE"),
+        ("Cisco IOS Software, Catalyst L3 Switch Software (CAT9K_IOSXE)", "Cisco IOS-XE"),
+        ("Cisco Nexus Operating System (NX-OS) Software, version 10.4(3)", "Cisco NX-OS"),
+        ("Cisco IOS XR Software, Version 7.9.2", "Cisco IOS-XR"),
+        ("Cisco Network Appliance", ""),
+    ],
+)
+def test_cisco_platform_uses_the_os_family_reported_by_snmp(description, platform):
+    from netops_executor.snmp_identity import VENDORS, platform_for
+
+    assert platform_for(VENDORS[9], description, "") == platform
