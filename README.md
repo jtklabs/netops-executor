@@ -2192,7 +2192,7 @@ is true **and** `has_more` is false. Empty live pages require continued polling.
 Octet strings are base64; integers/counters and other textual values are strings
 to preserve precision. IP addresses are dotted text.
 
-Bounds: up to 64 roots and 256 GET OIDs (at least one OID); port 161 default; per-request timeout 2 seconds (0.1–30),
+Bounds: up to 64 roots and 256 GET OIDs (at least one OID for a plain walk); port 161 default; per-request timeout 2 seconds (0.1–30),
 retries 1 (0–5); job timeout 300 seconds (1–3600); maximum rows 10000
 (1–100000). A fixed 16 MiB result limit also applies. Limits/timeouts fail the job
 with partial results retained. Authentication fallback is allowed before a root
@@ -2201,6 +2201,42 @@ produces data; partial roots are never replayed with another identity.
 Walks to the same IP/port serialize; SNMP reads may overlap upgrades and observe
 transitional state. Stale SNMP workers fail and release their read reservations.
 Cancellation retains committed rows. Job/result retention is manual.
+
+### Basic NetBox discovery
+
+Supply a site in the same job to collect device identity and sync it to NetBox.
+The executor makes the identity reads automatically. Any requested walk or GET
+results are still available through the usual endpoints.
+
+```json
+{"device_ip":"192.0.2.10","site":"Sydney","poller_instance":"checkmk-au"}
+```
+
+Set `NETOPS_NETBOX_URL` to the base NetBox URL (without `/api/`) and set
+`NETOPS_NETBOX_TOKEN` to a write-enabled API token. Use HTTPS for remote URLs.
+Set `NETOPS_NETBOX_CA_FILE` if the executor needs a private CA.
+`NETOPS_POLLER_INSTANCE` supplies the default when the request omits
+`poller_instance`. Native Ansible installs can set these in
+`executor_environment`. The URL and token are executor settings.
+
+NetBox looks up the device by its reported name and polled IP, using the
+`snmp_discovery_ip` custom field or an existing matching primary IP. The
+executor creates missing sites and poller tags, reuses a matching manufacturer
+and model or part number from the device type catalog, and creates a basic
+device type when no match exists. New devices receive the `SNMP discovered`
+role. Serial numbers go in the native serial field and running versions in
+the `software_version` custom field. The executor records the polled address
+without guessing a subnet, VRF, or management interface. NetBox requires unique
+device names within each site and tenant, so a different IP with the same
+name in that scope reports a conflict.
+
+The token needs view/add access for sites, manufacturers, device types,
+device roles, tags, and device custom fields, plus view/add/change access
+for devices. `result.discovery` reports the collected facts, missing fields,
+and whether NetBox created, updated, or already had the device. Name,
+manufacturer, and model are required to write a device. If the agent omits a
+serial number or software version, the job records a warning and preserves
+any existing value. A failed NetBox sync leaves the SNMP results available.
 
 ## Deployment and CLI
 

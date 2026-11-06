@@ -469,3 +469,65 @@ def test_bulk_rejected_by_report_falls_back(client, settings, store, monkeypatch
     assert state["status"] == "succeeded" and len(walked(store, job)) == 2
     assert agent.kinds() == ["bulk", "next", "next", "next"]
     assert state["result"]["walk"]["fallbacks"][0]["reason"] == "unsupported"
+
+
+@pytest.mark.parametrize("serial, expected", [("SN-001", "succeeded"), ("", "completed_with_warnings")])
+def test_discovery_collects_identity_and_syncs(client, settings, store, monkeypatch, serial, expected):
+    from netops_executor.snmp_identity import ENTITY, SYS_DESCR, SYS_NAME, SYS_OBJECT_ID
+
+    settings.netbox_url = "https://netbox.example"
+    settings.netbox_token = "x" * 40
+    settings.poller_instance = "checkmk-us"
+    response = client.post("/api/v1/snmp/walks", json={"device_ip": "192.0.2.15", "site": " Lab "})
+    assert response.status_code == 202, response.text
+    job = response.json()
+    assert job["request"]["poller_instance"] == "checkmk-us"
+    FakeAgent(
+        monkeypatch,
+        {
+            SYS_NAME: rfc1902.OctetString("lab-switch."),
+            SYS_DESCR: rfc1902.OctetString("Cisco IOS XE Software, Version 17.09.05"),
+            SYS_OBJECT_ID: rfc1902.ObjectName("1.3.6.1.4.1.9.1.1"),
+            f"{ENTITY}.5.1": rfc1902.Integer32(9),
+            f"{ENTITY}.5.2": rfc1902.Integer32(3),
+            f"{ENTITY}.11.1": rfc1902.OctetString("MODULE-001"),
+            f"{ENTITY}.11.2": rfc1902.OctetString(serial),
+            f"{ENTITY}.13.2": rfc1902.OctetString("C9300-48P"),
+        },
+    )
+    seen = []
+
+    def sync(_settings, site, poller, address, facts, checkpoint):
+        checkpoint()
+        seen.append(
+            (site, poller, address, facts["name"], facts["model"], facts["serial"], facts["software_version"])
+        )
+        return "created", 42
+
+    monkeypatch.setattr(snmp, "sync_device", sync)
+    process(settings, store, store.claim("worker"), "worker")
+    state = store.get(job["id"])
+    assert state["status"] == expected
+    assert seen == [("Lab", "checkmk-us", "192.0.2.15", "lab-switch", "C9300-48P", serial, "17.09.05")]
+    assert state["result"]["discovery"]["missing"] == ([] if serial else ["serial"])
+    assert state["result"]["discovery"]["netbox"] == {"status": "created", "device_id": 42}
+    assert state["result"]["rows"] == 0
+
+
+def test_discovery_configuration_and_required_identity(client, settings, store, monkeypatch):
+    from netops_executor.snmp_identity import SYS_NAME
+
+    path = "/api/v1/snmp/walks"
+    body = {"device_ip": "192.0.2.15", "site": "Lab"}
+    assert client.post(path, json=body).status_code == 422
+    settings.netbox_url = "https://netbox.example"
+    settings.netbox_token = "x" * 40
+    assert client.post(path, json=body).status_code == 422
+    response = client.post(path, json={**body, "poller_instance": "checkmk-au"})
+    assert response.status_code == 202
+    FakeAgent(monkeypatch, {SYS_NAME: rfc1902.OctetString("lab-switch")})
+    process(settings, store, store.claim("worker"), "worker")
+    state = store.get(response.json()["id"])
+    assert state["status"] == "failed"
+    assert state["result"]["discovery"]["netbox"]["status"] == "failed"
+    assert "enough identity" in state["result"]["discovery"]["netbox"]["error"]

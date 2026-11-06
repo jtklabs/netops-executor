@@ -9,6 +9,9 @@ from .models import Model, Name, ScheduledRequest
 EnvName = Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$", max_length=128)]
 
 
+PollerInstance = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,79}$")]
+
+
 class SnmpProfile(Model):
     id: Name
     username: str = Field(min_length=1, max_length=32)
@@ -49,6 +52,19 @@ def numeric_oid_list(values):
 
 class SnmpWalkRequest(ScheduledRequest):
     device_ip: IPvAnyAddress
+    site: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=r"^[^\x00-\x1f\x7f]+$",
+        description="NetBox site name. Supplying a site enables basic device discovery and sync.",
+        examples=["Sydney"],
+    )
+    poller_instance: PollerInstance | None = Field(
+        default=None,
+        description="Collecting instance tag. Defaults to the executor's configured instance.",
+        examples=["checkmk-au"],
+    )
     oids: list[str] = Field(
         default_factory=list,
         max_length=64,
@@ -81,9 +97,16 @@ class SnmpWalkRequest(ScheduledRequest):
     def select_profiles(self):
         if self.profile and self.credential_profiles:
             raise ValueError("use profile or credential_profiles, not both")
-        if not self.oids and not self.get_oids:
-            raise ValueError("request at least one OID in oids or get_oids")
+        if self.poller_instance and not self.site:
+            raise ValueError("poller_instance requires a site")
+        if not self.site and not self.oids and not self.get_oids:
+            raise ValueError("request a site for discovery or at least one OID in oids or get_oids")
         return self
+
+    @field_validator("site", mode="before")
+    @classmethod
+    def strip_site(cls, value):
+        return value.strip() if isinstance(value, str) else value
 
     @field_validator("device_ip")
     @classmethod

@@ -8,11 +8,11 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
-from pydantic import Field, model_validator
+from pydantic import Field, TypeAdapter, model_validator
 
 from .models import Model, Name
 from .platforms import DeviceType
-from .snmp_models import SnmpProfile
+from .snmp_models import PollerInstance, SnmpProfile
 
 
 def env(name, default=None):
@@ -101,6 +101,10 @@ class Settings:
     webhook_ca_file: Path | None = None
     # SNMP rows included in a walk's webhook; the rest are read from the results endpoint.
     webhook_max_rows: int = 10000
+    netbox_url: str | None = None
+    netbox_token: str | None = field(default=None, repr=False)
+    netbox_ca_file: Path | None = None
+    poller_instance: str | None = None
 
     def device(self, identifier):
         if identifier in self.devices:
@@ -137,6 +141,20 @@ class Settings:
             if len({p.id for p in profiles}) != len(profiles):
                 raise ValueError("duplicate SNMP profile IDs")
             result.snmp_profiles = {p.id: p for p in profiles}
+        result.netbox_url = env("NETOPS_NETBOX_URL") or None
+        result.netbox_token = env("NETOPS_NETBOX_TOKEN") or None
+        if result.netbox_url:
+            result.netbox_url = webhook_url(result.netbox_url, "NETOPS_NETBOX_URL").rstrip("/")
+            if urlsplit(result.netbox_url).query or not re.fullmatch(
+                r"[!-~]{16,}", result.netbox_token or ""
+            ):
+                raise ValueError("NetBox needs a URL without a query and a valid NETOPS_NETBOX_TOKEN")
+        if env("NETOPS_NETBOX_CA_FILE"):
+            result.netbox_ca_file = Path(env("NETOPS_NETBOX_CA_FILE"))
+        if env("NETOPS_POLLER_INSTANCE"):
+            result.poller_instance = TypeAdapter(PollerInstance).validate_python(
+                env("NETOPS_POLLER_INSTANCE")
+            )
         result.root_path = env("NETOPS_ROOT_PATH", "").rstrip("/")
         if result.root_path and not re.fullmatch(r"(?:/[A-Za-z0-9._~-]+)+", result.root_path):
             raise ValueError("NETOPS_ROOT_PATH must be a path such as /netops-executor")
@@ -197,8 +215,8 @@ class Settings:
         return result
 
 
-def webhook_url(url):
-    """Job results go to the webhook, so require HTTPS except to this host."""
+def webhook_url(url, variable="NETOPS_WEBHOOK_URL"):
+    """Require HTTPS for outbound integrations except to this host."""
     parsed = urlsplit(url)
     try:
         loopback = parsed.hostname == "localhost" or ip_address(parsed.hostname or "").is_loopback
@@ -211,7 +229,7 @@ def webhook_url(url):
         or parsed.password
         or parsed.fragment
     ):
-        raise ValueError("NETOPS_WEBHOOK_URL must be an HTTPS URL without credentials or fragment")
+        raise ValueError(f"{variable} must be an HTTPS URL without credentials or fragment")
     return url
 
 

@@ -5,10 +5,13 @@ import base64
 import json
 import os
 
+import httpx
 from pysnmp.hlapi.v3arch import asyncio as snmp
 from pysnmp.proto import rfc1902, rfc1905
 
 from .credentials import AuthenticationRejected, Selector, Vault
+from .netbox_discovery import SyncError, sync_device
+from .snmp_identity import ENTITY_CLASS, collect_identity, text
 from .snmp_models import SnmpWalkRequest
 from .store import CancelRequested, LostOwnership
 
@@ -122,9 +125,12 @@ class SnmpRunner:
         try:
             self.record("snmp_started")
             asyncio.run(self.walk())
-            success = all(r["status"] in ("succeeded", "missing") for r in self.items())
+            success = not self.result.get("error") and self.reads_succeeded()
+            status = "succeeded" if success else "failed"
+            if self.request.site and success:
+                status = self.sync_inventory()
             self.record("snmp_finished")
-            self.store.finish(self.job["id"], self.worker, "succeeded" if success else "failed")
+            self.store.finish(self.job["id"], self.worker, status)
         except LostOwnership:
             return
         except CancelRequested:
@@ -226,6 +232,11 @@ class SnmpRunner:
                     except (WalkError, AuthenticationRejected) as exc:
                         item.update(status="failed", error=str(exc))
                     self.record("snmp_oid_finished")
+                if self.request.site and self.reads_succeeded():
+                    try:
+                        await authenticated(lambda a, ctx: self.read_inventory(engine, a, target, ctx))
+                    except (WalkError, AuthenticationRejected) as exc:
+                        self.result["error"] = str(exc)
         except TimeoutError:
             self.result["error"] = "job timeout exceeded"
         finally:
@@ -236,6 +247,109 @@ class SnmpRunner:
                     status="failed" if item["status"] == "running" else "skipped",
                     error=self.result.get("error", "job result limit reached"),
                 )
+
+    def reads_succeeded(self):
+        return all(item["status"] in ("succeeded", "missing") for item in self.items())
+
+    async def read_inventory(self, engine, auth, target, context):
+        inventory = {}
+
+        async def get(oids):
+            if not oids:
+                return {}
+            values = await self.get(engine, auth, target, context, oids, produced=bool(inventory))
+            if any(value is not None for _, value in values):
+                self.audit_credential([inventory])
+            return {str(oid): text(value) for oid, value in values}
+
+        async def first_value(root, expected=None):
+            current = rfc1902.ObjectName(root)
+            prefix = current
+            # ENTITY-MIB chassis rows normally appear early. Bound the work on
+            # devices that expose only ports/modules or a malformed table.
+            remaining = 256
+            while remaining:
+                kind = "bulk" if expected is not None and self.repetitions else "next"
+                indication, status, index, bindings = await self.send(
+                    engine, auth, target, context, kind, [current]
+                )
+                try:
+                    failure = self.check(indication, status, index, produced=bool(inventory))
+                except WalkError:
+                    return ""
+                if failure:
+                    if kind == "bulk" and self.degrade(failure[0], root):
+                        continue
+                    return ""
+                if not bindings:
+                    return ""
+                for oid, value in bindings[:remaining]:
+                    if (
+                        value is None
+                        or isinstance(value, MISSING)
+                        or oid <= current
+                        or not prefix.isPrefixOf(oid)
+                    ):
+                        return ""
+                    self.audit_credential([inventory])
+                    if expected is None:
+                        return text(value)
+                    if text(value) == expected:
+                        return str(oid).rsplit(".", 1)[-1]
+                    current = oid
+                    remaining -= 1
+            return ""
+
+        async def chassis_index():
+            return await first_value(ENTITY_CLASS, expected="3")
+
+        facts = await collect_identity(get, chassis_index, first_value)
+        self.result["discovery"] = {
+            **facts,
+            "address": str(self.request.device_ip),
+            "site": self.request.site,
+            "poller_instance": self.request.poller_instance,
+        }
+
+    def sync_inventory(self):
+        discovery = self.result["discovery"]
+        missing = [
+            field
+            for field in ("name", "manufacturer", "model", "serial", "software_version")
+            if not discovery[field]
+        ]
+        discovery["missing"] = missing
+
+        def checkpoint():
+            self.store.checkpoint(self.job["id"], self.worker)
+
+        try:
+            if any(field in missing for field in ("name", "manufacturer", "model")):
+                raise SyncError("SNMP did not report enough identity to create a device")
+            action, device_id = sync_device(
+                self.settings,
+                discovery["site"],
+                discovery["poller_instance"],
+                discovery["address"],
+                discovery,
+                checkpoint,
+            )
+        except SyncError as error:
+            discovery["netbox"] = {"status": "failed", "error": str(error)}
+        except httpx.HTTPStatusError as error:
+            discovery["netbox"] = {
+                "status": "failed",
+                "error": f"NetBox returned HTTP {error.response.status_code} for {error.request.method} {error.request.url.path}",
+            }
+        except (httpx.RequestError, OSError, ValueError, TypeError, KeyError):
+            discovery["netbox"] = {
+                "status": "failed",
+                "error": "Could not read or write the configured NetBox API",
+            }
+        else:
+            discovery["netbox"] = {"status": action, "device_id": device_id}
+            return "completed_with_warnings" if missing else "succeeded"
+        return "failed"
 
     def audit_credential(self, items):
         # Record the vault profile once an operation's first data is committed.

@@ -457,8 +457,19 @@ def create_app(settings=None):
             and not any(p["id"] == request.profile and p["kind"] == "snmp" for p in vault.list())
         ):
             raise HTTPException(422, "unknown SNMP v3 profile")
+        payload = request.model_dump(mode="json")
+        if request.site:
+            if not settings.netbox_url or not settings.netbox_token:
+                raise HTTPException(422, "NetBox SNMP discovery is not configured on this executor")
+            instance = request.poller_instance or settings.poller_instance
+            if not instance:
+                raise HTTPException(422, "supply poller_instance or configure NETOPS_POLLER_INSTANCE")
+            payload["poller_instance"] = instance
+        else:
+            # Preserve saved requests and idempotency for ordinary walks.
+            del payload["site"], payload["poller_instance"]
         return store.submit(
-            request.model_dump(mode="json"),
+            payload,
             f"snmp:{request.device_ip}:{request.port}",
             idempotency_key,
             kind="snmp_walk",
