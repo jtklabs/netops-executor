@@ -13,10 +13,22 @@ SOFTWARE_VERSION = "software_version"
 SOFTWARE_REPORT = "plugins/refresh/device-software/report/"
 DISCOVERED_TAG = "discovered"
 LEGACY_DISCOVERY_ROLE = "snmp-discovered"
+WIRELESS_CONTROLLER = "wireless_controller"
+ACCESS_POINT_ROLE = "Wireless AP"
 
+# Platforms that only ever run one kind of appliance.
+ROLE_PLATFORMS = {
+    "aruba clearpass": "Network Access Control",
+    "infoblox nios": "DNS/DHCP",
+    "sgos": "Proxy",
+}
 # Only infer a role for product families that identify a device function.
 ROLE_MODELS = {
     "arista": ((r"DCS-", "Switch"),),
+    # Quantum and numbered appliances are gateways; Smart-1 management servers are not.
+    "check point": (
+        (r"(?:Check Point\s+)?(?:Quantum\s+(?:Spark|Force|Lightspeed)?\s*)?\d{4,5}\b", "Firewall"),
+    ),
     "cisco": (
         (r"(?:WS-C|C(?:atalyst[ -]+)?9[23456]\d{2}|N[235679]K-|Nexus\b)", "Switch"),
         (r"(?:ASR|ISR|CSR)\b|(?:ASR|ISR|CSR)\d|C(?:atalyst[ -]+)?8[235]\d{2}", "Router"),
@@ -24,6 +36,11 @@ ROLE_MODELS = {
     ),
     "f5": ((r"BIG[- ]?IP\b", "Load Balancer"),),
     "fortinet": ((r"FortiGate\b|FG-", "Firewall"), (r"FortiSwitch\b|FS-", "Switch")),
+    # Aruba Mobility controllers (70xx, 72xx, 90xx, 92xx) and Mobility Conductors.
+    "hpe": (
+        (r"(?:Aruba\s*|A)?(?:7[02]\d{2}|9[0-2]\d{2})(?:XM)?\b|MM-(?:HW|VA)", "Wireless Controller"),
+        (r"(?:Aruba\s*)?AP-\d", ACCESS_POINT_ROLE),
+    ),
     "juniper": (
         (r"(?:EX|QFX)[ -]?\d", "Switch"),
         (r"(?:MX|PTX|ACX)[ -]?\d", "Router"),
@@ -48,6 +65,8 @@ def model_key(value):
 
 
 def discovery_role(facts):
+    if role := ROLE_PLATFORMS.get((facts.get("platform") or "").casefold()):
+        return role
     for pattern, role in ROLE_MODELS.get(facts["manufacturer"].casefold(), ()):
         if re.match(pattern, facts["model"], re.IGNORECASE):
             return role
@@ -120,21 +139,29 @@ class NetBoxDiscovery:
             raise SyncError("NetBox names need at least one letter or digit usable in a slug")
         return self.ensure(path, lambda: self.named(path, name), {"name": name, "slug": slug})
 
-    def custom_field(self, name, label, description):
+    def custom_field(self, name, label, description, kind="text"):
         path = "extras/custom-fields/"
+        data = {
+            "object_types": ["dcim.device"],
+            "name": name,
+            "label": label,
+            "type": kind,
+            "description": description,
+        }
+        if kind == "object":
+            data["related_object_type"] = "dcim.device"
         field = self.ensure(
             path,
             lambda: next((row for row in self.records(path, name=name) if row["name"] == name), None),
-            {
-                "object_types": ["dcim.device"],
-                "name": name,
-                "label": label,
-                "type": "text",
-                "description": description,
-            },
+            data,
         )
-        if field["type"]["value"] != "text" or "dcim.device" not in field["object_types"]:
-            raise SyncError(f"NetBox custom field {name} must be a device text field")
+        if (
+            field["type"]["value"] != kind
+            or "dcim.device" not in field["object_types"]
+            or (kind == "object" and field.get("related_object_type") != "dcim.device")
+        ):
+            noun = "device object" if kind == "object" else "device text"
+            raise SyncError(f"NetBox custom field {name} must be a {noun} field")
 
     def device_type(self, manufacturer, model):
         path = "dcim/device-types/"
@@ -211,7 +238,178 @@ class NetBoxDiscovery:
                 facts["stack_inventory"] = {"status": "failed", "error": "Could not sync the NetBox stack"}
         if facts["software_version"] and (device.get("platform") or facts.get("platform")):
             facts["software_inventory"] = self.report_software(device["id"], facts)
+        if facts.get("access_points") is not None:
+            try:
+                facts["access_point_inventory"] = self.sync_access_points(device, poller, facts)
+            except SyncError as error:
+                facts["access_point_inventory"] = {"status": "failed", "error": str(error)}
+            except httpx.HTTPStatusError as error:
+                facts["access_point_inventory"] = {
+                    "status": "failed",
+                    "error": f"NetBox access point sync returned HTTP {error.response.status_code}",
+                }
+            except (httpx.RequestError, OSError, ValueError, TypeError, KeyError):
+                facts["access_point_inventory"] = {
+                    "status": "failed",
+                    "error": "Could not sync the controller's access points",
+                }
         return action, device["id"]
+
+    def sync_access_points(self, controller, poller, facts):
+        """Create or update one device per AP the controller reports.
+
+        A new AP starts at the controller's site, because nothing in the AP
+        table says where it hangs; a later move by hand is kept. APs the
+        controller stops reporting are left alone, like stack members.
+        """
+        self.custom_field(
+            WIRELESS_CONTROLLER,
+            "Wireless controller",
+            "Controller that last reported this access point to NetOps Executor.",
+            kind="object",
+        )
+        manufacturer = self.named_object("dcim/manufacturers/", facts["manufacturer"])
+        platform = (controller.get("platform") or {}).get("id")
+        if not platform and facts.get("platform"):
+            platform = self.named_object("dcim/platforms/", facts["platform"])["id"]
+        defaults = {
+            "site": controller["site"]["id"],
+            "tenant": (controller.get("tenant") or {}).get("id"),
+            "role": self.named_object("dcim/device-roles/", ACCESS_POINT_ROLE)["id"],
+            "platform": platform,
+            "tags": [
+                self.named_object("extras/tags/", poller, poller)["id"],
+                self.named_object("extras/tags/", DISCOVERED_TAG)["id"],
+            ],
+        }
+        device_types = {}
+        results, skipped = [], 0
+        for access_point in facts["access_points"]:
+            if not access_point["up"] and not access_point["serial"]:
+                # Down and never reported a serial: a stale controller entry, not hardware.
+                skipped += 1
+                continue
+            name = (access_point["name"] or access_point["mac_address"].replace(":", ""))[:64]
+            try:
+                if not access_point["model"]:
+                    raise SyncError(f"Access point {name} has no model in the controller table")
+                if access_point["model"] not in device_types:
+                    device_types[access_point["model"]] = self.device_type(
+                        manufacturer, access_point["model"]
+                    )
+                results.append(
+                    self.sync_access_point(
+                        controller, facts, access_point, name, device_types[access_point["model"]], defaults
+                    )
+                )
+            except SyncError as error:
+                results.append({"name": name, "status": "failed", "error": str(error)})
+            except httpx.HTTPStatusError as error:
+                results.append(
+                    {
+                        "name": name,
+                        "status": "failed",
+                        "error": f"NetBox returned HTTP {error.response.status_code} for this access point",
+                    }
+                )
+        failed = any(
+            row["status"] == "failed" or row.get("software_inventory", {}).get("status") == "failed"
+            for row in results
+        )
+        return {
+            "status": "warning" if failed else "synced",
+            "controller_id": controller["id"],
+            "reported": len(facts["access_points"]),
+            "skipped": skipped,
+            "access_points": results,
+        }
+
+    def sync_access_point(self, controller, facts, access_point, name, device_type, defaults):
+        path = "dcim/devices/"
+        serial = access_point["serial"]
+        version = access_point["software_version"] or facts["software_version"]
+
+        def by_serial():
+            if not serial:
+                return None
+            matches = [
+                row
+                for row in self.records(path, serial=serial)
+                if (row["serial"] or "").casefold() == serial.casefold()
+            ]
+            if len(matches) > 1:
+                raise SyncError(f"Access point {name} serial matches multiple NetBox devices")
+            return matches[0] if matches else None
+
+        def by_name():
+            for row in self.records(path, name__ie=name, site_id=defaults["site"]):
+                if (row["name"] or "").casefold() != name.casefold() or (
+                    (row.get("tenant") or {}).get("id") != defaults["tenant"]
+                ):
+                    continue
+                if serial and row["serial"] and row["serial"].casefold() != serial.casefold():
+                    raise SyncError(f"Access point {name} has a different serial in NetBox")
+                return row
+            return None
+
+        fields = {WIRELESS_CONTROLLER: controller["id"]}
+        if version:
+            fields[SOFTWARE_VERSION] = version
+        description = f"AP group {access_point['group']}" if access_point["group"] else ""
+        current = by_serial() or by_name()
+        if current is None:
+            current = self.ensure(
+                path,
+                lambda: by_serial() or by_name(),
+                {
+                    **defaults,
+                    "name": name,
+                    "device_type": device_type["id"],
+                    "serial": serial,
+                    "status": "active" if access_point["up"] else "offline",
+                    "description": description,
+                    "custom_fields": fields,
+                },
+            )
+            action = "created"
+        else:
+            changes = {}
+            if current["name"] != name:
+                changes["name"] = name
+            if current["device_type"]["id"] != device_type["id"]:
+                changes["device_type"] = device_type["id"]
+            if serial and current["serial"] != serial:
+                changes["serial"] = serial
+            if defaults["platform"] and not current.get("platform"):
+                changes["platform"] = defaults["platform"]
+            current_fields = current["custom_fields"]
+            if (current_fields.get(WIRELESS_CONTROLLER) or {}).get("id") != controller["id"] or (
+                version and current_fields.get(SOFTWARE_VERSION) != version
+            ):
+                changes["custom_fields"] = fields
+            # Keep a description someone wrote; only maintain the one discovery writes.
+            if current["description"] != description and (
+                not current["description"] or current["description"].startswith("AP group ")
+            ):
+                changes["description"] = description
+            if defaults["tags"][0] not in {tag["id"] for tag in current["tags"]}:
+                changes["add_tags"] = [defaults["tags"][0]]
+            if changes:
+                current = self.request("PATCH", f"{path}{current['id']}/", json=changes)
+            action = "updated" if changes else "unchanged"
+        result = {
+            "name": name,
+            "device_id": current["id"],
+            "serial": serial,
+            "up": access_point["up"],
+            "status": action,
+        }
+        if version and (current.get("platform") or defaults["platform"]):
+            result["software_inventory"] = self.report_software(
+                current["id"],
+                {"software_version": version, "collected_at": facts.get("collected_at")},
+            )
+        return result
 
     def sync_stack(self, device, poller, facts):
         path = "dcim/virtual-chassis/"

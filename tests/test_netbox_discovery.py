@@ -184,3 +184,192 @@ def test_discovery_reports_running_software_for_the_matched_device(
         )
         assert discovery.sync("Lab", "checkmk-au", "192.0.2.1", facts) == ("unchanged", 10)
     assert facts["software_inventory"] == expected
+
+
+@pytest.mark.parametrize(
+    ("manufacturer", "model", "platform", "role"),
+    [
+        ("Check Point", "Check Point 6200", "Check Point Gaia", "Firewall"),
+        ("Check Point", "Check Point Quantum Spark 1600", "Check Point Gaia", "Firewall"),
+        ("Check Point", "Smart-1 6000-L", "Check Point Gaia", "Unclassified"),
+        ("Blue Coat", "SG-S400", "SGOS", "Proxy"),
+        ("Infoblox", "IB-1420", "Infoblox NIOS", "DNS/DHCP"),
+        ("HPE", "C2000", "Aruba ClearPass", "Network Access Control"),
+        ("HPE", "Aruba7010", "ArubaOS", "Wireless Controller"),
+        ("HPE", "Aruba 9240", "ArubaOS", "Wireless Controller"),
+        ("HPE", "MM-VA-500", "ArubaOS", "Wireless Controller"),
+        ("HPE", "AP-515", "ArubaOS", "Wireless AP"),
+        ("HPE", "Aruba 9300-32D", "ArubaOS-CX", "Unclassified"),
+        ("Juniper", "SRX1500", "Junos", "Firewall"),
+        ("Palo Alto Networks", "PA-3220", "PAN-OS", "Firewall"),
+    ],
+)
+def test_discovery_role_covers_appliance_families(manufacturer, model, platform, role):
+    from netops_executor.netbox_discovery import discovery_role
+
+    assert discovery_role({"manufacturer": manufacturer, "model": model, "platform": platform}) == role
+
+
+class FakeNetBox:
+    """Enough of the NetBox REST API for the access point sync: filtered GETs, POST and PATCH."""
+
+    def __init__(self, devices):
+        self.rows = {
+            "extras/custom-fields": [
+                {
+                    "name": "wireless_controller",
+                    "object_types": ["dcim.device"],
+                    "type": {"value": "object"},
+                    "related_object_type": "dcim.device",
+                }
+            ],
+            "dcim/manufacturers": [{"id": 3, "name": "HPE", "slug": "hpe"}],
+            "dcim/device-types": [
+                {"id": 41, "model": "AP-515", "part_number": ""},
+                {"id": 42, "model": "AP-535", "part_number": ""},
+            ],
+            "dcim/device-roles": [{"id": 5, "name": "Wireless AP", "slug": "wireless-ap"}],
+            "extras/tags": [
+                {"id": 7, "name": "lab", "slug": "lab"},
+                {"id": 8, "name": "discovered", "slug": "discovered"},
+            ],
+            "dcim/devices": devices,
+        }
+        self.calls = []
+
+    def handle(self, request):
+        path = request.url.path.removeprefix("/api/").strip("/")
+        params = request.url.params
+        if request.method == "GET":
+            rows = self.rows[path]
+            if path == "dcim/device-types":
+                rows = [row for row in rows if params["q"].casefold() in row["model"].casefold()]
+            if path == "dcim/devices":
+                if "serial" in params:
+                    rows = [row for row in rows if row["serial"].casefold() == params["serial"].casefold()]
+                if "name__ie" in params:
+                    rows = [row for row in rows if row["name"].casefold() == params["name__ie"].casefold()]
+                if "site_id" in params:
+                    rows = [row for row in rows if str(row["site"]["id"]) == params["site_id"]]
+            return httpx.Response(200, json={"results": rows, "next": None})
+        data = json.loads(request.content)
+        self.calls.append((request.method, path, data))
+        if path == "plugins/refresh/device-software/report":
+            return httpx.Response(200, json={"results": [{"result": "created", "id": data["device"] + 1000}]})
+        if request.method == "POST":
+            return httpx.Response(
+                201, json={"id": 500 + len(self.calls), "platform": {"id": data["platform"]}}
+            )
+        return httpx.Response(200, json={"id": int(path.rsplit("/", 1)[1]), "platform": {"id": 9}})
+
+
+def test_controller_access_points_become_devices_matched_by_serial():
+    renamed = {
+        "id": 61,
+        "name": "old-name",
+        "serial": "CNJPJ0A001",
+        "site": {"id": 2},  # Moved by hand to the floor's real site; kept.
+        "tenant": None,
+        "device_type": {"id": 41},
+        "platform": {"id": 9},
+        "description": "",
+        "custom_fields": {"software_version": "8.10.0.3", "wireless_controller": None},
+        "tags": [{"id": 8}],
+    }
+    unchanged = {
+        "id": 62,
+        "name": "dal-ap-102",
+        "serial": "CNJPJ0A002",
+        "site": {"id": 1},
+        "tenant": None,
+        "device_type": {"id": 41},
+        "platform": {"id": 9},
+        "description": "AP group floor-1",
+        "custom_fields": {"software_version": "8.10.0.4", "wireless_controller": {"id": 40}},
+        "tags": [{"id": 7}, {"id": 8}],
+    }
+    conflict = {**unchanged, "id": 63, "name": "dal-ap-104", "serial": "OTHER-SERIAL"}
+    netbox = FakeNetBox([renamed, unchanged, conflict])
+
+    def ap(name, serial, model="AP-515", up=True, version=""):
+        return {
+            "mac_address": "20:4c:03:aa:01:01",
+            "name": name,
+            "model": model,
+            "serial": serial,
+            "address": "10.20.10.11",
+            "group": "floor-1",
+            "up": up,
+            "software_version": version,
+        }
+
+    facts = {
+        "manufacturer": "HPE",
+        "platform": "ArubaOS",
+        "software_version": "8.10.0.4",
+        "collected_at": "2026-11-07T00:00:00+00:00",
+        "access_points": [
+            ap("dal-ap-101", "CNJPJ0A001", version="8.10.0.4_87457"),
+            ap("dal-ap-102", "CNJPJ0A002"),
+            ap("dal-ap-103", "CNJPJ0B003", model="AP-535", up=False),
+            ap("", "", up=False),
+            ap("dal-ap-104", "CNJPJ0A004"),
+        ],
+    }
+    controller = {"id": 40, "site": {"id": 1}, "tenant": None, "platform": {"id": 9}}
+    with httpx.Client(
+        base_url="https://netbox.example/api/", transport=httpx.MockTransport(netbox.handle)
+    ) as client:
+        result = NetBoxDiscovery(client, lambda: None).sync_access_points(controller, "lab", facts)
+
+    assert (result["status"], result["controller_id"], result["reported"], result["skipped"]) == (
+        "warning",
+        40,
+        5,
+        1,
+    )
+    rows = {row["name"]: row for row in result["access_points"]}
+    assert {name: row["status"] for name, row in rows.items()} == {
+        "dal-ap-101": "updated",
+        "dal-ap-102": "unchanged",
+        "dal-ap-103": "created",
+        "dal-ap-104": "failed",
+    }
+    assert rows["dal-ap-104"]["error"] == "Access point dal-ap-104 has a different serial in NetBox"
+    writes = [call for call in netbox.calls if call[1] != "plugins/refresh/device-software/report"]
+    assert writes == [
+        (
+            "PATCH",
+            "dcim/devices/61",
+            {
+                "name": "dal-ap-101",
+                "custom_fields": {"wireless_controller": 40, "software_version": "8.10.0.4_87457"},
+                "description": "AP group floor-1",
+                "add_tags": [7],
+            },
+        ),
+        (
+            "POST",
+            "dcim/devices",
+            {
+                "site": 1,
+                "tenant": None,
+                "role": 5,
+                "platform": 9,
+                "tags": [7, 8],
+                "name": "dal-ap-103",
+                "device_type": 42,
+                "serial": "CNJPJ0B003",
+                "status": "offline",
+                "description": "AP group floor-1",
+                "custom_fields": {"wireless_controller": 40, "software_version": "8.10.0.4"},
+            },
+        ),
+    ]
+    reports = [call[2] for call in netbox.calls if call[1] == "plugins/refresh/device-software/report"]
+    assert [(report["device"], report["version"]) for report in reports] == [
+        (61, "8.10.0.4_87457"),
+        (62, "8.10.0.4"),
+        (rows["dal-ap-103"]["device_id"], "8.10.0.4"),
+    ]
+    assert rows["dal-ap-101"]["software_inventory"] == {"status": "created", "id": 1061}

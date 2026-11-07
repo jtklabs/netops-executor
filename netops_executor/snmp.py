@@ -19,6 +19,7 @@ from .snmp_address import collect_polled_address
 from .snmp_identity import ENTITY_CLASS, collect_identity, text
 from .snmp_models import SnmpWalkRequest
 from .snmp_stack import StackInventoryError, collect_stack
+from .snmp_wireless import AccessPointInventoryError, collect_access_points
 from .ssh import SSH, DeviceError
 from .store import CancelRequested, LostOwnership
 
@@ -324,6 +325,17 @@ class SnmpRunner:
                     facts["model"] = active["model"]
                     facts["serial"] = active["serial"]
                     facts["software_version"] = active["software_version"] or facts["software_version"]
+        if facts["manufacturer"] == "HPE" and facts["platform"] == "ArubaOS":
+            # Mobility controllers list the APs they terminate; ClearPass and CX switches do not.
+            try:
+                facts["access_points"] = await collect_access_points(walk_column)
+            except AccessPointInventoryError as error:
+                facts["access_point_inventory"] = {"status": "failed", "error": str(error)}
+            except WalkError:
+                facts["access_point_inventory"] = {
+                    "status": "failed",
+                    "error": "Aruba access point table read failed",
+                }
         collected_at = datetime.now(timezone.utc).isoformat()
         try:
             management_ip = await collect_polled_address(get, self.request.device_ip)
@@ -384,7 +396,7 @@ class SnmpRunner:
             discovery["netbox"] = {"status": action, "device_id": device_id}
             optional_failure = any(
                 discovery.get(field, {}).get("status") in {"failed", "warning"}
-                for field in ("software_inventory", "stack_inventory")
+                for field in ("software_inventory", "stack_inventory", "access_point_inventory")
             )
             return "completed_with_warnings" if missing or optional_failure else "succeeded"
         return "failed"

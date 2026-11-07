@@ -2224,8 +2224,10 @@ NetBox looks up the device by its reported name and polled IP, using the
 executor creates missing sites and poller tags, reuses a matching manufacturer
 and model or part number from the device type catalog, and creates a basic
 device type when no match exists. It tags new devices `discovered` and sets a
-functional role such as Switch, Router, Firewall, or Console Server when it
-recognizes the product family. It uses Unclassified when the model is ambiguous.
+functional role when it recognizes the product family: Switch, Router,
+Firewall, Load Balancer, Console Server, Wireless Controller, Wireless AP,
+Network Access Control (ClearPass), DNS/DHCP (Infoblox), or Proxy (Blue Coat).
+It uses Unclassified when the model is ambiguous.
 The next poll moves devices with the old `SNMP discovered` role to this scheme.
 For other existing devices, discovery preserves their assigned role and adds
 only the poller tag. The name `discovered` is reserved for discovery provenance.
@@ -2266,9 +2268,35 @@ management record and its IP stable. Provisioned slots and modules are skipped.
 A changed chassis serial at an existing member position reports a conflict
 for review. Discovery retains existing members when an agent stops reporting them.
 
+Vendor identity comes from ENTITY-MIB where the device fills it in, and from the
+vendor's own MIB otherwise. Discovery reads model, serial, version and platform
+for Cisco (IOS, IOS-XE, IOS-XR, NX-OS, ASA), Arista EOS, Juniper Junos
+(including SRX chassis-cluster primaries), Palo Alto PAN-OS, Fortinet FortiOS,
+F5 TMOS, Check Point Gaia (version written as `R81.20 Take 89`), Infoblox NIOS,
+Blue Coat SGOS, Opengear, Aruba Mobility controllers (ArubaOS), and Aruba
+ClearPass. The OIDs match `scripts/snmp-inventory/snmpinv/vendors.py`.
+`tests/lab/snmp_discovery` polls a simulated device for each of these except
+Cisco IOS-XR, NX-OS and ASA, and checks every NetBox record it writes.
+
+An ArubaOS Mobility controller also reports the access points it terminates
+(WLSX-WLAN-MIB `wlsxWlanAPTable`), which are usually not pollable themselves.
+Discovery creates or updates one NetBox device per AP with role Wireless AP,
+the controller's manufacturer and platform, the AP's model and serial, and an
+`AP group <name>` description. The `software_version` custom field holds the
+AP's reported image, or the controller's when the AP row has none. The
+`wireless_controller` device custom field links each AP to the controller that
+last reported it. APs are matched by serial first, so a renamed AP keeps its
+record, and then by name at the controller's site. A new AP is created at the
+controller's site and later site moves are kept. A down AP with no serial is a
+stale controller entry and is skipped. APs the controller stops reporting are
+left in NetBox. `result.discovery.access_point_inventory` reports the count
+and each AP's result. A conflict on one AP finishes the job with warnings
+without stopping the others.
+
 The token needs view/add access for sites, manufacturers, device types,
-device roles, platforms, tags, interfaces, and device custom fields, plus
-view/add/change access for devices, IP addresses, and Cisco virtual chassis.
+device roles, platforms, tags, interfaces, and device custom fields (text, and
+the `wireless_controller` device object field), plus view/add/change access for
+devices, IP addresses, and Cisco virtual chassis.
 `result.discovery` reports the collected facts, missing fields,
 and whether NetBox created, updated, or already had the device. Name,
 manufacturer, and model are required to write a device. If the agent omits a

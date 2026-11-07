@@ -1,0 +1,11 @@
+# Simulated SNMP fleet: one snmpd per lab walk, each on its own address.
+# Build context is the repository root (see compose.yaml).
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends snmpd snmp python3 iproute2 \
+ && rm -rf /var/lib/apt/lists/*
+COPY scripts/snmp-inventory/tests/emulator /emulator
+COPY services/netops-executor/tests/lab/snmp_discovery/walks /walks
+COPY services/netops-executor/tests/lab/snmp_discovery/agent.py /agent.py
+CMD ["python3", "/agent.py"]

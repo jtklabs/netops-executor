@@ -1,0 +1,7 @@
+# NetBox 4.7, the release this repo targets, with the repo's netbox-refresh
+# plugin so the executor's software reports are stored and can be checked.
+# Build context is the repository root (see compose.yaml).
+FROM netboxcommunity/netbox:v4.7.4-5.1.1
+COPY plugins/netbox-refresh/netbox_refresh /opt/netbox-plugins/netbox-refresh/netbox_refresh
+COPY plugins/netbox-refresh/netbox_refresh/static/netbox_refresh /opt/netbox/netbox/static/netbox_refresh
+ENV PYTHONPATH=/opt/netbox-plugins/netbox-refresh
