@@ -2230,7 +2230,14 @@ The next poll moves devices with the old `SNMP discovered` role to this scheme.
 For other existing devices, discovery preserves their assigned role and adds
 only the poller tag. The name `discovered` is reserved for discovery provenance.
 Serial numbers go in the native serial field and running versions in
-the `software_version` custom field. For F5 BIG-IP Virtual Edition, discovery
+the `software_version` custom field. When the NetBox Lifecycle plugin is
+available, the executor also reports the running version for devices with a
+platform. Lifecycle links the device to a reusable Software Version object
+that can be approved in **Lifecycle → Software Standards**. A standard can
+approve multiple versions for a device type or platform. See the result on the
+device or in **Lifecycle → Compliance Report**. The executor token needs add
+and change permissions on Lifecycle's Device Software model for this step.
+For F5 BIG-IP Virtual Edition, discovery
 uses the last seven characters of the base registration key as the serial.
 Configure one `f5` device with the polled IP as its `host`, working SSH
 credentials, and a trusted host key. The executor runs the read-only
@@ -2256,7 +2263,9 @@ view/add/change access for devices and IP addresses.
 and whether NetBox created, updated, or already had the device. Name,
 manufacturer, and model are required to write a device. If the agent omits a
 serial number or software version, the job records a warning and preserves
-any existing value. A failed NetBox sync leaves the SNMP results available.
+any existing value. A failed NetBox sync leaves the SNMP results available. `result.discovery.software_inventory`
+reports the Lifecycle write separately. A missing Lifecycle endpoint is optional.
+Other reporting failures finish with warnings after the device inventory sync.
 
 ## Deployment and CLI
 

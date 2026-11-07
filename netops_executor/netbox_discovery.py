@@ -10,6 +10,7 @@ import httpx
 
 DISCOVERY_IP = "snmp_discovery_ip"
 SOFTWARE_VERSION = "software_version"
+SOFTWARE_REPORT = "plugins/refresh/device-software/report/"
 DISCOVERED_TAG = "discovered"
 LEGACY_DISCOVERY_ROLE = "snmp-discovered"
 
@@ -196,7 +197,28 @@ class NetBoxDiscovery:
         if (management_ip := facts.get("management_ip")) and self.assign_primary_ip(device, management_ip):
             if action == "unchanged":
                 action = "updated"
+        if facts["software_version"] and (device.get("platform") or facts.get("platform")):
+            facts["software_inventory"] = self.report_software(device["id"], facts)
         return action, device["id"]
+
+    def report_software(self, device_id, facts):
+        data = {"device": device_id, "version": facts["software_version"], "source": "snmp"}
+        if collected_at := facts.get("collected_at"):
+            data["collected_at"] = collected_at
+        try:
+            (entry,) = self.request("POST", SOFTWARE_REPORT, json=data)["results"]
+            if entry["result"] in {"created", "changed", "updated", "unchanged", "stale"}:
+                return {"status": entry["result"], "id": entry["id"]}
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code == 404:
+                return {"status": "unavailable"}
+            return {
+                "status": "failed",
+                "error": f"Software report returned HTTP {error.response.status_code}",
+            }
+        except (httpx.RequestError, ValueError, KeyError, TypeError):
+            pass
+        return {"status": "failed", "error": "NetBox did not accept the running software observation"}
 
     def assign_primary_ip(self, device, management_ip):
         interface_path = "dcim/interfaces/"

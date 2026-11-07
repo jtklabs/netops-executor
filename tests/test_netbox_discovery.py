@@ -150,3 +150,37 @@ def test_primary_ip_uses_the_interface_vrf_and_preserves_other_assignments(forei
                 ),
                 ("PATCH", "dcim/devices/6", {"primary_ip4": 2}),
             ]
+
+
+@pytest.mark.parametrize(
+    ("http_status", "response", "expected"),
+    [
+        (200, {"results": [{"result": "created", "id": 27}]}, {"status": "created", "id": 27}),
+        (404, {}, {"status": "unavailable"}),
+        (403, {}, {"status": "failed", "error": "Software report returned HTTP 403"}),
+    ],
+)
+def test_discovery_reports_running_software_for_the_matched_device(
+    monkeypatch, http_status, response, expected
+):
+    def handle(request):
+        assert request.method == "POST"
+        assert request.url.path == "/api/plugins/refresh/device-software/report/"
+        assert json.loads(request.content) == {
+            "device": 10,
+            "version": "17.5.1.10-0.0.35",
+            "source": "snmp",
+            "collected_at": "2026-11-07T00:00:00+00:00",
+        }
+        return httpx.Response(http_status, json=response)
+
+    facts = {"software_version": "17.5.1.10-0.0.35", "collected_at": "2026-11-07T00:00:00+00:00"}
+    with httpx.Client(
+        base_url="https://netbox.example/api/", transport=httpx.MockTransport(handle)
+    ) as client:
+        discovery = NetBoxDiscovery(client, lambda: None)
+        monkeypatch.setattr(
+            discovery, "sync_inventory", lambda *_: ("unchanged", {"id": 10, "platform": {"id": 9}})
+        )
+        assert discovery.sync("Lab", "checkmk-au", "192.0.2.1", facts) == ("unchanged", 10)
+    assert facts["software_inventory"] == expected

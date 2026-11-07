@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import re
+from datetime import datetime, timezone
 
 import httpx
 from paramiko import SSHException
@@ -309,6 +310,7 @@ class SnmpRunner:
             return await first_value(ENTITY_CLASS, expected="3")
 
         facts = await collect_identity(get, chassis_index, first_value)
+        collected_at = datetime.now(timezone.utc).isoformat()
         try:
             management_ip = await collect_polled_address(get, self.request.device_ip)
         except WalkError:
@@ -316,6 +318,7 @@ class SnmpRunner:
             management_ip = None
         self.result["discovery"] = {
             **facts,
+            "collected_at": collected_at,
             "address": str(self.request.device_ip),
             "site": self.request.site,
             "poller_instance": self.request.poller_instance,
@@ -365,7 +368,8 @@ class SnmpRunner:
             }
         else:
             discovery["netbox"] = {"status": action, "device_id": device_id}
-            return "completed_with_warnings" if missing else "succeeded"
+            software_failed = discovery.get("software_inventory", {}).get("status") == "failed"
+            return "completed_with_warnings" if missing or software_failed else "succeeded"
         return "failed"
 
     def read_f5_license_serial(self, checkpoint):
