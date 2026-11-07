@@ -3,7 +3,7 @@
 Runs inside the agent container. The container's own address is the stack's;
 each other device's address is added to eth0, which makes this container
 answer ARP for it on the lab bridge. Each device is a separate snmpd from the
-snmp-inventory emulator, bound to its address on UDP 161.
+lab's emulator (emulator/), bound to its address on UDP 161.
 
 STACK_WALK picks which 9300 walk the stack address serves, so lab.py can fail
 the stack over by recreating this container.

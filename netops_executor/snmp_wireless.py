@@ -3,7 +3,7 @@
 APs tunnel to their controller and usually sit on networks the poller cannot
 reach, so the controller's WLSX-WLAN-MIB wlsxWlanAPTable is the inventory. Its
 INDEX is wlanAPMacAddress, so each AP's MAC is the row suffix; the OIDs mirror
-scripts/snmp-inventory/snmpinv/vendors.py.
+the snmp-inventory scanner in jtklabs/Netbox (scripts/snmp-inventory/snmpinv/vendors.py).
 """
 
 AP_ENTRY = "1.3.6.1.4.1.14823.2.2.1.5.2.1.4.1"

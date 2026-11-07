@@ -3,7 +3,7 @@
 A local, end-to-end check of NetOps Executor's SNMP discovery against one
 simulated device per supported vendor, a four-member Catalyst 9300 stack, and
 an Aruba controller's access points. It runs real net-snmp `snmpd` agents, a
-throwaway NetBox 4.7.4 with this repo's `netbox-refresh` plugin, and the
+throwaway NetBox 4.7.4 with the Lifecycle plugin (`netbox-refresh`), and the
 executor API plus one worker, all in Docker.
 
 ```bash
@@ -54,8 +54,8 @@ followed by a rediscovery that must change nothing:
 The full run expects an empty NetBox, so run `./lab.py down` before running it
 again.
 
-`make_walks.py` builds the walks. The fleet comes from the snmp-inventory
-fixtures in `scripts/snmp-inventory/tests/emulator/make_fixtures.py`, with each
+`make_walks.py` builds the walks. The fleet comes from the vendor fixtures in
+`emulator/make_fixtures.py` (see `emulator/README.md`), with each
 device's management address moved to its lab address. The Opengear walk also
 gets an `ogSerialNumber`, which the executor reads and the shared fixture lacks.
 The stack is built here; `c9300-stack-failover.walk` is the same stack after
@@ -78,7 +78,9 @@ fresh secrets generated on first run and is gitignored, as are the generated
 walks. The executor shares the NetBox container's network namespace so it can
 use NetBox over loopback HTTP, which is the only plain-HTTP NetBox URL the
 executor accepts. `Dockerfile.netbox` builds NetBox 4.7.4 with
-`plugins/netbox-refresh` from this repo, and `netbox/plugins.py` enables it.
+the Lifecycle plugin from a NetBoxV2 checkout and `netbox/plugins.py` enables
+it. The checkout is expected next to this repository (`../NetBoxV2`); set
+`NETBOX_V2` to its path otherwise.
 
 The walks are synthetic: they prove the executor handles each vendor's shapes,
 not that a given firmware fills in a given table.

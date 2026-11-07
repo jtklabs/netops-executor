@@ -28,7 +28,8 @@ class Vendor:
     version_pattern: str = ""
 
 
-# Enterprise scalars mirror the verified OIDs in scripts/snmp-inventory/snmpinv/vendors.py.
+# Enterprise scalars mirror the verified OIDs of the snmp-inventory scanner in jtklabs/Netbox
+# (scripts/snmp-inventory/snmpinv/vendors.py).
 VENDORS = {
     9: Vendor("Cisco"),
     11: Vendor("HPE"),

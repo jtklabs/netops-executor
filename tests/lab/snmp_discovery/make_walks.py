@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate the recorded walks the lab's SNMP agents serve.
 
-Every snmp-inventory fixture except its three-member stack is served at its
-own lab address, rewritten so the device's management interface carries that
+Every vendor fixture in emulator/make_fixtures.py except its three-member
+stack is served at its own lab address, rewritten so the device's management interface carries that
 address (discovery can then assign it as the primary IP). FLEET lists them.
 
 The lab's own 9300 stack replaces the fixture stack. It has four present
@@ -14,7 +14,7 @@ switches and one provisioned slot:
     switch 4  C9300-48P  member    entPhysicalIndex 4000
     switch 5  (provisioned, no hardware)
 
-It is built with the same helpers as the snmp-inventory fixtures, so the
+It is built with the same helpers as the emulator/ fixtures, so the
 format is exactly `snmpwalk -On -Oe -Ot` output. The stack walks are:
 
     c9300-stack.walk           switch 1 is the active switch
@@ -43,7 +43,7 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-EMULATOR = os.path.join(HERE, "..", "..", "..", "..", "..", "scripts", "snmp-inventory", "tests", "emulator")
+EMULATOR = os.path.join(HERE, "emulator")
 sys.path.insert(0, os.path.abspath(EMULATOR))
 
 from make_fixtures import (  # noqa: E402
@@ -81,9 +81,9 @@ FLEET = {
     "juniper-srx1500-cluster": "10.93.0.22",
     "bluecoat-sg-s400": "10.93.0.23",
 }
-# Objects the shared fixtures leave out that the executor reads. The
-# snmp-inventory scanner reads Opengear from sysDescr only, so its fixture has
-# no ogSerialNumber; the executor reads it, as on the real IM7248 in netbox47.
+# Objects the fixtures leave out that the executor reads. The fixtures came from
+# a scanner that read Opengear from sysDescr only, so they have no
+# ogSerialNumber; the executor reads it, as a real IM7248 answers it.
 EXTRAS = {"opengear-cm7148": [s("1.3.6.1.4.1.25049.17.1.2.0", "71482763250042")]}
 
 HOSTNAME = "lab-c9300-stk01"

@@ -1,12 +1,15 @@
 # Local lab only: a simulated multi-vendor SNMP fleet, a throwaway NetBox 4.7 with
-# the repo's netbox-refresh plugin, and NetOps Executor.
+# the Lifecycle plugin from NetBoxV2, and NetOps Executor.
 # Run it through lab.py, which writes lab.env with fresh secrets before starting compose.
 name: snmp-discovery-lab
 
 x-netbox: &netbox
   build:
-    context: ../../../../..
-    dockerfile: services/netops-executor/tests/lab/snmp_discovery/Dockerfile.netbox
+    context: .
+    dockerfile: Dockerfile.netbox
+    additional_contexts:
+      # The Lifecycle plugin, from a NetBoxV2 checkout next to this repository.
+      lifecycle: ${NETBOX_V2:-../../../../NetBoxV2}/plugins/netbox-refresh
   image: netbox-snmp-lab:v4.7.4-5.1.1
   env_file: lab.env
   volumes:
@@ -50,8 +53,8 @@ x-executor: &executor
 services:
   agents:
     build:
-      context: ../../../../..
-      dockerfile: services/netops-executor/tests/lab/snmp_discovery/Dockerfile.agent
+      context: .
+      dockerfile: Dockerfile.agent
     image: snmp-lab-agents:lab
     init: true
     environment:

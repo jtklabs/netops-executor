@@ -2288,7 +2288,8 @@ for Cisco (IOS, IOS-XE, IOS-XR, NX-OS, ASA), Arista EOS, Juniper Junos
 (including SRX chassis-cluster primaries), Palo Alto PAN-OS, Fortinet FortiOS,
 F5 TMOS, Check Point Gaia (version written as `R81.20 Take 89`), Infoblox NIOS,
 Blue Coat SGOS, Opengear, Aruba Mobility controllers (ArubaOS), and Aruba
-ClearPass. The OIDs match `scripts/snmp-inventory/snmpinv/vendors.py`.
+ClearPass. The vendor OIDs were checked against each vendor's MIB by the
+snmp-inventory scanner in jtklabs/Netbox (`scripts/snmp-inventory/docs/OID-SOURCES.md`).
 `tests/lab/snmp_discovery` polls a simulated device for each of these except
 Cisco IOS-XR, NX-OS and ASA, and checks every NetBox record it writes.
 

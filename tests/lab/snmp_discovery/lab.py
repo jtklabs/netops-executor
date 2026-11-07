@@ -11,7 +11,8 @@ The full run expects an empty NetBox: run ./lab.py down before running it again.
 One agent container answers SNMPv3 for every device in FLEET plus a
 four-member Catalyst 9300 stack, each on its own 10.93.0.x address, from walks
 built by make_walks.py. The lab also runs a throwaway NetBox 4.7.4 with the
-repo's netbox-refresh plugin, and the executor API and a worker. It binds only
+Lifecycle plugin (netbox-refresh) from a NetBoxV2 checkout, and the executor API
+and a worker. It binds only
 to 127.0.0.1: NetBox on port 18080 and the executor on 18081. Secrets are
 generated into lab.env on first run; it is gitignored.
 
@@ -208,7 +209,7 @@ def write_env() -> None:
         # NetOps Executor
         "NETOPS_API_TOKEN": token(48),
         "NETOPS_NETBOX_TOKEN": f"nbt_{key}.{value}",
-        # The emulator's fixed lab credentials (scripts/snmp-inventory/tests/emulator/emulator.py).
+        # The emulator's fixed lab credentials (emulator/emulator.py).
         "LAB_SNMP_AUTH_PASSWORD": "labauthpass123",
         "LAB_SNMP_PRIV_PASSWORD": "labprivpass123",
     }
@@ -263,6 +264,15 @@ def wait(description: str, check, timeout: float) -> None:
 
 
 def up(walk: str = "c9300-stack") -> None:
+    plugin = os.path.join(
+        os.environ.get("NETBOX_V2", os.path.join(HERE, "..", "..", "..", "..", "NetBoxV2")),
+        "plugins",
+        "netbox-refresh",
+    )
+    if not os.path.isdir(plugin):
+        sys.exit(
+            f"Lifecycle plugin not found at {os.path.abspath(plugin)}; set NETBOX_V2 to a NetBoxV2 checkout"
+        )
     write_env()
     subprocess.run([sys.executable, os.path.join(HERE, "make_walks.py")], check=True)
     compose("up", "-d", "--build", walk=walk)
