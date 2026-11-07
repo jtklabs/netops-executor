@@ -15,11 +15,17 @@ switches and one provisioned slot:
     switch 5  (provisioned, no hardware)
 
 It is built with the same helpers as the snmp-inventory fixtures, so the
-format is exactly `snmpwalk -On -Oe -Ot` output. Two walks are written:
+format is exactly `snmpwalk -On -Oe -Ot` output. The stack walks are:
 
     c9300-stack.walk           switch 1 is the active switch
     c9300-stack-failover.walk  switch 1 has failed over: switch 2 is active
                                and switch 1 has rejoined as standby
+
+and three hardware changes, applied in order (see CHANGES):
+
+    c9300-stack-replaced.walk    switch 3 swapped for new hardware
+    c9300-stack-renumbered.walk  switches 2 and 4 swap member numbers
+    c9300-stack-new-master.walk  switch 1, the management record, swapped
 
 The management SVI (Vlan10) carries the stack's lab address.
 
@@ -96,6 +102,27 @@ MEMBERS = (
 )
 PROVISIONED_SWITCH = 5
 
+# Hardware changes, applied in this order by lab.py. Each walk is the stack
+# after the change; the member tuples are (number, model, serial, MAC, uplink).
+S1, S2, S3, S4 = MEMBERS
+NEW_S3 = (3, "C9300-24P", "FOC2750L3ZZ", "70:B3:17:B3:00:00", "C9300-NM-4G")
+NEW_S1 = (1, "C9300-48P", "FOC2751L1EE", "70:B3:17:B1:00:00", "C9300-NM-8X")
+
+
+def renumber(member: tuple, number: int) -> tuple:
+    return (number, *member[1:])
+
+
+# name -> (members, active switch number, standby switch number)
+CHANGES = {
+    # Switch 3 fails and is swapped for a C9300-24P.
+    "c9300-stack-replaced": ((S1, S2, NEW_S3, S4), 1, 2),
+    # Switches 2 and 4 swap member numbers.
+    "c9300-stack-renumbered": ((S1, renumber(S4, 2), NEW_S3, renumber(S2, 4)), 1, 2),
+    # Switch 1, the management record, is swapped while switch 2 is active.
+    "c9300-stack-new-master": ((NEW_S1, renumber(S4, 2), NEW_S3, renumber(S2, 4)), 2, 4),
+}
+
 
 def stack_row(entity_index: int, number: int, role: int, state: int, mac: str, priority: int) -> list:
     """One cswSwitchInfoEntry, indexed by the member's entPhysicalIndex."""
@@ -111,7 +138,7 @@ def stack_row(entity_index: int, number: int, role: int, state: int, mac: str, p
     ]
 
 
-def build(address: str, active: int, standby: int) -> list:
+def build(address: str, active: int, standby: int, members: tuple = MEMBERS) -> list:
     """The whole stack, with `active` and `standby` holding those roles."""
     out = system_group(
         "Cisco IOS Software [Cupertino], Catalyst L3 Switch Software "
@@ -125,7 +152,7 @@ def build(address: str, active: int, standby: int) -> list:
     )
     out += entity(1, "c93xx Stack", 11, 0, -1, "c93xx Stack", "", "", "Cisco")
 
-    for number, model, serial, mac, uplink in MEMBERS:
+    for number, model, serial, mac, uplink in members:
         base = number * 1000
         out += entity(
             base,
@@ -183,7 +210,7 @@ def build(address: str, active: int, standby: int) -> list:
     )
 
     if_index = 1
-    for number, model, _serial, _mac, uplink in MEMBERS:
+    for number, model, _serial, _mac, uplink in sorted(members):
         ports = 24 if model.startswith("C9300-24") else 48
         for port in (1, 2, ports):
             out += interface(
@@ -244,6 +271,8 @@ def main() -> int:
     os.makedirs(args.output_dir, exist_ok=True)
     for name, active, standby in (("c9300-stack", 1, 2), ("c9300-stack-failover", 2, 1)):
         write(args.output_dir, name, build(STACK_ADDRESS, active, standby))
+    for name, (members, active, standby) in CHANGES.items():
+        write(args.output_dir, name, build(STACK_ADDRESS, active, standby, members))
     for name, address in FLEET.items():
         write(args.output_dir, name, relocate(DEVICES[name](), address) + EXTRAS.get(name, []))
     with open(os.path.join(args.output_dir, "fleet.json"), "w") as handle:

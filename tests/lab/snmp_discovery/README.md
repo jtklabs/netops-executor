@@ -7,7 +7,7 @@ throwaway NetBox 4.7.4 with this repo's `netbox-refresh` plugin, and the
 executor API plus one worker, all in Docker.
 
 ```bash
-./lab.py                  # start, discover all, rediscover all, fail the stack over; verify each step
+./lab.py                  # start, discover all, rediscover all, then stack failover and hardware changes
 ./lab.py poll 10.93.0.16  # submit one more discovery job and print result.discovery
 ./lab.py down             # stop the lab and delete its volumes
 ```
@@ -42,6 +42,18 @@ The 9300 stack:
 | 4 | C9300-48P | member | FOC2742L4DD |
 | 5 | — | provisioned, no hardware | — |
 
+After a failover, the lab applies three hardware changes to the stack, each
+followed by a rediscovery that must change nothing:
+
+| Walk | Change | Expected in NetBox |
+| --- | --- | --- |
+| `c9300-stack-replaced` | switch 3 swapped for a C9300-24P, FOC2750L3ZZ | new `lab-c9300-stk01-3`; old record renamed `lab-c9300-stk01-3-decom-FOC2742L3CC`, Decommissioning, out of the chassis |
+| `c9300-stack-renumbered` | switches 2 and 4 swap member numbers | the same two records renamed and moved, IDs kept |
+| `c9300-stack-new-master` | switch 1 swapped while switch 2 is active | new `lab-c9300-stk01` with the polled IP and chassis master; old record `lab-c9300-stk01-decom-FOC2741L1AA`, without IP |
+
+The full run expects an empty NetBox, so run `./lab.py down` before running it
+again.
+
 `make_walks.py` builds the walks. The fleet comes from the snmp-inventory
 fixtures in `scripts/snmp-inventory/tests/emulator/make_fixtures.py`, with each
 device's management address moved to its lab address. The Opengear walk also
@@ -57,7 +69,8 @@ stack it checks one virtual chassis, its master, and every member. For the
 controller it checks that `dal-ap-101` to `-103` exist with role Wireless AP,
 their own model, serial and version (`dal-ap-102` inherits the controller's),
 and a `wireless_controller` link to `dal-wlc-01`. Rediscovery and the stack
-failover must leave NetBox unchanged.
+failover must leave NetBox unchanged. After each stack hardware change it also
+checks the retired records and that switches already known keep their record.
 
 Everything binds to 127.0.0.1: NetBox on 18080 (user `admin`, password
 `SUPERUSER_PASSWORD` in `lab.env`) and the executor on 18081. `lab.env` holds

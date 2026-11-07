@@ -417,7 +417,10 @@ class NetBoxDiscovery:
         anchor = facts["stack_member_id"]
         suffix = f"-{device['id']}"
         chassis_name = facts["name"][: 64 - len(suffix)] + suffix
-        if existing := device.get("virtual_chassis"):
+        # A replaced management switch is a new record joining the existing chassis.
+        if existing := device.get("virtual_chassis") or (
+            {"id": facts["stack_chassis_id"]} if facts.get("stack_chassis_id") else None
+        ):
             chassis = self.request("GET", f"{path}{existing['id']}/")
         else:
             chassis = self.ensure(path, lambda: self.named(path, chassis_name), {"name": chassis_name})
@@ -459,10 +462,151 @@ class NetBoxDiscovery:
         incomplete = any(
             row.get("software_inventory", {}).get("status") == "failed" for row in results
         ) or any(not member["serial"] or not member["software_version"] for member in facts["stack_members"])
+        changes = facts.get("stack_changes") or {}
         return {
             "status": "warning" if incomplete else "synced",
             "virtual_chassis_id": chassis_id,
             "members": results,
+            "retired": changes.get("retired", []),
+            "renumbered": changes.get("renumbered", []),
+        }
+
+    def reconcile_stack(self, current, members, facts):
+        """Line NetBox's stack records up with the switches SNMP reports, by serial.
+
+        A switch that now reports another member number is renamed and moved to
+        that position. A record whose switch is gone while its member number is
+        in use by other hardware is retired: renamed <name>-decom-<serial>, set
+        to decommissioning and taken out of the chassis, so the new switch can
+        take its name and position. NetBox needs device names unique per site
+        and tenant, whatever the status, hence the rename. A record whose switch
+        is gone and whose number nobody uses is kept, as before.
+
+        Returns the management record, or None when its switch was replaced,
+        and the reported member it now stands for.
+        """
+        path = "dcim/devices/"
+        chassis = self.request("GET", f"dcim/virtual-chassis/{current['virtual_chassis']['id']}/")
+        facts["stack_chassis_id"] = chassis["id"]
+        records = list(self.records(path, virtual_chassis_id=chassis["id"]))
+        reported = {member["member_id"]: member for member in members}
+        by_serial = {member["serial"].casefold(): member for member in members if member["serial"]}
+
+        def switch(row):
+            return by_serial.get(row["serial"].casefold()) if row["serial"] else None
+
+        anchor, replaced = switch(current), False
+        if anchor is None:
+            anchor = reported.get(current["vc_position"])
+            if current["serial"]:
+                # The management switch is gone. New hardware in its slot takes over.
+                held = {row["serial"].casefold() for row in records if row["serial"]}
+                if anchor is None or not anchor["serial"] or anchor["serial"].casefold() in held:
+                    raise SyncError("The management switch left the stack; check the NetBox stack")
+                replaced = True
+            elif anchor is None:
+                raise SyncError("The management chassis changed or disappeared; check the NetBox stack")
+
+        hostname = facts["name"]
+
+        def target_name(member):
+            if member is anchor:
+                return hostname
+            suffix = f"-{member['member_id']}"
+            return hostname[: 64 - len(suffix)] + suffix
+
+        retire, moves = [], []
+        for row in records:
+            member = switch(row)
+            if row["id"] == current["id"] and replaced:
+                retire.append(row)
+            elif member is None:
+                if row["serial"] and row["vc_position"] in reported:
+                    retire.append(row)
+            elif (row["vc_position"], row["name"]) != (member["member_id"], target_name(member)):
+                moves.append((row, member["member_id"], target_name(member)))
+
+        changes = {"retired": [], "renumbered": []}
+        master = (chassis.get("master") or {}).get("id")
+        for row in retire:
+            if row["id"] == master:
+                self.request("PATCH", f"dcim/virtual-chassis/{chassis['id']}/", json={"master": None})
+                master = None
+            changes["retired"].append(self.retire_stack_member(row, management=row["id"] == current["id"]))
+
+        retired = {row["id"] for row in retire}
+        remaining = [row for row in records if row["id"] not in retired]
+        occupied = {row["vc_position"]: row["id"] for row in remaining}
+        names = {(row["name"] or "").casefold(): row["id"] for row in remaining}
+        if any(
+            occupied.get(position, row["id"]) != row["id"]
+            or names.get(name.casefold(), row["id"]) != row["id"]
+            for row, position, name in moves
+        ):
+            # Swapped member numbers: park every moving record first. NetBox
+            # positions run to 255; stacks use the low numbers.
+            targets = {position for _, position, _ in moves}
+            spare = (n for n in range(255, 0, -1) if n not in occupied and n not in targets)
+            for row, _, _ in moves:
+                suffix = f"-renumbering-{row['id']}"
+                self.request(
+                    "PATCH",
+                    f"{path}{row['id']}/",
+                    json={"vc_position": next(spare), "name": hostname[: 64 - len(suffix)] + suffix},
+                )
+        for row, position, name in moves:
+            updated = self.request(
+                "PATCH", f"{path}{row['id']}/", json={"vc_position": position, "name": name}
+            )
+            changes["renumbered"].append(
+                {
+                    "device_id": row["id"],
+                    "serial": row["serial"],
+                    "from": row["vc_position"],
+                    "to": position,
+                    "name": name,
+                }
+            )
+            if row["id"] == current["id"]:
+                current = updated
+        facts["stack_changes"] = changes
+        return (None if replaced else current), anchor
+
+    def retire_stack_member(self, row, management):
+        path = "dcim/devices/"
+        site, tenant = row["site"]["id"], (row.get("tenant") or {}).get("id")
+
+        def taken(name):
+            return any(
+                (other["name"] or "").casefold() == name.casefold()
+                and (other.get("tenant") or {}).get("id") == tenant
+                and other["id"] != row["id"]
+                for other in self.records(path, name__ie=name, site_id=site)
+            )
+
+        name = ""
+        for suffix in (f"-decom-{row['serial']}", f"-decom-{row['serial']}-{row['id']}"):
+            name = (row["name"] or "")[: 64 - len(suffix)] + suffix
+            if not taken(name):
+                break
+        data = {"name": name, "status": "decommissioning", "virtual_chassis": None, "vc_position": None}
+        addresses = []
+        if management:
+            # Free the management address and discovery match for the replacement switch.
+            addresses = [row[field]["id"] for field in ("primary_ip4", "primary_ip6") if row.get(field)]
+            data.update({"primary_ip4": None, "primary_ip6": None, "custom_fields": {DISCOVERY_IP: None}})
+        self.request("PATCH", f"{path}{row['id']}/", json=data)
+        for address in addresses:
+            self.request(
+                "PATCH",
+                f"ipam/ip-addresses/{address}/",
+                json={"assigned_object_type": None, "assigned_object_id": None},
+            )
+        return {
+            "device_id": row["id"],
+            "serial": row["serial"],
+            "position": row["vc_position"],
+            "name": name,
         }
 
     def sync_stack_member(self, facts, member, current, manufacturer, defaults):
@@ -631,13 +775,8 @@ class NetBoxDiscovery:
             if existing_stack:
                 # The hostname and IP are the stack's stable management record.
                 # An active/standby election alone does not move physical records.
-                anchor = next((row for row in members if row["member_id"] == current["vc_position"]), None)
-                if anchor is None or (
-                    current["serial"]
-                    and anchor["serial"]
-                    and current["serial"].casefold() != anchor["serial"].casefold()
-                ):
-                    raise SyncError("The management chassis changed or disappeared; check the NetBox stack")
+                current, anchor = self.reconcile_stack(current, members, facts)
+                existing_stack = bool(current)
             else:
                 anchor = next(row for row in members if row["role"] == "active")
             facts["stack_member_id"] = anchor["member_id"]

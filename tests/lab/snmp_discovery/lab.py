@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Poll a simulated multi-vendor SNMP fleet with NetOps Executor and check NetBox.
 
-    ./lab.py                    # up, discover all, rediscover all, fail the stack over; verify each step
+    ./lab.py                    # up, discover all, rediscover all, then stack failover and hardware changes
     ./lab.py up                 # build and start the lab only
     ./lab.py poll [ADDRESS]     # submit one discovery job and print its result (default: the stack)
     ./lab.py down               # stop the lab and delete its volumes
+
+The full run expects an empty NetBox: run ./lab.py down before running it again.
 
 One agent container answers SNMPv3 for every device in FLEET plus a
 four-member Catalyst 9300 stack, each on its own 10.93.0.x address, from walks
@@ -170,6 +172,17 @@ STACK = {
     f"{HOSTNAME}-4": (4, "C9300-48P", "FOC2742L4DD"),
 }
 STACK_VERSION = "17.09.05"
+# The stack after each hardware change in make_walks.CHANGES, and the records
+# each change retires: name -> serial.
+REPLACED = {**STACK, f"{HOSTNAME}-3": (3, "C9300-24P", "FOC2750L3ZZ")}
+RENUMBERED = {
+    **REPLACED,
+    f"{HOSTNAME}-2": (2, "C9300-48P", "FOC2742L4DD"),
+    f"{HOSTNAME}-4": (4, "C9300-48U", "FOC2741L2BB"),
+}
+NEW_MASTER = {**RENUMBERED, HOSTNAME: (1, "C9300-48P", "FOC2751L1EE")}
+RETIRED_3 = {f"{HOSTNAME}-3-decom-FOC2742L3CC": "FOC2742L3CC"}
+RETIRED_1 = {**RETIRED_3, f"{HOSTNAME}-decom-FOC2741L1AA": "FOC2741L1AA"}
 
 failures: list[str] = []
 
@@ -410,11 +423,22 @@ def verify_access_points(job: dict, expect_action: str) -> None:
         check(stored == version, f"{name}: netbox-refresh running {version} (got {stored})")
 
 
-def verify_stack(job: dict, step: str, expect_action: str) -> None:
+def verify_stack(
+    job: dict,
+    step: str,
+    expect_action: str,
+    expected: dict = STACK,
+    retired: dict | None = None,
+    changes: tuple[int, int] = (0, 0),
+    before: dict | None = None,
+) -> dict:
+    """Check the stack; return serial -> NetBox device id for the next step."""
     print(f"\n== {HOSTNAME} stack: {step}")
     facts = verify_job(job, HOSTNAME, expect_action)
     stack = facts.get("stack_inventory") or {}
     check(stack.get("status") == "synced", f"stack inventory synced (got {stack.get('status')})")
+    counts = (len(stack.get("retired") or []), len(stack.get("renumbered") or []))
+    check(counts == changes, f"retired, renumbered this poll: {changes} (got {counts})")
     for member in stack.get("members") or []:
         status = (member.get("software_inventory") or {}).get("status")
         check(status in REPORTED, f"{member.get('name')}: software report accepted (got {status})")
@@ -426,13 +450,13 @@ def verify_stack(job: dict, step: str, expect_action: str) -> None:
         netbox("dcim/devices/", virtual_chassis_id=chassis[0]["id"], limit=100)["results"] if chassis else []
     )
     devices = {row["name"]: row for row in members}
-    check(set(devices) == set(STACK), f"chassis members are {sorted(STACK)} (got {sorted(devices)})")
+    check(set(devices) == set(expected), f"chassis members are {sorted(expected)} (got {sorted(devices)})")
     if chassis:
         check(
             (chassis[0].get("master") or {}).get("id") == devices.get(HOSTNAME, {}).get("id"),
             "virtual chassis master is the hostname record",
         )
-    for name, (position, model, serial) in STACK.items():
+    for name, (position, model, serial) in expected.items():
         row = devices.get(name)
         if not row:
             continue
@@ -454,6 +478,34 @@ def verify_stack(job: dict, step: str, expect_action: str) -> None:
         check(primary == wanted, f"{name}: primary IPv4 {wanted} (got {primary})")
         stored = stored_software(row["id"])
         check(stored == STACK_VERSION, f"{name}: netbox-refresh running {STACK_VERSION} (got {stored})")
+    addresses = netbox("ipam/ip-addresses/", address=STACK_IP)["results"]
+    owners = [((item.get("assigned_object") or {}).get("device") or {}).get("id") for item in addresses]
+    check(
+        owners == [devices.get(HOSTNAME, {}).get("id")],
+        f"{STACK_IP} assigned once, to the hostname record (got devices {owners})",
+    )
+
+    for name, serial in (retired or {}).items():
+        rows = netbox("dcim/devices/", name=name, site_id=site_id())["results"]
+        check(len(rows) == 1, f"{name}: retired record exists (got {len(rows)})")
+        if not rows:
+            continue
+        row = rows[0]
+        check(row["serial"] == serial, f"{name}: serial {serial} (got {row['serial']})")
+        check(
+            row["status"]["value"] == "decommissioning",
+            f"{name}: status decommissioning (got {row['status']['value']})",
+        )
+        check(row["virtual_chassis"] is None, f"{name}: out of the chassis (got {row['virtual_chassis']})")
+        check(row["primary_ip4"] is None, f"{name}: no primary IP (got {row['primary_ip4']})")
+        found = row["custom_fields"].get("snmp_discovery_ip")
+        check(found in (None, ""), f"{name}: no snmp_discovery_ip (got {found})")
+
+    ids = {row["serial"]: row["id"] for row in devices.values()}
+    for serial, device_id in (before or {}).items():
+        if serial in ids:
+            check(ids[serial] == device_id, f"{serial}: keeps NetBox record {device_id} (got {ids[serial]})")
+    return ids
 
 
 def discover_all(expect_action: str) -> None:
@@ -488,8 +540,50 @@ def main() -> int:
     print("\n#### failover: switch 2 becomes active, switch 1 rejoins as standby")
     compose("up", "-d", "--force-recreate", "agents", walk="c9300-stack-failover")
     time.sleep(5)
-    verify_stack(poll(STACK_IP), "an election keeps the management record and IP", "unchanged")
-    compose("up", "-d", "--force-recreate", "agents", walk="c9300-stack")
+    ids = verify_stack(poll(STACK_IP), "an election keeps the management record and IP", "unchanged")
+
+    def change(walk: str, step: str, *args, **kwargs) -> dict:
+        print(f"\n#### {step}")
+        compose("up", "-d", "--force-recreate", "agents", walk=walk)
+        time.sleep(5)
+        return verify_stack(poll(STACK_IP), step, *args, **kwargs)
+
+    ids = change(
+        "c9300-stack-replaced",
+        "switch 3 swapped: new record, old one decommissioning",
+        "unchanged",
+        REPLACED,
+        RETIRED_3,
+        (1, 0),
+        ids,
+    )
+    ids = verify_stack(
+        poll(STACK_IP), "rediscovery after the swap", "unchanged", REPLACED, RETIRED_3, before=ids
+    )
+    ids = change(
+        "c9300-stack-renumbered",
+        "switches 2 and 4 swap numbers: records renamed and moved",
+        "unchanged",
+        RENUMBERED,
+        RETIRED_3,
+        (0, 2),
+        ids,
+    )
+    ids = verify_stack(
+        poll(STACK_IP), "rediscovery after renumbering", "unchanged", RENUMBERED, RETIRED_3, before=ids
+    )
+    ids = change(
+        "c9300-stack-new-master",
+        "switch 1 swapped: new hostname record takes the IP and chassis",
+        "created",
+        NEW_MASTER,
+        RETIRED_1,
+        (1, 0),
+        ids,
+    )
+    verify_stack(
+        poll(STACK_IP), "rediscovery after the new master", "unchanged", NEW_MASTER, RETIRED_1, before=ids
+    )
     print(f"\n{len(failures)} failure(s)" if failures else "\nall checks passed")
     for failure in failures:
         print(f"  {failure}")

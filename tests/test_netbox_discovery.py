@@ -373,3 +373,181 @@ def test_controller_access_points_become_devices_matched_by_serial():
         (rows["dal-ap-103"]["device_id"], "8.10.0.4"),
     ]
     assert rows["dal-ap-101"]["software_inventory"] == {"status": "created", "id": 1061}
+
+
+def stack_record(id_, name, position, serial, **extra):
+    return {
+        "id": id_,
+        "name": name,
+        "vc_position": position,
+        "serial": serial,
+        "site": {"id": 1},
+        "tenant": None,
+        "virtual_chassis": {"id": 30},
+        "primary_ip4": None,
+        "primary_ip6": None,
+        **extra,
+    }
+
+
+def member(number, serial, role="member"):
+    return {
+        "member_id": number,
+        "role": role,
+        "model": "C9300-48P",
+        "serial": serial,
+        "software_version": "17.9.5",
+    }
+
+
+def reconcile(records, members):
+    calls = []
+
+    def handle(request):
+        path = request.url.path.removeprefix("/api/").strip("/")
+        params = request.url.params
+        if request.method == "GET":
+            if path == "dcim/virtual-chassis/30":
+                return httpx.Response(200, json={"id": 30, "master": {"id": records[0]["id"]}})
+            assert path == "dcim/devices"
+            if "virtual_chassis_id" in params:
+                rows = records
+            else:
+                rows = [row for row in records if row["name"].casefold() == params["name__ie"].casefold()]
+            return httpx.Response(200, json={"results": rows, "next": None})
+        data = json.loads(request.content)
+        calls.append((request.method, path, data))
+        return httpx.Response(200, json={"id": int(path.rsplit("/", 1)[1]), **data})
+
+    facts = {"name": "sw"}
+    with httpx.Client(
+        base_url="https://netbox.example/api/", transport=httpx.MockTransport(handle)
+    ) as client:
+        current, anchor = NetBoxDiscovery(client, lambda: None).reconcile_stack(records[0], members, facts)
+    return current, anchor, facts, calls
+
+
+def test_replaced_stack_member_is_retired_so_the_new_switch_takes_its_place():
+    records = [
+        stack_record(1, "sw", 1, "S1"),
+        stack_record(2, "sw-2", 2, "S2"),
+        stack_record(3, "sw-3", 3, "S3"),
+    ]
+    current, anchor, facts, calls = reconcile(
+        records, [member(1, "S1", "active"), member(2, "S2", "standby"), member(3, "S3-NEW")]
+    )
+    assert (current["id"], anchor["member_id"]) == (1, 1)
+    assert calls == [
+        (
+            "PATCH",
+            "dcim/devices/3",
+            {
+                "name": "sw-3-decom-S3",
+                "status": "decommissioning",
+                "virtual_chassis": None,
+                "vc_position": None,
+            },
+        )
+    ]
+    assert facts["stack_changes"] == {
+        "retired": [{"device_id": 3, "serial": "S3", "position": 3, "name": "sw-3-decom-S3"}],
+        "renumbered": [],
+    }
+
+
+def test_swapped_member_numbers_rename_and_move_the_records():
+    records = [
+        stack_record(1, "sw", 1, "S1"),
+        stack_record(2, "sw-2", 2, "S2"),
+        stack_record(3, "sw-3", 3, "S3"),
+    ]
+    current, _, facts, calls = reconcile(
+        records, [member(1, "S1", "active"), member(2, "S3"), member(3, "S2")]
+    )
+    assert current["id"] == 1
+    assert calls == [
+        ("PATCH", "dcim/devices/2", {"vc_position": 255, "name": "sw-renumbering-2"}),
+        ("PATCH", "dcim/devices/3", {"vc_position": 254, "name": "sw-renumbering-3"}),
+        ("PATCH", "dcim/devices/2", {"vc_position": 3, "name": "sw-3"}),
+        ("PATCH", "dcim/devices/3", {"vc_position": 2, "name": "sw-2"}),
+    ]
+    assert [(row["serial"], row["from"], row["to"]) for row in facts["stack_changes"]["renumbered"]] == [
+        ("S2", 2, 3),
+        ("S3", 3, 2),
+    ]
+
+
+def test_moving_to_a_free_member_number_needs_no_parking():
+    records = [stack_record(1, "sw", 1, "S1"), stack_record(2, "sw-2", 2, "S2")]
+    _, _, _, calls = reconcile(records, [member(1, "S1", "active"), member(5, "S2")])
+    assert calls == [("PATCH", "dcim/devices/2", {"vc_position": 5, "name": "sw-5"})]
+
+
+def test_replaced_management_switch_frees_its_name_address_and_chassis_role():
+    records = [
+        stack_record(1, "sw", 1, "S1", primary_ip4={"id": 70}),
+        stack_record(2, "sw-2", 2, "S2"),
+    ]
+    current, anchor, facts, calls = reconcile(records, [member(1, "S1-NEW"), member(2, "S2", "active")])
+    assert current is None and anchor["serial"] == "S1-NEW"
+    assert facts["stack_chassis_id"] == 30
+    assert calls == [
+        ("PATCH", "dcim/virtual-chassis/30", {"master": None}),
+        (
+            "PATCH",
+            "dcim/devices/1",
+            {
+                "name": "sw-decom-S1",
+                "status": "decommissioning",
+                "virtual_chassis": None,
+                "vc_position": None,
+                "primary_ip4": None,
+                "primary_ip6": None,
+                "custom_fields": {"snmp_discovery_ip": None},
+            },
+        ),
+        ("PATCH", "ipam/ip-addresses/70", {"assigned_object_type": None, "assigned_object_id": None}),
+    ]
+
+
+def test_a_retired_name_already_in_use_gets_the_record_id():
+    records = [
+        stack_record(1, "sw", 1, "S1"),
+        stack_record(2, "sw-2", 2, "S2"),
+        # Same switch retired from this slot once before.
+        {**stack_record(9, "sw-2-decom-S2", None, "S2"), "virtual_chassis": None},
+    ]
+    in_chassis = records[:2]
+
+    calls = []
+
+    def handle(request):
+        path = request.url.path.removeprefix("/api/").strip("/")
+        params = request.url.params
+        if request.method == "GET":
+            if path == "dcim/virtual-chassis/30":
+                return httpx.Response(200, json={"id": 30, "master": {"id": 1}})
+            rows = (
+                in_chassis
+                if "virtual_chassis_id" in params
+                else [row for row in records if row["name"].casefold() == params["name__ie"].casefold()]
+            )
+            return httpx.Response(200, json={"results": rows, "next": None})
+        calls.append((path, json.loads(request.content)["name"]))
+        return httpx.Response(200, json={})
+
+    with httpx.Client(
+        base_url="https://netbox.example/api/", transport=httpx.MockTransport(handle)
+    ) as client:
+        NetBoxDiscovery(client, lambda: None).reconcile_stack(
+            in_chassis[0], [member(1, "S1", "active"), member(2, "S2-NEW")], {"name": "sw"}
+        )
+    assert calls == [("dcim/devices/2", "sw-2-decom-S2-2")]
+
+
+def test_management_slot_reused_by_a_known_switch_is_left_for_review():
+    from netops_executor.netbox_discovery import SyncError
+
+    records = [stack_record(1, "sw", 1, "S1"), stack_record(2, "sw-2", 2, "S2")]
+    with pytest.raises(SyncError, match="management switch left the stack"):
+        reconcile(records, [member(1, "S2", "active"), member(3, "S3")])

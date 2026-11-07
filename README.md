@@ -2265,8 +2265,22 @@ with the SNMP hostname. Other switches use `<hostname>-<member ID>` and get
 their own model, serial, and reported software version. Discovery assigns
 the polled IP only to the hostname record. Subsequent elections keep that
 management record and its IP stable. Provisioned slots and modules are skipped.
-A changed chassis serial at an existing member position reports a conflict
-for review. Discovery retains existing members when an agent stops reporting them.
+Members are matched to NetBox records by serial. When a switch reports a
+different member number, its record is renamed and moved to match, so its
+history stays with the hardware; swapped numbers are handled. When a member
+number is in use by different hardware, the old record is retired: it is
+renamed `<name>-decom-<old serial>`, set to Decommissioning, and taken out of
+the virtual chassis, and the new switch gets a new record with the member's
+name. (NetBox requires device names to be unique per site and tenant whatever
+the status, so the retired record cannot keep the name.) If the management
+switch is replaced, the new hardware in its slot takes over the hostname, the
+polled IP, and the chassis master role, and the old record also loses its
+primary IP and `snmp_discovery_ip`. If a switch the stack already knows takes
+the management switch's slot, discovery stops for review. A retired name
+already in use gets the record ID appended. `result.discovery.stack_inventory`
+lists the `retired` and `renumbered` records. Discovery retains existing
+members when an agent stops reporting them and nothing else takes their
+number.
 
 Vendor identity comes from ENTITY-MIB where the device fills it in, and from the
 vendor's own MIB otherwise. Discovery reads model, serial, version and platform
