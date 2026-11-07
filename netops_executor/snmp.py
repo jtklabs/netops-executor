@@ -1,19 +1,23 @@
-"""Bounded SNMP v3 GETBULK/GETNEXT walks and GETs; no SSH or inventory dependency."""
+"""Bounded SNMP v3 reads and optional NetBox discovery."""
 
 import asyncio
 import base64
 import json
 import os
+import re
 
 import httpx
+from paramiko import SSHException
 from pysnmp.hlapi.v3arch import asyncio as snmp
 from pysnmp.proto import rfc1902, rfc1905
 
 from .credentials import AuthenticationRejected, Selector, Vault
+from .f5_operations import license_serial
 from .netbox_discovery import SyncError, sync_device
 from .snmp_address import collect_polled_address
 from .snmp_identity import ENTITY_CLASS, collect_identity, text
 from .snmp_models import SnmpWalkRequest
+from .ssh import SSH, DeviceError
 from .store import CancelRequested, LostOwnership
 
 MAX_RESULT_BYTES = 16 * 1024 * 1024
@@ -320,15 +324,21 @@ class SnmpRunner:
 
     def sync_inventory(self):
         discovery = self.result["discovery"]
+
+        def checkpoint():
+            self.store.checkpoint(self.job["id"], self.worker)
+
+        if discovery["manufacturer"] == "F5" and re.search(
+            r"\bBIG-IP\s+(?:Virtual Edition|VE)\b", discovery["model"], re.I
+        ):
+            discovery["serial"] = self.read_f5_license_serial(checkpoint)
+
         missing = [
             field
             for field in ("name", "manufacturer", "model", "serial", "software_version")
             if not discovery[field]
         ]
         discovery["missing"] = missing
-
-        def checkpoint():
-            self.store.checkpoint(self.job["id"], self.worker)
 
         try:
             if any(field in missing for field in ("name", "manufacturer", "model")):
@@ -357,6 +367,29 @@ class SnmpRunner:
             discovery["netbox"] = {"status": action, "device_id": device_id}
             return "completed_with_warnings" if missing else "succeeded"
         return "failed"
+
+    def read_f5_license_serial(self, checkpoint):
+        # SNMP jobs may target arbitrary IPs. Only send SSH credentials to an
+        # unambiguous F5 endpoint configured by the executor administrator.
+        targets = [
+            d
+            for d in self.settings.devices.values()
+            if d.host == str(self.request.device_ip) and d.device_type == "f5"
+        ]
+        if len(targets) != 1:
+            return ""
+        ssh = SSH(
+            self.settings,
+            targets[0],
+            guard=checkpoint,
+            audit=lambda data: self.store.credential_event(self.job["id"], self.worker, data),
+        )
+        try:
+            return license_serial(ssh)
+        except (DeviceError, OSError, EOFError, SSHException):
+            return ""
+        finally:
+            ssh.close()
 
     def audit_credential(self, items):
         # Record the vault profile once an operation's first data is committed.

@@ -2230,7 +2230,13 @@ The next poll moves devices with the old `SNMP discovered` role to this scheme.
 For other existing devices, discovery preserves their assigned role and adds
 only the poller tag. The name `discovered` is reserved for discovery provenance.
 Serial numbers go in the native serial field and running versions in
-the `software_version` custom field. Discovery fills an unset NetBox platform
+the `software_version` custom field. For F5 BIG-IP Virtual Edition, discovery
+uses the last seven characters of the base registration key as the serial.
+Configure one `f5` device with the polled IP as its `host`, working SSH
+credentials, and a trusted host key. The executor runs the read-only
+`show /sys license` command over SSH and retains only the serial suffix.
+If the lookup is unavailable, discovery reports a missing serial and preserves
+the existing NetBox serial. Discovery fills an unset NetBox platform
 when it identifies the OS family, such as Cisco IOS, Cisco IOS-XE, or Cisco NX-OS.
 It preserves an existing platform assignment. When SNMP identifies the interface
 and prefix for the polled address, discovery assigns the IP to that interface

@@ -533,6 +533,67 @@ def test_discovery_configuration_and_required_identity(client, settings, store, 
     assert "enough identity" in state["result"]["discovery"]["netbox"]["error"]
 
 
+@pytest.mark.parametrize(
+    ("model", "configured", "output", "serial"),
+    [
+        ("BIG-IP Virtual Edition", True, "Registration key    ABCDE-FGHIJ-KLMNO-PQRST-UVW1234", "UVW1234"),
+        ("BIG-IP Virtual Edition", True, "Registration key    none", ""),
+        ("BIG-IP Virtual Edition", False, None, ""),
+        ("BIG-IP i4600", True, None, "SNMP-SERIAL"),
+    ],
+)
+def test_f5_discovery_uses_license_suffix_for_ve(
+    client, settings, store, monkeypatch, model, configured, output, serial
+):
+    from netops_executor.config import Device
+    from netops_executor.snmp_identity import SYS_NAME, SYS_OBJECT_ID
+
+    settings.netbox_url = "https://netbox.example"
+    settings.netbox_token = "x" * 40
+    settings.poller_instance = "lab"
+    if configured:
+        settings.devices["bigip"] = Device(id="bigip", host="192.0.2.15", device_type="f5")
+    FakeAgent(
+        monkeypatch,
+        {
+            SYS_NAME: rfc1902.OctetString("bigip"),
+            SYS_OBJECT_ID: rfc1902.ObjectName("1.3.6.1.4.1.3375.2.1.3.2"),
+            "1.3.6.1.4.1.3375.2.1.3.5.2.0": rfc1902.OctetString(model),
+            "1.3.6.1.4.1.3375.2.1.3.3.3.0": rfc1902.OctetString("SNMP-SERIAL"),
+            "1.3.6.1.4.1.3375.2.1.4.2.0": rfc1902.OctetString("17.5.1"),
+        },
+    )
+    seen = []
+
+    class LicenseSSH:
+        def __init__(self, _settings, device, guard, audit):
+            assert device.id == "bigip"
+            guard()
+
+        def tmsh(self, command, timeout):
+            assert command == "show /sys license" and output is not None
+            seen.append("read")
+            return output
+
+        def close(self):
+            seen.append("close")
+
+    def sync(_settings, _site, _poller, _address, discovery, _checkpoint):
+        assert discovery["serial"] == serial
+        return "updated", 42
+
+    monkeypatch.setattr(snmp, "SSH", LicenseSSH)
+    monkeypatch.setattr(snmp, "sync_device", sync)
+    response = client.post("/api/v1/snmp/walks", json={"device_ip": "192.0.2.15", "site": "Lab"})
+    assert response.status_code == 202
+    process(settings, store, store.claim("worker"), "worker")
+    job = store.get(response.json()["id"])
+    assert job["status"] == ("succeeded" if serial else "completed_with_warnings")
+    assert job["result"]["discovery"]["missing"] == ([] if serial else ["serial"])
+    assert "ABCDE-FGHIJ" not in json.dumps(job["result"])
+    assert seen == (["read", "close"] if output is not None else [])
+
+
 @pytest.mark.parametrize(("suffix", "version_scalar"), [("", True), (".0", True), ("", False)])
 def test_opengear_discovery_reads_serial_and_appliance_firmware(
     client, settings, store, monkeypatch, suffix, version_scalar

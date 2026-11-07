@@ -189,6 +189,17 @@ def license_date(device):
     return "-".join(match.groups())
 
 
+def license_serial(ssh):
+    output = ssh.tmsh("show /sys license", timeout=10)
+    matches = re.findall(
+        r"(?im)^[ \t]*(?:base )?registration key[ \t:]+(?:[a-z0-9]+-)+([a-z0-9]{7})[ \t\r]*$",
+        output,
+    )
+    if len(matches) != 1:
+        raise DeviceError("F5 license serial unavailable")
+    return matches[0]
+
+
 def free_bytes(device):
     rows = device.ssh.shell("df -Pk /shared/images").splitlines()
     try:
