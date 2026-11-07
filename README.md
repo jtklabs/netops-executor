@@ -2256,9 +2256,19 @@ custom field. NetBox requires unique
 device names within each site and tenant, so a different IP with the same
 name in that scope reports a conflict.
 
+Cisco StackWise discovery joins present switch rows to their ENTITY-MIB chassis
+records. A stack gets a NetBox virtual chassis and one device per switch.
+The first scan uses the elected active switch as the management record, named
+with the SNMP hostname. Other switches use `<hostname>-<member ID>` and get
+their own model, serial, and reported software version. Discovery assigns
+the polled IP only to the hostname record. Subsequent elections keep that
+management record and its IP stable. Provisioned slots and modules are skipped.
+A changed chassis serial at an existing member position reports a conflict
+for review. Discovery retains existing members when an agent stops reporting them.
+
 The token needs view/add access for sites, manufacturers, device types,
 device roles, platforms, tags, interfaces, and device custom fields, plus
-view/add/change access for devices and IP addresses.
+view/add/change access for devices, IP addresses, and Cisco virtual chassis.
 `result.discovery` reports the collected facts, missing fields,
 and whether NetBox created, updated, or already had the device. Name,
 manufacturer, and model are required to write a device. If the agent omits a

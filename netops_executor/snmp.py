@@ -18,6 +18,7 @@ from .netbox_discovery import SyncError, sync_device
 from .snmp_address import collect_polled_address
 from .snmp_identity import ENTITY_CLASS, collect_identity, text
 from .snmp_models import SnmpWalkRequest
+from .snmp_stack import StackInventoryError, collect_stack
 from .ssh import SSH, DeviceError
 from .store import CancelRequested, LostOwnership
 
@@ -268,48 +269,61 @@ class SnmpRunner:
                 self.audit_credential([inventory])
             return {str(oid): text(value) for oid, value in values}
 
-        async def first_value(root, expected=None):
-            current = rfc1902.ObjectName(root)
-            prefix = current
-            # ENTITY-MIB chassis rows normally appear early. Bound the work on
-            # devices that expose only ports/modules or a malformed table.
-            remaining = 256
-            while remaining:
-                kind = "bulk" if expected is not None and self.repetitions else "next"
+        async def walk_column(root, *, bulk, limit):
+            current = prefix = rfc1902.ObjectName(root)
+            remaining = limit
+            while True:
+                kind = "bulk" if bulk and self.repetitions else "next"
                 indication, status, index, bindings = await self.send(
                     engine, auth, target, context, kind, [current]
                 )
-                try:
-                    failure = self.check(indication, status, index, produced=bool(inventory))
-                except WalkError:
-                    return ""
+                failure = self.check(indication, status, index, produced=bool(inventory))
                 if failure:
                     if kind == "bulk" and self.degrade(failure[0], root):
                         continue
-                    return ""
+                    raise WalkError(failure[1])
                 if not bindings:
-                    return ""
-                for oid, value in bindings[:remaining]:
-                    if (
-                        value is None
-                        or isinstance(value, MISSING)
-                        or oid <= current
-                        or not prefix.isPrefixOf(oid)
-                    ):
-                        return ""
+                    raise WalkError("SNMP agent returned an empty inventory response")
+                for oid, value in bindings:
+                    if value is None or isinstance(value, MISSING) or not prefix.isPrefixOf(oid):
+                        return
+                    if oid <= current or not remaining:
+                        raise WalkError("SNMP inventory column is invalid or exceeds its row limit")
                     self.audit_credential([inventory])
-                    if expected is None:
-                        return text(value)
-                    if text(value) == expected:
-                        return str(oid).rsplit(".", 1)[-1]
+                    yield str(oid).removeprefix(root + "."), text(value)
                     current = oid
                     remaining -= 1
+
+        async def first_value(root, expected=None):
+            # ENTITY-MIB chassis rows normally appear early even in large inventories.
+            try:
+                async for index, value in walk_column(root, bulk=expected is not None, limit=256):
+                    if expected is None:
+                        return value
+                    if value == expected:
+                        return index
+            except WalkError:
+                pass
             return ""
 
         async def chassis_index():
             return await first_value(ENTITY_CLASS, expected="3")
 
         facts = await collect_identity(get, chassis_index, first_value)
+        if facts["manufacturer"] == "Cisco":
+            try:
+                members = await collect_stack(get, walk_column)
+            except StackInventoryError as error:
+                facts["stack_inventory"] = {"status": "failed", "error": str(error)}
+            except WalkError:
+                facts["stack_inventory"] = {"status": "failed", "error": "Cisco stack inventory read failed"}
+            else:
+                if members:
+                    active = next(member for member in members if member["role"] == "active")
+                    facts["stack_members"] = members
+                    facts["model"] = active["model"]
+                    facts["serial"] = active["serial"]
+                    facts["software_version"] = active["software_version"] or facts["software_version"]
         collected_at = datetime.now(timezone.utc).isoformat()
         try:
             management_ip = await collect_polled_address(get, self.request.device_ip)
@@ -368,8 +382,11 @@ class SnmpRunner:
             }
         else:
             discovery["netbox"] = {"status": action, "device_id": device_id}
-            software_failed = discovery.get("software_inventory", {}).get("status") == "failed"
-            return "completed_with_warnings" if missing or software_failed else "succeeded"
+            optional_failure = any(
+                discovery.get(field, {}).get("status") in {"failed", "warning"}
+                for field in ("software_inventory", "stack_inventory")
+            )
+            return "completed_with_warnings" if missing or optional_failure else "succeeded"
         return "failed"
 
     def read_f5_license_serial(self, checkpoint):

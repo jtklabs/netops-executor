@@ -687,3 +687,68 @@ def test_discovery_reads_polled_ip_interface_and_prefix(
     job = store.get(response.json()["id"])
     expected = {"interface": "eth0", "address": cidr, "dhcp": table == "modern"} if cidr else None
     assert job["result"]["discovery"]["management_ip"] == expected
+
+
+def test_cisco_stack_discovery_joins_member_chassis_and_excludes_provisioned_slots(
+    client, settings, store, monkeypatch
+):
+    from netops_executor.snmp_identity import ENTITY, SYS_DESCR, SYS_NAME, SYS_OBJECT_ID
+    from netops_executor.snmp_stack import STACK_ENTRY
+
+    settings.netbox_url = "https://netbox.example"
+    settings.netbox_token = "x" * 40
+    settings.poller_instance = "lab"
+    octets = rfc1902.OctetString
+    integer = rfc1902.Integer32
+    values = {
+        SYS_NAME: octets("core.example"),
+        SYS_DESCR: octets("Cisco IOS XE Software, Version 17.09.05"),
+        SYS_OBJECT_ID: rfc1902.ObjectName("1.3.6.1.4.1.9.1.1"),
+        f"{ENTITY}.5.15": integer(9),  # A module cannot become a switch.
+    }
+    for index, number, role, state, model, serial, version in (
+        (1000, 1, 4, 4, "C9300-48P", "STANDBY-1", "17.9.4"),
+        (2000, 2, 1, 4, "C9300-24T", "ACTIVE-2", "17.9.5"),
+        (3000, 3, 2, 9, "C9300-48P", "", ""),
+    ):
+        values.update(
+            {
+                f"{STACK_ENTRY}.1.{index}": integer(number),
+                f"{STACK_ENTRY}.3.{index}": integer(role),
+                f"{STACK_ENTRY}.6.{index}": integer(state),
+                f"{ENTITY}.5.{index}": integer(3),
+                f"{ENTITY}.10.{index}": octets(version),
+                f"{ENTITY}.11.{index}": octets(serial),
+                f"{ENTITY}.13.{index}": octets(model),
+            }
+        )
+    FakeAgent(monkeypatch, values)
+    monkeypatch.setattr(snmp, "sync_device", lambda *_: ("created", 42))
+    response = client.post("/api/v1/snmp/walks", json={"device_ip": "192.0.2.15", "site": "Lab"})
+    assert response.status_code == 202
+    process(settings, store, store.claim("worker"), "worker")
+    job = store.get(response.json()["id"])
+    assert job["status"] == "succeeded"
+    facts = job["result"]["discovery"]
+    assert (facts["name"], facts["serial"], facts["model"], facts["software_version"]) == (
+        "core.example",
+        "ACTIVE-2",
+        "C9300-24T",
+        "17.9.5",
+    )
+    assert facts["stack_members"] == [
+        {
+            "member_id": 1,
+            "role": "standby",
+            "model": "C9300-48P",
+            "serial": "STANDBY-1",
+            "software_version": "17.9.4",
+        },
+        {
+            "member_id": 2,
+            "role": "active",
+            "model": "C9300-24T",
+            "serial": "ACTIVE-2",
+            "software_version": "17.9.5",
+        },
+    ]

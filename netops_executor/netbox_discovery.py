@@ -197,9 +197,147 @@ class NetBoxDiscovery:
         if (management_ip := facts.get("management_ip")) and self.assign_primary_ip(device, management_ip):
             if action == "unchanged":
                 action = "updated"
+        if facts.get("stack_member_id"):
+            try:
+                facts["stack_inventory"] = self.sync_stack(device, poller, facts)
+            except SyncError as error:
+                facts["stack_inventory"] = {"status": "failed", "error": str(error)}
+            except httpx.HTTPStatusError as error:
+                facts["stack_inventory"] = {
+                    "status": "failed",
+                    "error": f"NetBox stack sync returned HTTP {error.response.status_code}",
+                }
+            except (httpx.RequestError, OSError, ValueError, TypeError, KeyError):
+                facts["stack_inventory"] = {"status": "failed", "error": "Could not sync the NetBox stack"}
         if facts["software_version"] and (device.get("platform") or facts.get("platform")):
             facts["software_inventory"] = self.report_software(device["id"], facts)
         return action, device["id"]
+
+    def sync_stack(self, device, poller, facts):
+        path = "dcim/virtual-chassis/"
+        devices_path = "dcim/devices/"
+        anchor = facts["stack_member_id"]
+        suffix = f"-{device['id']}"
+        chassis_name = facts["name"][: 64 - len(suffix)] + suffix
+        if existing := device.get("virtual_chassis"):
+            chassis = self.request("GET", f"{path}{existing['id']}/")
+        else:
+            chassis = self.ensure(path, lambda: self.named(path, chassis_name), {"name": chassis_name})
+        chassis_id = chassis["id"]
+        master = (chassis.get("master") or {}).get("id")
+        if master not in (None, device["id"]):
+            raise SyncError("The polled device is not the management member of its NetBox virtual chassis")
+        positions = {
+            row["vc_position"]: row for row in self.records(devices_path, virtual_chassis_id=chassis_id)
+        }
+        if anchor in positions and positions[anchor]["id"] != device["id"]:
+            raise SyncError("The management member's position is already in use in NetBox")
+        if not device.get("virtual_chassis"):
+            self.request(
+                "PATCH",
+                f"{devices_path}{device['id']}/",
+                json={"virtual_chassis": chassis_id, "vc_position": anchor},
+            )
+        if master is None:
+            self.request("PATCH", f"{path}{chassis_id}/", json={"master": device["id"]})
+        manufacturer = self.named_object("dcim/manufacturers/", facts["manufacturer"])
+        tag = self.named_object("extras/tags/", poller, poller)
+        discovered = self.named_object("extras/tags/", DISCOVERED_TAG)
+        role = self.named_object("dcim/device-roles/", "Switch")
+        defaults = {
+            "site": device["site"]["id"],
+            "tenant": (device.get("tenant") or {}).get("id"),
+            "role": role["id"],
+            "platform": (device.get("platform") or {}).get("id"),
+            "virtual_chassis": chassis_id,
+            "status": "active",
+            "tags": [tag["id"], discovered["id"]],
+        }
+        results = [
+            self.sync_stack_member(facts, member, positions.get(member["member_id"]), manufacturer, defaults)
+            for member in facts["stack_members"]
+            if member["member_id"] != anchor
+        ]
+        incomplete = any(
+            row.get("software_inventory", {}).get("status") == "failed" for row in results
+        ) or any(not member["serial"] or not member["software_version"] for member in facts["stack_members"])
+        return {
+            "status": "warning" if incomplete else "synced",
+            "virtual_chassis_id": chassis_id,
+            "members": results,
+        }
+
+    def sync_stack_member(self, facts, member, current, manufacturer, defaults):
+        path = "dcim/devices/"
+        position = member["member_id"]
+        suffix = f"-{position}"
+        name = facts["name"][: 64 - len(suffix)] + suffix
+        site_id, tenant_id = defaults["site"], defaults["tenant"]
+
+        def lookup():
+            for row in self.records(path, name__ie=name, site_id=site_id):
+                if (row["name"] or "").casefold() != name.casefold() or (
+                    (row.get("tenant") or {}).get("id") != tenant_id
+                ):
+                    continue
+                chassis = (row.get("virtual_chassis") or {}).get("id")
+                if chassis == defaults["virtual_chassis"] and row["vc_position"] == position:
+                    return row
+                raise SyncError(f"Stack member {name} conflicts with an existing NetBox device")
+            return None
+
+        # Check the name even when a member was found by slot; renaming must not collide.
+        named = lookup()
+        current = current or named
+        if current and any(current.get(field) for field in ("primary_ip4", "primary_ip6", "oob_ip")):
+            raise SyncError(f"Stack member {name} has a management IP in NetBox")
+        if (
+            current
+            and member["serial"]
+            and current["serial"]
+            and (member["serial"].casefold() != current["serial"].casefold())
+        ):
+            raise SyncError(f"Stack member {name} has a different chassis serial in NetBox")
+        device_type = self.device_type(manufacturer, member["model"])
+        fields = {SOFTWARE_VERSION: member["software_version"]} if member["software_version"] else {}
+        platform = defaults["platform"]
+        if not current:
+            current = self.ensure(
+                path,
+                lookup,
+                {
+                    **defaults,
+                    "name": name,
+                    "device_type": device_type["id"],
+                    "serial": member["serial"],
+                    "vc_position": position,
+                    "custom_fields": fields,
+                },
+            )
+        else:
+            changes = {}
+            if current["name"] != name:
+                changes["name"] = name
+            if current["device_type"]["id"] != device_type["id"]:
+                changes["device_type"] = device_type["id"]
+            if member["serial"] and current["serial"] != member["serial"]:
+                changes["serial"] = member["serial"]
+            if platform and not current.get("platform"):
+                changes["platform"] = platform
+            if fields and current["custom_fields"].get(SOFTWARE_VERSION) != member["software_version"]:
+                changes["custom_fields"] = fields
+            poller_tag = defaults["tags"][0]
+            if poller_tag not in {item["id"] for item in current["tags"]}:
+                changes["add_tags"] = [poller_tag]
+            if changes:
+                self.request("PATCH", f"{path}{current['id']}/", json=changes)
+        result = {"member_id": position, "device_id": current["id"], "name": name}
+        if member["software_version"] and (current.get("platform") or platform):
+            result["software_inventory"] = self.report_software(
+                current["id"],
+                {**member, "collected_at": facts.get("collected_at")},
+            )
+        return result
 
     def report_software(self, device_id, facts):
         data = {"device": device_id, "version": facts["software_version"], "source": "snmp"}
@@ -286,15 +424,39 @@ class NetBoxDiscovery:
         self.custom_field(SOFTWARE_VERSION, "Software version", "Running software version reported by SNMP.")
         site = self.named_object("dcim/sites/", site_name)
         tag = self.named_object("extras/tags/", poller, poller)
-        manufacturer = self.named_object("dcim/manufacturers/", facts["manufacturer"])
-        device_type = self.device_type(manufacturer, facts["model"])
-
         path = "dcim/devices/"
         name = facts["name"]
         current = self.device(name, address)
+        members = facts.get("stack_members")
+        existing_stack = current and current.get("virtual_chassis") and facts["manufacturer"] == "Cisco"
+        if members:
+            if existing_stack:
+                # The hostname and IP are the stack's stable management record.
+                # An active/standby election alone does not move physical records.
+                anchor = next((row for row in members if row["member_id"] == current["vc_position"]), None)
+                if anchor is None or (
+                    current["serial"]
+                    and anchor["serial"]
+                    and current["serial"].casefold() != anchor["serial"].casefold()
+                ):
+                    raise SyncError("The management chassis changed or disappeared; check the NetBox stack")
+            else:
+                anchor = next(row for row in members if row["role"] == "active")
+            facts["stack_member_id"] = anchor["member_id"]
+            facts["model"] = anchor["model"]
+            facts["serial"] = anchor["serial"]
+            if anchor["role"] != "active":
+                facts["software_version"] = anchor["software_version"]
+        if existing_stack and not members:
+            # Without StackWise membership, the first ENTITY-MIB chassis might
+            # be another switch. Keep the established hardware identity.
+            device_type = current["device_type"]
+        else:
+            manufacturer = self.named_object("dcim/manufacturers/", facts["manufacturer"])
+            device_type = self.device_type(manufacturer, facts["model"])
         fields = {DISCOVERY_IP: address}
         data = {"device_type": device_type["id"], "site": site["id"]}
-        if facts["serial"]:
+        if facts["serial"] and (not existing_stack or members):
             data["serial"] = facts["serial"]
         if facts["software_version"]:
             fields[SOFTWARE_VERSION] = facts["software_version"]
@@ -347,5 +509,5 @@ class NetBoxDiscovery:
         if missing_tags := [tag_id for tag_id in tag_ids if tag_id not in existing_tags]:
             data["add_tags"] = missing_tags
         if data:
-            self.request("PATCH", f"{path}{current['id']}/", json=data)
+            current = self.request("PATCH", f"{path}{current['id']}/", json=data)
         return ("updated" if data else "unchanged"), current
