@@ -89,7 +89,11 @@ class ValidationPolicy(Model):
     on_timeout: Literal["needs_review", "fail"] = "needs_review"
     consecutive_passes: int = Field(default=2, ge=1, le=10)
     settling_seconds: int = Field(default=30, ge=0, le=3600)
-    waf_request_check: bool = False
+    # None: on for reboot jobs. True: required (rejected without reboot). False: off.
+    waf_request_check: bool | None = Field(
+        default=None,
+        description="After restoring traffic, require one ASM request logged after the reboot. Default: on for reboot jobs on active units with WAF policies.",
+    )
     ltm_min_unchanged_percent: float = Field(default=100, ge=0, le=100)
     waf_min_unchanged_percent: float = Field(default=100, ge=0, le=100)
 
@@ -104,6 +108,13 @@ class StandaloneDrain(Model):
     enabled: bool = True
     remaining_connections: int | None = Field(default=None, ge=0)
     reduction_percent: float | None = Field(default=None, ge=0, le=100)
+    plateau_percent: float | None = Field(
+        default=None,
+        gt=0,
+        le=100,
+        description="Also drained when connections fall less than this percent over one plateau window",
+    )
+    plateau_window_seconds: int = Field(default=60, ge=5, le=3600)
     timeout_seconds: int = Field(default=600, ge=0, le=86400)
     reboot_on_timeout: bool = False
 
@@ -152,6 +163,8 @@ class JobRequest(ScheduledRequest):
     drain: bool = False
     drain_connections: int | None = Field(default=None, ge=0)
     drain_percent: float | None = Field(default=None, ge=0, le=100)
+    drain_plateau_percent: float | None = Field(default=None, gt=0, le=100)
+    drain_plateau_window: int = Field(default=60, ge=5, le=3600)
     drain_timeout: int = Field(default=300, ge=0, le=86400)
     reboot_on_drain_timeout: bool = False
     install_timeout: int = Field(default=3600, ge=60, le=86400)
@@ -165,13 +178,21 @@ class JobRequest(ScheduledRequest):
             self.drain = True
             self.drain_connections, self.drain_percent = d.remaining_connections, d.reduction_percent
             self.drain_timeout, self.reboot_on_drain_timeout = d.timeout_seconds, d.reboot_on_timeout
+            self.drain_plateau_percent, self.drain_plateau_window = (
+                d.plateau_percent,
+                d.plateau_window_seconds,
+            )
         if self.backup_directory is not None:
             p = PurePosixPath(self.backup_directory)
             if p.is_absolute() or ".." in p.parts or not p.parts:
                 raise ValueError("backup_directory must be a relative directory under BACKUP_ROOT")
         if self.drain_connections is not None and self.drain_percent is not None:
             raise ValueError("choose a connection count or a percent to drain, not both")
-        if self.drain_connections is not None or self.drain_percent is not None:
+        if (
+            self.drain_connections is not None
+            or self.drain_percent is not None
+            or self.drain_plateau_percent is not None
+        ):
             self.drain = True
         if self.validation_policy.waf_request_check and not self.reboot:
             raise ValueError("WAF request validation requires reboot")

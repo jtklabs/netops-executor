@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,9 @@ class FakeSSH:
     def __init__(self):
         self.commands = []
         self.remote = {}
+        # Device clock and ASM request log for the post-upgrade WAF request check.
+        self.clock = "2026-11-08T04:00:00Z"
+        self.asm_requests = [{"id": "8723401", "requestDatetime": "2026-11-08T04:05:00Z"}]
 
     def tmsh(self, command, **kwargs):
         self.commands.append((command, kwargs))
@@ -85,6 +89,12 @@ class FakeSSH:
         if command.startswith("mv --"):
             _, _, source, dest = command.split()
             self.remote[dest] = self.remote[source]
+        if command.startswith("date -u"):
+            return self.clock + "\n"
+        if "/mgmt/tm/asm/events/requests" in command:
+            return json.dumps(
+                {"kind": "tm:asm:events:requests:requestcollectionstate", "items": self.asm_requests}
+            )
         return ""
 
     def put(self, local, remote):

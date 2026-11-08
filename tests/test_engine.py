@@ -3,6 +3,7 @@ import json
 import pytest
 from conftest import Clock, FakeDevice
 
+from netops_executor import f5_operations as ops
 from netops_executor.engine import Runner
 from netops_executor.models import JobRequest
 from netops_executor.ssh import DeviceError
@@ -177,6 +178,8 @@ def test_post_validation_detects_individual_regression(settings, store):
 
 def test_wrong_image_digest_prevents_install(settings, store, image):
     image["sha256"] = "0" * 64
+    fake = FakeDevice()
+    fake.v["HD1.2"]["version"] = "15.1.0"
     j, fake = execute(
         settings,
         store,
@@ -187,6 +190,7 @@ def test_wrong_image_digest_prevents_install(settings, store, image):
             "allowed_source_versions": ["16.1.5"],
             "ucs_unencrypted": True,
         },
+        fake,
     )
     assert not fake.installs
     assert "SHA-256" in j["result"]["error"]
@@ -238,3 +242,139 @@ def test_transferred_image_waits_for_catalog(settings, store, image):
     job, _ = execute(settings, store, {"transfer": True, "images": [image]}, fake)
     assert job["status"] == "succeeded"
     assert len(attempts) == 2
+
+
+def steps(store, job):
+    return [e["step"] for e in store.events(job["id"], 0, 1000)]
+
+
+def test_volume_with_target_software_gets_only_the_config_copy(settings, store, image):
+    # HD1.2 already runs the final 17.1.2 build: no image transfer, check or install, only cpcfg.
+    j, fake = execute(settings, store, reboot_options(install=True, images=[image]))
+    assert j["status"] == "succeeded", j["result"]
+    assert j["result"]["reused_volume"] == "HD1.2"
+    assert not fake.installs and not fake.ssh.remote
+    assert ("cpcfg HD1.1 HD1.2", {}) in fake.ssh.commands
+    assert fake.reboots == ["HD1.2"]
+    assert "transfer_started" not in steps(store, j)
+
+
+def test_drain_ends_on_plateau(settings, store):
+    fake = FakeDevice()
+    # 100 before disabling, then 90 and holding: the first minute drops 11%, the second 0%.
+    fake.counts = iter([100, 90, 89])
+    j, fake = execute(settings, store, reboot_options(drain_plateau_percent=5), fake)
+    assert j["status"] == "succeeded", j["result"]
+    drain = j["result"]["drain"]
+    assert drain["reason"] == "plateau" and drain["final_connections"] == 89
+    assert drain["window_reduction_percent"] == 0
+    assert fake.reboots == ["HD1.2"]
+
+
+def test_drain_count_still_ends_before_plateau(settings, store):
+    fake = FakeDevice()
+    fake.counts = iter([100, 40])
+    j, _ = execute(
+        settings,
+        store,
+        reboot_options(standalone_drain={"remaining_connections": 50, "plateau_percent": 5}),
+        fake,
+    )
+    assert j["status"] == "succeeded"
+    assert j["result"]["drain"]["reason"] == "threshold"
+
+
+def test_rising_traffic_is_not_a_plateau(settings, store):
+    fake = FakeDevice()
+    fake.counts = iter([100, 100, 150])
+    j, fake = execute(settings, store, reboot_options(drain_plateau_percent=5, drain_timeout=100), fake)
+    assert j["status"] == "recovery_required"
+    assert j["result"]["drain"]["reason"] == "timeout"
+    assert not fake.reboots
+    assert fake.addresses["/Common/192.0.2.20"]
+
+
+def test_drained_address_that_boots_enabled_is_disabled_again(settings, store):
+    fake = FakeDevice()
+    original = fake.reboot
+
+    def reboot(volume):
+        original(volume)
+        fake.addresses["/Common/192.0.2.20"] = True
+
+    fake.reboot = reboot
+    j, fake = execute(settings, store, reboot_options(drain=True), fake)
+    assert j["status"] == "recovery_required"
+    assert "booted enabled" in j["result"]["error"]
+    assert not fake.addresses["/Common/192.0.2.20"]
+    assert "post_validation_sample" not in steps(store, j)
+
+
+def test_asm_request_logged_after_restore_passes(settings, store):
+    j, fake = execute(settings, store, reboot_options(drain=True))
+    assert j["status"] == "succeeded", j["result"]
+    check = j["result"]["waf_request_check"]
+    assert check["status"] == "passed" and check["id"] == "8723401"
+    assert check["after"] == "2026-11-08T04:00:00+00:00"
+    events = steps(store, j)
+    # Traffic comes back only after validation, and the log check needs that traffic.
+    assert (
+        events.index("post_validation_sample")
+        < events.index("virtual_addresses_restored")
+        < events.index("waf_request_check_completed")
+    )
+    query = next(c for c, _ in fake.ssh.commands if "asm/events/requests" in c)
+    assert query == ops.ASM_REQUESTS
+
+
+@pytest.mark.parametrize(
+    "on_timeout,status", [("needs_review", "needs_review"), ("fail", "recovery_required")]
+)
+def test_only_older_asm_requests_do_not_pass(settings, store, on_timeout, status):
+    fake = FakeDevice()
+    fake.ssh.asm_requests = [{"id": "old", "requestDatetime": "2026-11-08T03:59:59Z"}]
+    policy = {"on_timeout": on_timeout}
+    j, _ = execute(settings, store, reboot_options(validation_policy=policy, validation_timeout=30), fake)
+    assert j["status"] == status
+    assert j["result"]["waf_request_check"]["status"] == "timed_out"
+    assert j["result"]["waf_request_check"]["attempts"] > 1
+
+
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        ({"waf_request_check": False}, "disabled by validation_policy.waf_request_check"),
+        ("asm_none", "ASM is not provisioned"),
+        ("no_policies", "no WAF policies"),
+    ],
+)
+def test_asm_request_check_skips(settings, store, change, reason):
+    fake = FakeDevice()
+    policy = {}
+    if change == "asm_none":
+        fake.snap["asm_provision"] = "none"
+    elif change == "no_policies":
+        fake.snap["waf_policies"] = 0
+    else:
+        policy = change
+    j, fake = execute(settings, store, reboot_options(validation_policy=policy), fake)
+    assert j["status"] == "succeeded", j["result"]
+    assert j["result"]["waf_request_check"] == {"status": "skipped", "reason": reason}
+    assert not any("asm/events/requests" in c for c, _ in fake.ssh.commands)
+
+
+def test_explicit_asm_request_check_requires_reboot():
+    with pytest.raises(ValueError):
+        JobRequest(device="lab", create_ucs=True, validation_policy={"waf_request_check": True})
+    assert JobRequest(device="lab", create_ucs=True).validation_policy.waf_request_check is None
+
+
+def test_asm_request_log_parsing():
+    collection = '{"items":[{"id":"1","requestDatetime":"2026-11-08T06:00:01-04:00"}],"totalItems":1}'
+    assert ops.asm_requests(collection)[0][1].isoformat() == "2026-11-08T10:00:01+00:00"
+    assert ops.asm_requests('{"items":[],"totalItems":0}') == []
+    adapter = ops.asm_requests('{"id":"x","timestamp":"2026-11-08T10:00:00Z"}')
+    assert adapter[0][0] == "x"
+    for bad in ('{"items":[{"id":"1","requestDatetime":"2026-11-08T10:00:01"}]}', '{"items":{}}', "[]"):
+        with pytest.raises(ValueError):
+            ops.asm_requests(bad)

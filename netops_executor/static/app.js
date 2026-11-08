@@ -21,6 +21,7 @@ const bools = [
 const numbers = [
   "drain_connections",
   "drain_percent",
+  "drain_plateau_percent",
   "drain_timeout",
   "install_timeout",
   "reboot_timeout",
@@ -348,6 +349,7 @@ const examples = {
       standalone_drain: {
         enabled: true,
         remaining_connections: 100,
+        plateau_percent: 5,
         timeout_seconds: 600,
       },
       validation_policy: {

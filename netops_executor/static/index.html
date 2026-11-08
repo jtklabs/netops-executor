@@ -139,6 +139,16 @@
                   /></label>
                 </div>
                 <label
+                  >Or drained once a minute drops less than this percent
+                  <input
+                    id="drain_plateau_percent"
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="any"
+                    placeholder="5 = under 5% per minute"
+                /></label>
+                <label
                   >Drain timeout, seconds
                   <input
                     id="drain_timeout"

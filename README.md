@@ -425,6 +425,7 @@ No root user, raw-socket capability or privileged container is needed.
     "standalone_drain": {
       "enabled": true,
       "remaining_connections": 100,
+      "plateau_percent": 5,
       "timeout_seconds": 600,
       "reboot_on_timeout": true
     },
@@ -492,9 +493,12 @@ Inventory/HTTP target defaults may restrict the eligible profiles for a target.
 | `reboot_timeout` | Verified reboot timeout; default 900 seconds |
 | `validation_timeout` | Bounded validation window; default 600, maximum 86400 seconds |
 
-The installer reuses an exact final version/build when available. **It always
-saves the current configuration and runs `cpcfg --source=<current> <target>`,
-including reused volumes.** It requires a verified zero exit status. Copy progress
+The installer reuses an exact final version/build when available. A target
+volume that already runs the final version/build skips the image transfer, image
+checks, free-space reserve and installation, and `result.reused_volume` names it.
+An explicit `target_volume` is still honored. **It always saves the current
+configuration and runs `cpcfg --source=<current> <target>`, including reused
+volumes.** It requires a verified zero exit status. Copy progress
 and its private on-device log directory are recorded. An ambiguous install/copy
 is never automatically replayed.
 
@@ -626,6 +630,14 @@ remaining count or `reduction_percent` (not both) in `standalone_drain`.
 A 90% reduction from 1,000 connections means 100 remaining. Counts sum clientside
 virtual-server connections; they are not a complete system connection-table count.
 
+Long-lived connections may never reach that target. Add `plateau_percent` to also
+treat the unit as drained once connections fall by less than that percent over one
+`plateau_window_seconds` window (default 60). With `plateau_percent: 5`, 400
+connections that are still 390 a minute later count as drained. Whichever rule is
+met first ends the drain, and `result.drain.reason` records `threshold`, `plateau`
+or `timeout`. Rising traffic is never a plateau. The flat field is
+`drain_plateau_percent` with `drain_plateau_window`.
+
 The flat fields `drain`, `drain_connections`, `drain_percent`, `drain_timeout`, and
 `reboot_on_drain_timeout` remain supported. Their default timeout is 300 seconds;
 `standalone_drain.timeout_seconds` defaults to 600. With no threshold, drain to zero.
@@ -633,8 +645,11 @@ Draining requires reboot. Timeout restores addresses and stops unless forced
 reboot on timeout was explicitly selected.
 
 Disabled states are saved and copied into the target so traffic stays drained
-through reboot and validation. After successful or manually accepted validation,
-restore only addresses disabled by this job, save, and collect the final snapshot.
+through reboot and validation. After the reboot the job checks that every drained
+address booted disabled. One that booted enabled, or is missing, is disabled again
+and the job stops as `recovery_required` before validation. After successful or
+manually accepted validation, restore only addresses disabled by this job, save,
+collect the final snapshot, then run the ASM request check below.
 Before reboot, cancellation/error attempts restoration. Uncertain boots retain
 recovery state and reservations instead of issuing blind cleanup.
 
@@ -711,14 +726,23 @@ boot state and saved drain state, then send:
 Use `/jobs/{id}/resolve`. These are operator attestations, not remotely proven
 facts. Resolving a manually completed item preserves its wave completion status.
 
-Optional `validation_policy.waf_request_check: true` checks for new WAF traffic
-after restoration. Standby units and units without policies skip it. Configure a
-read-only inventory `waf_request_command` that emits JSON
-`{"id":"request-id","timestamp":"2026-10-28T12:00:00+00:00"}` over SSH from your
-local request-log adapter. The timestamp must be timezone-aware and between the
-reboot request and now. No HTTP calls or log-byte-growth guesses are used.
-Without an adapter/new request, the bounded gate requires manual validation;
-request logging and incoming traffic must exist for automatic proof.
+Every reboot job then proves the upgraded ASM is inspecting traffic: it needs one
+ASM request logged after the verified reboot, by the unit's own clock. It runs after
+the drained addresses are restored, so the restored traffic can produce that log.
+Units without ASM provisioned, units without WAF policies and standby units skip
+it, and `result.waf_request_check` records the reason. Set
+`validation_policy.waf_request_check: false` to turn it off, or `true` to require it
+(which then requires `reboot`).
+
+The check runs, over SSH, a read of the unit's local iControl REST port:
+`curl -sf -u admin: http://localhost:8100/mgmt/tm/asm/events/requests` with
+`$select=id,requestDatetime`, newest first. No credentials leave the executor, and
+only the request ID and timestamp are kept. An inventory `waf_request_command` can
+replace it; it must print `{"id":"request-id","timestamp":"2026-10-28T12:00:00Z"}`
+or the same REST collection. The virtual servers need a security logging profile
+with local storage that logs the traffic, such as "Log all requests"; a profile that
+logs only illegal requests may never log a normal request. Without a new log entry
+within `validation_timeout`, `on_timeout` opens the review gate (default) or fails.
 
 ### Rollback
 
@@ -1003,6 +1027,7 @@ HTTP jobs, so none can overlap it.
 | `device` | Required: the related F5 |
 | `addresses` | Virtual addresses to drain, such as `/Common/10.1.1.10`; default every enabled address |
 | `remaining_connections` or `reduction_percent` | Drain target from F5 clientside virtual-server connections; neither means zero |
+| `plateau_percent`, `plateau_window_seconds` | Also drained once connections fall less than this percent over one window; window default 60 seconds |
 | `timeout_seconds` | Default 600 |
 | `proceed_on_timeout` | Default false: restore the addresses and stop; true upgrades anyway |
 

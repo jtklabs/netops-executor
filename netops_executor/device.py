@@ -407,3 +407,25 @@ def differences(before, after, drained=False):
     for category, error in after.get("collection_errors", {}).items():
         result.append({"category": category, "change": "unavailable", "message": error})
     return result
+
+
+class Plateau:
+    """Drain completion by stalled decline: connections fell less than `percent` over one window.
+
+    Long-lived connections may never reach a count or percent threshold. Rising traffic is not a
+    plateau, so it still runs into the drain timeout.
+    """
+
+    def __init__(self, percent, window, now, connections):
+        self.percent, self.window = percent, window
+        self.started, self.previous = now, connections
+        self.reduction = None
+
+    def reached(self, now, connections):
+        if self.percent is None or now - self.started < self.window:
+            return False
+        previous, self.started, self.previous = self.previous, now, connections
+        if previous <= 0:
+            return False
+        self.reduction = round(100 * (previous - connections) / previous, 2)
+        return 0 <= self.reduction < self.percent
