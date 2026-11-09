@@ -21,11 +21,15 @@ class Vendor:
     model: tuple[str, ...] = ()
     version: tuple[str, ...] = ()
     build: str = ""
+    # How the release and build combine: F5 images are <version>-<build>, while
+    # Check Point admins say "R81.20 Take 89" for the installed Jumbo Hotfix take.
+    build_format: str = "{version}-{build}"
     model_pattern: str = ""
     version_pattern: str = ""
 
 
-# Enterprise scalars mirror the verified OIDs in scripts/snmp-inventory/snmpinv/vendors.py.
+# Enterprise scalars mirror the verified OIDs of the snmp-inventory scanner in jtklabs/Netbox
+# (scripts/snmp-inventory/snmpinv/vendors.py).
 VENDORS = {
     9: Vendor("Cisco"),
     11: Vendor("HPE"),
@@ -73,6 +77,24 @@ VENDORS = {
         model=("7779.3.1.1.2.1.4.0",),
         version=("7779.3.1.1.2.1.7.0",),
         version_pattern=r"\bNIOS Release\s+([0-9][\w.-]*)",
+    ),
+    2620: Vendor(
+        "Check Point",
+        platform="Check Point Gaia",
+        serial=("2620.1.6.16.3.0",),  # svnApplianceSerialNumber
+        model=("2620.1.6.16.7.0",),  # svnApplianceProductName
+        version=("2620.1.6.4.1.0",),  # svnVersion
+        build="2620.1.6.999.0",  # svnServicePack: the Jumbo Hotfix take on Gaia
+        build_format="{version} Take {build}",
+    ),
+    3417: Vendor(
+        "Blue Coat",
+        platform="SGOS",
+        serial=("3417.2.11.1.4.0",),  # sgProxySerialNumber
+        version=("3417.2.11.1.3.0",),  # sgProxyVersion
+        # BLUECOAT-SG-PROXY-MIB has no model object; SGOS names it in sysDescr.
+        model_pattern=r"\b(?:Blue\s?Coat|Symantec)\s+(SG[\w-]+)",
+        version_pattern=r"\bSGOS\s+([0-9][\w.]*)",
     ),
     25049: Vendor(
         "Opengear",
@@ -171,7 +193,7 @@ async def collect_identity(get, chassis_index, first_value):
     version = first(vendor.version) or extract(vendor.version_pattern, description)
     build = fallback.get(ENTERPRISE + vendor.build)
     if version and build and build != "0":
-        version = f"{version}-{build}"
+        version = vendor.build_format.format(version=version, build=build)
     if vendor.manufacturer == "Opengear" and version:
         version = version.split(maxsplit=1)[0]
     if vendor.manufacturer == "Fortinet" and version:

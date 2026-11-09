@@ -1,0 +1,12 @@
+[
+  {
+    "id": "default",
+    "username": "netops",
+    "security_level": "authPriv",
+    "auth_protocol": "SHA256",
+    "auth_password_env": "LAB_SNMP_AUTH_PASSWORD",
+    "priv_protocol": "AES128",
+    "priv_password_env": "LAB_SNMP_PRIV_PASSWORD",
+    "context_name": ""
+  }
+]

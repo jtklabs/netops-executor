@@ -752,3 +752,205 @@ def test_cisco_stack_discovery_joins_member_chassis_and_excludes_provisioned_slo
             "software_version": "17.9.5",
         },
     ]
+
+
+def discover(client, settings, store, monkeypatch, values):
+    settings.netbox_url = "https://netbox.example"
+    settings.netbox_token = "x" * 40
+    settings.poller_instance = "lab"
+    agent = FakeAgent(monkeypatch, values)
+    monkeypatch.setattr(snmp, "sync_device", lambda *_: ("created", 42))
+    response = client.post("/api/v1/snmp/walks", json={"device_ip": "192.0.2.15", "site": "Lab"})
+    assert response.status_code == 202
+    process(settings, store, store.claim("worker"), "worker")
+    return store.get(response.json()["id"]), agent
+
+
+@pytest.mark.parametrize(
+    ("enterprise", "description", "scalars", "expected"),
+    [
+        (
+            "2620.1.6.123.1.62",
+            "Linux dal-cp-01 3.10.0-957.21.3cpx86_64 #1 SMP x86_64 GNU/Linux",
+            {
+                "2620.1.6.4.1.0": rfc1902.OctetString("R81.20"),
+                "2620.1.6.999.0": rfc1902.Gauge32(89),
+                "2620.1.6.16.3.0": rfc1902.OctetString("1811B00234"),
+                "2620.1.6.16.7.0": rfc1902.OctetString("Check Point 6200"),
+            },
+            ("Check Point", "Check Point 6200", "1811B00234", "R81.20 Take 89", "Check Point Gaia"),
+        ),
+        (
+            "2620.1.6.123.1.62",
+            "Linux dal-cp-02 3.10.0-957.21.3cpx86_64 #1 SMP x86_64 GNU/Linux",
+            {
+                "2620.1.6.4.1.0": rfc1902.OctetString("R81.20"),
+                "2620.1.6.999.0": rfc1902.Gauge32(0),
+                "2620.1.6.16.3.0": rfc1902.OctetString("1811B00235"),
+                "2620.1.6.16.7.0": rfc1902.OctetString("Check Point 6200"),
+            },
+            ("Check Point", "Check Point 6200", "1811B00235", "R81.20", "Check Point Gaia"),
+        ),
+        (
+            "3417.1.1.37",
+            "Blue Coat SG-S400 Series, Version: SGOS 6.6.5.2, Release id: 193348 Proxy Edition",
+            {
+                "3417.2.11.1.3.0": rfc1902.OctetString("6.6.5.2"),
+                "3417.2.11.1.4.0": rfc1902.OctetString("0723160042"),
+            },
+            ("Blue Coat", "SG-S400", "0723160042", "6.6.5.2", "SGOS"),
+        ),
+        (
+            "3417.1.1.37",
+            "Symantec SG-S200 Series, Version: SGOS 7.3.6.1, Release id: 266521 Proxy Edition",
+            {"3417.2.11.1.4.0": rfc1902.OctetString("0723160043")},
+            ("Blue Coat", "SG-S200", "0723160043", "7.3.6.1", "SGOS"),
+        ),
+    ],
+)
+def test_appliance_identity_comes_from_vendor_scalars_and_sysdescr(
+    client, settings, store, monkeypatch, enterprise, description, scalars, expected
+):
+    from netops_executor.snmp_identity import ENTERPRISE, SYS_DESCR, SYS_NAME, SYS_OBJECT_ID
+
+    values = {
+        SYS_NAME: rfc1902.OctetString("appliance"),
+        SYS_DESCR: rfc1902.OctetString(description),
+        SYS_OBJECT_ID: rfc1902.ObjectName(ENTERPRISE + enterprise),
+        **{ENTERPRISE + oid: value for oid, value in scalars.items()},
+    }
+    job, _ = discover(client, settings, store, monkeypatch, values)
+    facts = job["result"]["discovery"]
+    assert job["status"] == "succeeded"
+    assert (
+        facts["manufacturer"],
+        facts["model"],
+        facts["serial"],
+        facts["software_version"],
+        facts["platform"],
+    ) == expected
+
+
+def aruba_ap(mac, name, model, serial, address, status=1, version=""):
+    from netops_executor.snmp_wireless import AP_ENTRY
+
+    index = ".".join(str(int(octet, 16)) for octet in mac.split(":"))
+    values = {
+        f"{AP_ENTRY}.2.{index}": rfc1902.IpAddress(address),
+        f"{AP_ENTRY}.3.{index}": rfc1902.OctetString(name),
+        f"{AP_ENTRY}.4.{index}": rfc1902.OctetString("floor-1"),
+        f"{AP_ENTRY}.6.{index}": rfc1902.OctetString(serial),
+        f"{AP_ENTRY}.13.{index}": rfc1902.OctetString(model),
+        f"{AP_ENTRY}.19.{index}": rfc1902.Integer32(status),
+    }
+    if version:
+        values[f"{AP_ENTRY}.34.{index}"] = rfc1902.OctetString(version)
+    return values
+
+
+def test_aruba_controller_discovery_reads_the_access_points_it_terminates(
+    client, settings, store, monkeypatch
+):
+    from netops_executor.snmp_identity import ENTITY, SYS_DESCR, SYS_NAME, SYS_OBJECT_ID
+
+    values = {
+        SYS_NAME: rfc1902.OctetString("dal-wlc-01"),
+        SYS_DESCR: rfc1902.OctetString("ArubaOS (MODEL: Aruba7010), Version 8.10.0.4"),
+        SYS_OBJECT_ID: rfc1902.ObjectName("1.3.6.1.4.1.14823.1.1.1"),
+        f"{ENTITY}.5.1": rfc1902.Integer32(3),
+        f"{ENTITY}.11.1": rfc1902.OctetString("CX0011234"),
+        f"{ENTITY}.13.1": rfc1902.OctetString("Aruba7010"),
+        **aruba_ap(
+            "20:4C:03:AA:01:01", "dal-ap-101", "AP-515", "CNJPJ0A001", "10.20.10.11", version="8.10.0.4_87457"
+        ),
+        **aruba_ap("20:4C:03:AA:01:02", "dal-ap-102", "AP-515", "CNJPJ0A002", "10.20.10.12"),
+        **aruba_ap("20:4C:03:AA:01:03", "", "AP-535", "", "0.0.0.0", status=2),
+    }
+    job, _ = discover(client, settings, store, monkeypatch, values)
+    facts = job["result"]["discovery"]
+    assert job["status"] == "succeeded"
+    assert (facts["manufacturer"], facts["model"], facts["platform"]) == ("HPE", "Aruba7010", "ArubaOS")
+    assert facts["access_points"] == [
+        {
+            "mac_address": "20:4c:03:aa:01:01",
+            "name": "dal-ap-101",
+            "model": "AP-515",
+            "serial": "CNJPJ0A001",
+            "address": "10.20.10.11",
+            "group": "floor-1",
+            "up": True,
+            "software_version": "8.10.0.4_87457",
+        },
+        {
+            "mac_address": "20:4c:03:aa:01:02",
+            "name": "dal-ap-102",
+            "model": "AP-515",
+            "serial": "CNJPJ0A002",
+            "address": "10.20.10.12",
+            "group": "floor-1",
+            "up": True,
+            "software_version": "",
+        },
+        {
+            "mac_address": "20:4c:03:aa:01:03",
+            "name": "",
+            "model": "AP-535",
+            "serial": "",
+            "address": "0.0.0.0",
+            "group": "floor-1",
+            "up": False,
+            "software_version": "",
+        },
+    ]
+
+
+def test_clearpass_discovery_does_not_read_an_access_point_table(client, settings, store, monkeypatch):
+    from netops_executor.snmp_identity import SYS_DESCR, SYS_NAME, SYS_OBJECT_ID
+    from netops_executor.snmp_wireless import AP_ENTRY
+
+    cppm = "1.3.6.1.4.1.14823.1.6.1.1.1.1.1"
+    values = {
+        SYS_NAME: rfc1902.OctetString("dal-cppm-01"),
+        SYS_DESCR: rfc1902.OctetString(
+            "ClearPass Policy Manager 6.11.5.253053, Model: C2000, FIPS Mode: Disabled"
+        ),
+        SYS_OBJECT_ID: rfc1902.ObjectName("1.3.6.1.4.1.14823.1.6.1"),
+        f"{cppm}.1.1": rfc1902.OctetString("C2000"),
+        f"{cppm}.2.1": rfc1902.OctetString("CNC2K2310042"),
+        f"{cppm}.3.1": rfc1902.OctetString("6.11.5.253053"),
+    }
+    job, agent = discover(client, settings, store, monkeypatch, values)
+    facts = job["result"]["discovery"]
+    assert job["status"] == "succeeded"
+    assert (facts["model"], facts["serial"], facts["software_version"], facts["platform"]) == (
+        "C2000",
+        "CNC2K2310042",
+        "6.11.5.253053",
+        "Aruba ClearPass",
+    )
+    assert "access_points" not in facts
+    assert not any(AP_ENTRY in oid for _, _, oids in agent.calls for oid in oids)
+
+
+def test_invalid_access_point_index_is_reported_without_failing_discovery(
+    client, settings, store, monkeypatch
+):
+    from netops_executor.snmp_identity import SYS_DESCR, SYS_NAME, SYS_OBJECT_ID
+    from netops_executor.snmp_wireless import AP_ENTRY
+
+    values = {
+        SYS_NAME: rfc1902.OctetString("dal-wlc-01"),
+        SYS_DESCR: rfc1902.OctetString("ArubaOS (MODEL: Aruba7010), Version 8.10.0.4"),
+        SYS_OBJECT_ID: rfc1902.ObjectName("1.3.6.1.4.1.14823.1.1.1"),
+        "1.3.6.1.4.1.14823.2.2.1.2.1.3.0": rfc1902.OctetString("Aruba7010"),
+        "1.3.6.1.4.1.14823.2.2.1.2.1.11.0": rfc1902.OctetString("CX0011234"),
+        f"{AP_ENTRY}.3.1.2.3": rfc1902.OctetString("short-index"),
+    }
+    job, _ = discover(client, settings, store, monkeypatch, values)
+    facts = job["result"]["discovery"]
+    assert job["status"] == "completed_with_warnings"
+    assert facts["access_point_inventory"] == {
+        "status": "failed",
+        "error": "Aruba returned an invalid access point index",
+    }
+    assert "access_points" not in facts

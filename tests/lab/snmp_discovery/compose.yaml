@@ -1,0 +1,111 @@
+# Local lab only: a simulated multi-vendor SNMP fleet, a throwaway NetBox 4.7 with
+# the Lifecycle plugin from NetBoxV2, and NetOps Executor.
+# Run it through lab.py, which writes lab.env with fresh secrets before starting compose.
+name: snmp-discovery-lab
+
+x-netbox: &netbox
+  build:
+    context: .
+    dockerfile: Dockerfile.netbox
+    additional_contexts:
+      # The Lifecycle plugin, from a NetBoxV2 checkout next to this repository.
+      lifecycle: ${NETBOX_V2:-../../../../NetBoxV2}/plugins/netbox-refresh
+  image: netbox-snmp-lab:v4.7.4-5.1.1
+  env_file: lab.env
+  volumes:
+    - ./netbox/plugins.py:/etc/netbox/config/plugins.py:ro
+  environment: &netbox-env
+    DB_HOST: postgres
+    DB_NAME: netbox
+    DB_USER: netbox
+    REDIS_HOST: redis
+    REDIS_DATABASE: 0
+    REDIS_CACHE_HOST: redis
+    REDIS_CACHE_DATABASE: 1
+    GRANIAN_WORKERS: 2
+    SKIP_SUPERUSER: "true"
+  depends_on: [postgres, redis]
+
+x-executor: &executor
+  build: ../../..
+  image: netops-executor:snmp-lab
+  init: true
+  env_file: lab.env
+  environment:
+    NETOPS_DATA_DIR: /data
+    NETOPS_BACKUP_ROOT: /data/backups
+    NETOPS_IMAGE_ROOT: /data/images
+    NETOPS_DEVICES_FILE: /config/devices.json
+    NETOPS_SNMP_PROFILES_FILE: /config/snmp-profiles.json
+    # The executor shares the NetBox container's network namespace, so NetBox is on loopback.
+    NETOPS_NETBOX_URL: http://127.0.0.1:8080
+    NETOPS_POLLER_INSTANCE: snmp-lab
+  volumes:
+    - executor-data:/data
+    - ./executor:/config:ro
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  network_mode: service:netbox
+  depends_on: [netbox]
+
+services:
+  agents:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: snmp-lab-agents:lab
+    init: true
+    environment:
+      STACK_WALK: ${STACK_WALK:-c9300-stack}
+    # agent.py adds each device's address (10.93.0.11 and up) to eth0.
+    cap_add: [NET_ADMIN]
+    networks:
+      lab:
+        ipv4_address: 10.93.0.10
+
+  postgres:
+    image: postgres:16-alpine
+    env_file: lab.env
+    environment:
+      POSTGRES_DB: netbox
+      POSTGRES_USER: netbox
+    volumes: [postgres:/var/lib/postgresql/data]
+    networks: [lab]
+
+  redis:
+    image: valkey/valkey:9.1-alpine
+    networks: [lab]
+
+  netbox:
+    <<: *netbox
+    environment:
+      <<: *netbox-env
+      SKIP_SUPERUSER: "false"
+      SUPERUSER_NAME: admin
+      SUPERUSER_EMAIL: admin@example.com
+    ports:
+      - "127.0.0.1:${LAB_NETBOX_PORT:-18080}:8080"
+      - "127.0.0.1:${LAB_EXECUTOR_PORT:-18081}:8081"
+    networks: [lab]
+
+  executor-api:
+    <<: *executor
+    command: ["netops-executor", "serve", "--host", "0.0.0.0", "--port", "8081"]
+
+  executor-worker:
+    <<: *executor
+    command: ["netops-executor", "worker", "--pool", "priority"]
+
+networks:
+  lab:
+    ipam:
+      config:
+        - subnet: 10.93.0.0/24
+          # Other containers draw from the top half; agent addresses are below it.
+          ip_range: 10.93.0.128/25
+
+volumes:
+  postgres:
+  executor-data:

@@ -13,10 +13,22 @@ SOFTWARE_VERSION = "software_version"
 SOFTWARE_REPORT = "plugins/refresh/device-software/report/"
 DISCOVERED_TAG = "discovered"
 LEGACY_DISCOVERY_ROLE = "snmp-discovered"
+WIRELESS_CONTROLLER = "wireless_controller"
+ACCESS_POINT_ROLE = "Wireless AP"
 
+# Platforms that only ever run one kind of appliance.
+ROLE_PLATFORMS = {
+    "aruba clearpass": "Network Access Control",
+    "infoblox nios": "DNS/DHCP",
+    "sgos": "Proxy",
+}
 # Only infer a role for product families that identify a device function.
 ROLE_MODELS = {
     "arista": ((r"DCS-", "Switch"),),
+    # Quantum and numbered appliances are gateways; Smart-1 management servers are not.
+    "check point": (
+        (r"(?:Check Point\s+)?(?:Quantum\s+(?:Spark|Force|Lightspeed)?\s*)?\d{4,5}\b", "Firewall"),
+    ),
     "cisco": (
         (r"(?:WS-C|C(?:atalyst[ -]+)?9[23456]\d{2}|N[235679]K-|Nexus\b)", "Switch"),
         (r"(?:ASR|ISR|CSR)\b|(?:ASR|ISR|CSR)\d|C(?:atalyst[ -]+)?8[235]\d{2}", "Router"),
@@ -24,6 +36,11 @@ ROLE_MODELS = {
     ),
     "f5": ((r"BIG[- ]?IP\b", "Load Balancer"),),
     "fortinet": ((r"FortiGate\b|FG-", "Firewall"), (r"FortiSwitch\b|FS-", "Switch")),
+    # Aruba Mobility controllers (70xx, 72xx, 90xx, 92xx) and Mobility Conductors.
+    "hpe": (
+        (r"(?:Aruba\s*|A)?(?:7[02]\d{2}|9[0-2]\d{2})(?:XM)?\b|MM-(?:HW|VA)", "Wireless Controller"),
+        (r"(?:Aruba\s*)?AP-\d", ACCESS_POINT_ROLE),
+    ),
     "juniper": (
         (r"(?:EX|QFX)[ -]?\d", "Switch"),
         (r"(?:MX|PTX|ACX)[ -]?\d", "Router"),
@@ -48,6 +65,8 @@ def model_key(value):
 
 
 def discovery_role(facts):
+    if role := ROLE_PLATFORMS.get((facts.get("platform") or "").casefold()):
+        return role
     for pattern, role in ROLE_MODELS.get(facts["manufacturer"].casefold(), ()):
         if re.match(pattern, facts["model"], re.IGNORECASE):
             return role
@@ -120,21 +139,29 @@ class NetBoxDiscovery:
             raise SyncError("NetBox names need at least one letter or digit usable in a slug")
         return self.ensure(path, lambda: self.named(path, name), {"name": name, "slug": slug})
 
-    def custom_field(self, name, label, description):
+    def custom_field(self, name, label, description, kind="text"):
         path = "extras/custom-fields/"
+        data = {
+            "object_types": ["dcim.device"],
+            "name": name,
+            "label": label,
+            "type": kind,
+            "description": description,
+        }
+        if kind == "object":
+            data["related_object_type"] = "dcim.device"
         field = self.ensure(
             path,
             lambda: next((row for row in self.records(path, name=name) if row["name"] == name), None),
-            {
-                "object_types": ["dcim.device"],
-                "name": name,
-                "label": label,
-                "type": "text",
-                "description": description,
-            },
+            data,
         )
-        if field["type"]["value"] != "text" or "dcim.device" not in field["object_types"]:
-            raise SyncError(f"NetBox custom field {name} must be a device text field")
+        if (
+            field["type"]["value"] != kind
+            or "dcim.device" not in field["object_types"]
+            or (kind == "object" and field.get("related_object_type") != "dcim.device")
+        ):
+            noun = "device object" if kind == "object" else "device text"
+            raise SyncError(f"NetBox custom field {name} must be a {noun} field")
 
     def device_type(self, manufacturer, model):
         path = "dcim/device-types/"
@@ -211,7 +238,178 @@ class NetBoxDiscovery:
                 facts["stack_inventory"] = {"status": "failed", "error": "Could not sync the NetBox stack"}
         if facts["software_version"] and (device.get("platform") or facts.get("platform")):
             facts["software_inventory"] = self.report_software(device["id"], facts)
+        if facts.get("access_points") is not None:
+            try:
+                facts["access_point_inventory"] = self.sync_access_points(device, poller, facts)
+            except SyncError as error:
+                facts["access_point_inventory"] = {"status": "failed", "error": str(error)}
+            except httpx.HTTPStatusError as error:
+                facts["access_point_inventory"] = {
+                    "status": "failed",
+                    "error": f"NetBox access point sync returned HTTP {error.response.status_code}",
+                }
+            except (httpx.RequestError, OSError, ValueError, TypeError, KeyError):
+                facts["access_point_inventory"] = {
+                    "status": "failed",
+                    "error": "Could not sync the controller's access points",
+                }
         return action, device["id"]
+
+    def sync_access_points(self, controller, poller, facts):
+        """Create or update one device per AP the controller reports.
+
+        A new AP starts at the controller's site, because nothing in the AP
+        table says where it hangs; a later move by hand is kept. APs the
+        controller stops reporting are left alone, like stack members.
+        """
+        self.custom_field(
+            WIRELESS_CONTROLLER,
+            "Wireless controller",
+            "Controller that last reported this access point to NetOps Executor.",
+            kind="object",
+        )
+        manufacturer = self.named_object("dcim/manufacturers/", facts["manufacturer"])
+        platform = (controller.get("platform") or {}).get("id")
+        if not platform and facts.get("platform"):
+            platform = self.named_object("dcim/platforms/", facts["platform"])["id"]
+        defaults = {
+            "site": controller["site"]["id"],
+            "tenant": (controller.get("tenant") or {}).get("id"),
+            "role": self.named_object("dcim/device-roles/", ACCESS_POINT_ROLE)["id"],
+            "platform": platform,
+            "tags": [
+                self.named_object("extras/tags/", poller, poller)["id"],
+                self.named_object("extras/tags/", DISCOVERED_TAG)["id"],
+            ],
+        }
+        device_types = {}
+        results, skipped = [], 0
+        for access_point in facts["access_points"]:
+            if not access_point["up"] and not access_point["serial"]:
+                # Down and never reported a serial: a stale controller entry, not hardware.
+                skipped += 1
+                continue
+            name = (access_point["name"] or access_point["mac_address"].replace(":", ""))[:64]
+            try:
+                if not access_point["model"]:
+                    raise SyncError(f"Access point {name} has no model in the controller table")
+                if access_point["model"] not in device_types:
+                    device_types[access_point["model"]] = self.device_type(
+                        manufacturer, access_point["model"]
+                    )
+                results.append(
+                    self.sync_access_point(
+                        controller, facts, access_point, name, device_types[access_point["model"]], defaults
+                    )
+                )
+            except SyncError as error:
+                results.append({"name": name, "status": "failed", "error": str(error)})
+            except httpx.HTTPStatusError as error:
+                results.append(
+                    {
+                        "name": name,
+                        "status": "failed",
+                        "error": f"NetBox returned HTTP {error.response.status_code} for this access point",
+                    }
+                )
+        failed = any(
+            row["status"] == "failed" or row.get("software_inventory", {}).get("status") == "failed"
+            for row in results
+        )
+        return {
+            "status": "warning" if failed else "synced",
+            "controller_id": controller["id"],
+            "reported": len(facts["access_points"]),
+            "skipped": skipped,
+            "access_points": results,
+        }
+
+    def sync_access_point(self, controller, facts, access_point, name, device_type, defaults):
+        path = "dcim/devices/"
+        serial = access_point["serial"]
+        version = access_point["software_version"] or facts["software_version"]
+
+        def by_serial():
+            if not serial:
+                return None
+            matches = [
+                row
+                for row in self.records(path, serial=serial)
+                if (row["serial"] or "").casefold() == serial.casefold()
+            ]
+            if len(matches) > 1:
+                raise SyncError(f"Access point {name} serial matches multiple NetBox devices")
+            return matches[0] if matches else None
+
+        def by_name():
+            for row in self.records(path, name__ie=name, site_id=defaults["site"]):
+                if (row["name"] or "").casefold() != name.casefold() or (
+                    (row.get("tenant") or {}).get("id") != defaults["tenant"]
+                ):
+                    continue
+                if serial and row["serial"] and row["serial"].casefold() != serial.casefold():
+                    raise SyncError(f"Access point {name} has a different serial in NetBox")
+                return row
+            return None
+
+        fields = {WIRELESS_CONTROLLER: controller["id"]}
+        if version:
+            fields[SOFTWARE_VERSION] = version
+        description = f"AP group {access_point['group']}" if access_point["group"] else ""
+        current = by_serial() or by_name()
+        if current is None:
+            current = self.ensure(
+                path,
+                lambda: by_serial() or by_name(),
+                {
+                    **defaults,
+                    "name": name,
+                    "device_type": device_type["id"],
+                    "serial": serial,
+                    "status": "active" if access_point["up"] else "offline",
+                    "description": description,
+                    "custom_fields": fields,
+                },
+            )
+            action = "created"
+        else:
+            changes = {}
+            if current["name"] != name:
+                changes["name"] = name
+            if current["device_type"]["id"] != device_type["id"]:
+                changes["device_type"] = device_type["id"]
+            if serial and current["serial"] != serial:
+                changes["serial"] = serial
+            if defaults["platform"] and not current.get("platform"):
+                changes["platform"] = defaults["platform"]
+            current_fields = current["custom_fields"]
+            if (current_fields.get(WIRELESS_CONTROLLER) or {}).get("id") != controller["id"] or (
+                version and current_fields.get(SOFTWARE_VERSION) != version
+            ):
+                changes["custom_fields"] = fields
+            # Keep a description someone wrote; only maintain the one discovery writes.
+            if current["description"] != description and (
+                not current["description"] or current["description"].startswith("AP group ")
+            ):
+                changes["description"] = description
+            if defaults["tags"][0] not in {tag["id"] for tag in current["tags"]}:
+                changes["add_tags"] = [defaults["tags"][0]]
+            if changes:
+                current = self.request("PATCH", f"{path}{current['id']}/", json=changes)
+            action = "updated" if changes else "unchanged"
+        result = {
+            "name": name,
+            "device_id": current["id"],
+            "serial": serial,
+            "up": access_point["up"],
+            "status": action,
+        }
+        if version and (current.get("platform") or defaults["platform"]):
+            result["software_inventory"] = self.report_software(
+                current["id"],
+                {"software_version": version, "collected_at": facts.get("collected_at")},
+            )
+        return result
 
     def sync_stack(self, device, poller, facts):
         path = "dcim/virtual-chassis/"
@@ -219,7 +417,10 @@ class NetBoxDiscovery:
         anchor = facts["stack_member_id"]
         suffix = f"-{device['id']}"
         chassis_name = facts["name"][: 64 - len(suffix)] + suffix
-        if existing := device.get("virtual_chassis"):
+        # A replaced management switch is a new record joining the existing chassis.
+        if existing := device.get("virtual_chassis") or (
+            {"id": facts["stack_chassis_id"]} if facts.get("stack_chassis_id") else None
+        ):
             chassis = self.request("GET", f"{path}{existing['id']}/")
         else:
             chassis = self.ensure(path, lambda: self.named(path, chassis_name), {"name": chassis_name})
@@ -261,10 +462,151 @@ class NetBoxDiscovery:
         incomplete = any(
             row.get("software_inventory", {}).get("status") == "failed" for row in results
         ) or any(not member["serial"] or not member["software_version"] for member in facts["stack_members"])
+        changes = facts.get("stack_changes") or {}
         return {
             "status": "warning" if incomplete else "synced",
             "virtual_chassis_id": chassis_id,
             "members": results,
+            "retired": changes.get("retired", []),
+            "renumbered": changes.get("renumbered", []),
+        }
+
+    def reconcile_stack(self, current, members, facts):
+        """Line NetBox's stack records up with the switches SNMP reports, by serial.
+
+        A switch that now reports another member number is renamed and moved to
+        that position. A record whose switch is gone while its member number is
+        in use by other hardware is retired: renamed <name>-decom-<serial>, set
+        to decommissioning and taken out of the chassis, so the new switch can
+        take its name and position. NetBox needs device names unique per site
+        and tenant, whatever the status, hence the rename. A record whose switch
+        is gone and whose number nobody uses is kept, as before.
+
+        Returns the management record, or None when its switch was replaced,
+        and the reported member it now stands for.
+        """
+        path = "dcim/devices/"
+        chassis = self.request("GET", f"dcim/virtual-chassis/{current['virtual_chassis']['id']}/")
+        facts["stack_chassis_id"] = chassis["id"]
+        records = list(self.records(path, virtual_chassis_id=chassis["id"]))
+        reported = {member["member_id"]: member for member in members}
+        by_serial = {member["serial"].casefold(): member for member in members if member["serial"]}
+
+        def switch(row):
+            return by_serial.get(row["serial"].casefold()) if row["serial"] else None
+
+        anchor, replaced = switch(current), False
+        if anchor is None:
+            anchor = reported.get(current["vc_position"])
+            if current["serial"]:
+                # The management switch is gone. New hardware in its slot takes over.
+                held = {row["serial"].casefold() for row in records if row["serial"]}
+                if anchor is None or not anchor["serial"] or anchor["serial"].casefold() in held:
+                    raise SyncError("The management switch left the stack; check the NetBox stack")
+                replaced = True
+            elif anchor is None:
+                raise SyncError("The management chassis changed or disappeared; check the NetBox stack")
+
+        hostname = facts["name"]
+
+        def target_name(member):
+            if member is anchor:
+                return hostname
+            suffix = f"-{member['member_id']}"
+            return hostname[: 64 - len(suffix)] + suffix
+
+        retire, moves = [], []
+        for row in records:
+            member = switch(row)
+            if row["id"] == current["id"] and replaced:
+                retire.append(row)
+            elif member is None:
+                if row["serial"] and row["vc_position"] in reported:
+                    retire.append(row)
+            elif (row["vc_position"], row["name"]) != (member["member_id"], target_name(member)):
+                moves.append((row, member["member_id"], target_name(member)))
+
+        changes = {"retired": [], "renumbered": []}
+        master = (chassis.get("master") or {}).get("id")
+        for row in retire:
+            if row["id"] == master:
+                self.request("PATCH", f"dcim/virtual-chassis/{chassis['id']}/", json={"master": None})
+                master = None
+            changes["retired"].append(self.retire_stack_member(row, management=row["id"] == current["id"]))
+
+        retired = {row["id"] for row in retire}
+        remaining = [row for row in records if row["id"] not in retired]
+        occupied = {row["vc_position"]: row["id"] for row in remaining}
+        names = {(row["name"] or "").casefold(): row["id"] for row in remaining}
+        if any(
+            occupied.get(position, row["id"]) != row["id"]
+            or names.get(name.casefold(), row["id"]) != row["id"]
+            for row, position, name in moves
+        ):
+            # Swapped member numbers: park every moving record first. NetBox
+            # positions run to 255; stacks use the low numbers.
+            targets = {position for _, position, _ in moves}
+            spare = (n for n in range(255, 0, -1) if n not in occupied and n not in targets)
+            for row, _, _ in moves:
+                suffix = f"-renumbering-{row['id']}"
+                self.request(
+                    "PATCH",
+                    f"{path}{row['id']}/",
+                    json={"vc_position": next(spare), "name": hostname[: 64 - len(suffix)] + suffix},
+                )
+        for row, position, name in moves:
+            updated = self.request(
+                "PATCH", f"{path}{row['id']}/", json={"vc_position": position, "name": name}
+            )
+            changes["renumbered"].append(
+                {
+                    "device_id": row["id"],
+                    "serial": row["serial"],
+                    "from": row["vc_position"],
+                    "to": position,
+                    "name": name,
+                }
+            )
+            if row["id"] == current["id"]:
+                current = updated
+        facts["stack_changes"] = changes
+        return (None if replaced else current), anchor
+
+    def retire_stack_member(self, row, management):
+        path = "dcim/devices/"
+        site, tenant = row["site"]["id"], (row.get("tenant") or {}).get("id")
+
+        def taken(name):
+            return any(
+                (other["name"] or "").casefold() == name.casefold()
+                and (other.get("tenant") or {}).get("id") == tenant
+                and other["id"] != row["id"]
+                for other in self.records(path, name__ie=name, site_id=site)
+            )
+
+        name = ""
+        for suffix in (f"-decom-{row['serial']}", f"-decom-{row['serial']}-{row['id']}"):
+            name = (row["name"] or "")[: 64 - len(suffix)] + suffix
+            if not taken(name):
+                break
+        data = {"name": name, "status": "decommissioning", "virtual_chassis": None, "vc_position": None}
+        addresses = []
+        if management:
+            # Free the management address and discovery match for the replacement switch.
+            addresses = [row[field]["id"] for field in ("primary_ip4", "primary_ip6") if row.get(field)]
+            data.update({"primary_ip4": None, "primary_ip6": None, "custom_fields": {DISCOVERY_IP: None}})
+        self.request("PATCH", f"{path}{row['id']}/", json=data)
+        for address in addresses:
+            self.request(
+                "PATCH",
+                f"ipam/ip-addresses/{address}/",
+                json={"assigned_object_type": None, "assigned_object_id": None},
+            )
+        return {
+            "device_id": row["id"],
+            "serial": row["serial"],
+            "position": row["vc_position"],
+            "name": name,
         }
 
     def sync_stack_member(self, facts, member, current, manufacturer, defaults):
@@ -433,13 +775,8 @@ class NetBoxDiscovery:
             if existing_stack:
                 # The hostname and IP are the stack's stable management record.
                 # An active/standby election alone does not move physical records.
-                anchor = next((row for row in members if row["member_id"] == current["vc_position"]), None)
-                if anchor is None or (
-                    current["serial"]
-                    and anchor["serial"]
-                    and current["serial"].casefold() != anchor["serial"].casefold()
-                ):
-                    raise SyncError("The management chassis changed or disappeared; check the NetBox stack")
+                current, anchor = self.reconcile_stack(current, members, facts)
+                existing_stack = bool(current)
             else:
                 anchor = next(row for row in members if row["role"] == "active")
             facts["stack_member_id"] = anchor["member_id"]

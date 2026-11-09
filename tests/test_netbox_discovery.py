@@ -184,3 +184,370 @@ def test_discovery_reports_running_software_for_the_matched_device(
         )
         assert discovery.sync("Lab", "checkmk-au", "192.0.2.1", facts) == ("unchanged", 10)
     assert facts["software_inventory"] == expected
+
+
+@pytest.mark.parametrize(
+    ("manufacturer", "model", "platform", "role"),
+    [
+        ("Check Point", "Check Point 6200", "Check Point Gaia", "Firewall"),
+        ("Check Point", "Check Point Quantum Spark 1600", "Check Point Gaia", "Firewall"),
+        ("Check Point", "Smart-1 6000-L", "Check Point Gaia", "Unclassified"),
+        ("Blue Coat", "SG-S400", "SGOS", "Proxy"),
+        ("Infoblox", "IB-1420", "Infoblox NIOS", "DNS/DHCP"),
+        ("HPE", "C2000", "Aruba ClearPass", "Network Access Control"),
+        ("HPE", "Aruba7010", "ArubaOS", "Wireless Controller"),
+        ("HPE", "Aruba 9240", "ArubaOS", "Wireless Controller"),
+        ("HPE", "MM-VA-500", "ArubaOS", "Wireless Controller"),
+        ("HPE", "AP-515", "ArubaOS", "Wireless AP"),
+        ("HPE", "Aruba 9300-32D", "ArubaOS-CX", "Unclassified"),
+        ("Juniper", "SRX1500", "Junos", "Firewall"),
+        ("Palo Alto Networks", "PA-3220", "PAN-OS", "Firewall"),
+    ],
+)
+def test_discovery_role_covers_appliance_families(manufacturer, model, platform, role):
+    from netops_executor.netbox_discovery import discovery_role
+
+    assert discovery_role({"manufacturer": manufacturer, "model": model, "platform": platform}) == role
+
+
+class FakeNetBox:
+    """Enough of the NetBox REST API for the access point sync: filtered GETs, POST and PATCH."""
+
+    def __init__(self, devices):
+        self.rows = {
+            "extras/custom-fields": [
+                {
+                    "name": "wireless_controller",
+                    "object_types": ["dcim.device"],
+                    "type": {"value": "object"},
+                    "related_object_type": "dcim.device",
+                }
+            ],
+            "dcim/manufacturers": [{"id": 3, "name": "HPE", "slug": "hpe"}],
+            "dcim/device-types": [
+                {"id": 41, "model": "AP-515", "part_number": ""},
+                {"id": 42, "model": "AP-535", "part_number": ""},
+            ],
+            "dcim/device-roles": [{"id": 5, "name": "Wireless AP", "slug": "wireless-ap"}],
+            "extras/tags": [
+                {"id": 7, "name": "lab", "slug": "lab"},
+                {"id": 8, "name": "discovered", "slug": "discovered"},
+            ],
+            "dcim/devices": devices,
+        }
+        self.calls = []
+
+    def handle(self, request):
+        path = request.url.path.removeprefix("/api/").strip("/")
+        params = request.url.params
+        if request.method == "GET":
+            rows = self.rows[path]
+            if path == "dcim/device-types":
+                rows = [row for row in rows if params["q"].casefold() in row["model"].casefold()]
+            if path == "dcim/devices":
+                if "serial" in params:
+                    rows = [row for row in rows if row["serial"].casefold() == params["serial"].casefold()]
+                if "name__ie" in params:
+                    rows = [row for row in rows if row["name"].casefold() == params["name__ie"].casefold()]
+                if "site_id" in params:
+                    rows = [row for row in rows if str(row["site"]["id"]) == params["site_id"]]
+            return httpx.Response(200, json={"results": rows, "next": None})
+        data = json.loads(request.content)
+        self.calls.append((request.method, path, data))
+        if path == "plugins/refresh/device-software/report":
+            return httpx.Response(200, json={"results": [{"result": "created", "id": data["device"] + 1000}]})
+        if request.method == "POST":
+            return httpx.Response(
+                201, json={"id": 500 + len(self.calls), "platform": {"id": data["platform"]}}
+            )
+        return httpx.Response(200, json={"id": int(path.rsplit("/", 1)[1]), "platform": {"id": 9}})
+
+
+def test_controller_access_points_become_devices_matched_by_serial():
+    renamed = {
+        "id": 61,
+        "name": "old-name",
+        "serial": "CNJPJ0A001",
+        "site": {"id": 2},  # Moved by hand to the floor's real site; kept.
+        "tenant": None,
+        "device_type": {"id": 41},
+        "platform": {"id": 9},
+        "description": "",
+        "custom_fields": {"software_version": "8.10.0.3", "wireless_controller": None},
+        "tags": [{"id": 8}],
+    }
+    unchanged = {
+        "id": 62,
+        "name": "dal-ap-102",
+        "serial": "CNJPJ0A002",
+        "site": {"id": 1},
+        "tenant": None,
+        "device_type": {"id": 41},
+        "platform": {"id": 9},
+        "description": "AP group floor-1",
+        "custom_fields": {"software_version": "8.10.0.4", "wireless_controller": {"id": 40}},
+        "tags": [{"id": 7}, {"id": 8}],
+    }
+    conflict = {**unchanged, "id": 63, "name": "dal-ap-104", "serial": "OTHER-SERIAL"}
+    netbox = FakeNetBox([renamed, unchanged, conflict])
+
+    def ap(name, serial, model="AP-515", up=True, version=""):
+        return {
+            "mac_address": "20:4c:03:aa:01:01",
+            "name": name,
+            "model": model,
+            "serial": serial,
+            "address": "10.20.10.11",
+            "group": "floor-1",
+            "up": up,
+            "software_version": version,
+        }
+
+    facts = {
+        "manufacturer": "HPE",
+        "platform": "ArubaOS",
+        "software_version": "8.10.0.4",
+        "collected_at": "2026-11-07T00:00:00+00:00",
+        "access_points": [
+            ap("dal-ap-101", "CNJPJ0A001", version="8.10.0.4_87457"),
+            ap("dal-ap-102", "CNJPJ0A002"),
+            ap("dal-ap-103", "CNJPJ0B003", model="AP-535", up=False),
+            ap("", "", up=False),
+            ap("dal-ap-104", "CNJPJ0A004"),
+        ],
+    }
+    controller = {"id": 40, "site": {"id": 1}, "tenant": None, "platform": {"id": 9}}
+    with httpx.Client(
+        base_url="https://netbox.example/api/", transport=httpx.MockTransport(netbox.handle)
+    ) as client:
+        result = NetBoxDiscovery(client, lambda: None).sync_access_points(controller, "lab", facts)
+
+    assert (result["status"], result["controller_id"], result["reported"], result["skipped"]) == (
+        "warning",
+        40,
+        5,
+        1,
+    )
+    rows = {row["name"]: row for row in result["access_points"]}
+    assert {name: row["status"] for name, row in rows.items()} == {
+        "dal-ap-101": "updated",
+        "dal-ap-102": "unchanged",
+        "dal-ap-103": "created",
+        "dal-ap-104": "failed",
+    }
+    assert rows["dal-ap-104"]["error"] == "Access point dal-ap-104 has a different serial in NetBox"
+    writes = [call for call in netbox.calls if call[1] != "plugins/refresh/device-software/report"]
+    assert writes == [
+        (
+            "PATCH",
+            "dcim/devices/61",
+            {
+                "name": "dal-ap-101",
+                "custom_fields": {"wireless_controller": 40, "software_version": "8.10.0.4_87457"},
+                "description": "AP group floor-1",
+                "add_tags": [7],
+            },
+        ),
+        (
+            "POST",
+            "dcim/devices",
+            {
+                "site": 1,
+                "tenant": None,
+                "role": 5,
+                "platform": 9,
+                "tags": [7, 8],
+                "name": "dal-ap-103",
+                "device_type": 42,
+                "serial": "CNJPJ0B003",
+                "status": "offline",
+                "description": "AP group floor-1",
+                "custom_fields": {"wireless_controller": 40, "software_version": "8.10.0.4"},
+            },
+        ),
+    ]
+    reports = [call[2] for call in netbox.calls if call[1] == "plugins/refresh/device-software/report"]
+    assert [(report["device"], report["version"]) for report in reports] == [
+        (61, "8.10.0.4_87457"),
+        (62, "8.10.0.4"),
+        (rows["dal-ap-103"]["device_id"], "8.10.0.4"),
+    ]
+    assert rows["dal-ap-101"]["software_inventory"] == {"status": "created", "id": 1061}
+
+
+def stack_record(id_, name, position, serial, **extra):
+    return {
+        "id": id_,
+        "name": name,
+        "vc_position": position,
+        "serial": serial,
+        "site": {"id": 1},
+        "tenant": None,
+        "virtual_chassis": {"id": 30},
+        "primary_ip4": None,
+        "primary_ip6": None,
+        **extra,
+    }
+
+
+def member(number, serial, role="member"):
+    return {
+        "member_id": number,
+        "role": role,
+        "model": "C9300-48P",
+        "serial": serial,
+        "software_version": "17.9.5",
+    }
+
+
+def reconcile(records, members):
+    calls = []
+
+    def handle(request):
+        path = request.url.path.removeprefix("/api/").strip("/")
+        params = request.url.params
+        if request.method == "GET":
+            if path == "dcim/virtual-chassis/30":
+                return httpx.Response(200, json={"id": 30, "master": {"id": records[0]["id"]}})
+            assert path == "dcim/devices"
+            if "virtual_chassis_id" in params:
+                rows = records
+            else:
+                rows = [row for row in records if row["name"].casefold() == params["name__ie"].casefold()]
+            return httpx.Response(200, json={"results": rows, "next": None})
+        data = json.loads(request.content)
+        calls.append((request.method, path, data))
+        return httpx.Response(200, json={"id": int(path.rsplit("/", 1)[1]), **data})
+
+    facts = {"name": "sw"}
+    with httpx.Client(
+        base_url="https://netbox.example/api/", transport=httpx.MockTransport(handle)
+    ) as client:
+        current, anchor = NetBoxDiscovery(client, lambda: None).reconcile_stack(records[0], members, facts)
+    return current, anchor, facts, calls
+
+
+def test_replaced_stack_member_is_retired_so_the_new_switch_takes_its_place():
+    records = [
+        stack_record(1, "sw", 1, "S1"),
+        stack_record(2, "sw-2", 2, "S2"),
+        stack_record(3, "sw-3", 3, "S3"),
+    ]
+    current, anchor, facts, calls = reconcile(
+        records, [member(1, "S1", "active"), member(2, "S2", "standby"), member(3, "S3-NEW")]
+    )
+    assert (current["id"], anchor["member_id"]) == (1, 1)
+    assert calls == [
+        (
+            "PATCH",
+            "dcim/devices/3",
+            {
+                "name": "sw-3-decom-S3",
+                "status": "decommissioning",
+                "virtual_chassis": None,
+                "vc_position": None,
+            },
+        )
+    ]
+    assert facts["stack_changes"] == {
+        "retired": [{"device_id": 3, "serial": "S3", "position": 3, "name": "sw-3-decom-S3"}],
+        "renumbered": [],
+    }
+
+
+def test_swapped_member_numbers_rename_and_move_the_records():
+    records = [
+        stack_record(1, "sw", 1, "S1"),
+        stack_record(2, "sw-2", 2, "S2"),
+        stack_record(3, "sw-3", 3, "S3"),
+    ]
+    current, _, facts, calls = reconcile(
+        records, [member(1, "S1", "active"), member(2, "S3"), member(3, "S2")]
+    )
+    assert current["id"] == 1
+    assert calls == [
+        ("PATCH", "dcim/devices/2", {"vc_position": 255, "name": "sw-renumbering-2"}),
+        ("PATCH", "dcim/devices/3", {"vc_position": 254, "name": "sw-renumbering-3"}),
+        ("PATCH", "dcim/devices/2", {"vc_position": 3, "name": "sw-3"}),
+        ("PATCH", "dcim/devices/3", {"vc_position": 2, "name": "sw-2"}),
+    ]
+    assert [(row["serial"], row["from"], row["to"]) for row in facts["stack_changes"]["renumbered"]] == [
+        ("S2", 2, 3),
+        ("S3", 3, 2),
+    ]
+
+
+def test_moving_to_a_free_member_number_needs_no_parking():
+    records = [stack_record(1, "sw", 1, "S1"), stack_record(2, "sw-2", 2, "S2")]
+    _, _, _, calls = reconcile(records, [member(1, "S1", "active"), member(5, "S2")])
+    assert calls == [("PATCH", "dcim/devices/2", {"vc_position": 5, "name": "sw-5"})]
+
+
+def test_replaced_management_switch_frees_its_name_address_and_chassis_role():
+    records = [
+        stack_record(1, "sw", 1, "S1", primary_ip4={"id": 70}),
+        stack_record(2, "sw-2", 2, "S2"),
+    ]
+    current, anchor, facts, calls = reconcile(records, [member(1, "S1-NEW"), member(2, "S2", "active")])
+    assert current is None and anchor["serial"] == "S1-NEW"
+    assert facts["stack_chassis_id"] == 30
+    assert calls == [
+        ("PATCH", "dcim/virtual-chassis/30", {"master": None}),
+        (
+            "PATCH",
+            "dcim/devices/1",
+            {
+                "name": "sw-decom-S1",
+                "status": "decommissioning",
+                "virtual_chassis": None,
+                "vc_position": None,
+                "primary_ip4": None,
+                "primary_ip6": None,
+                "custom_fields": {"snmp_discovery_ip": None},
+            },
+        ),
+        ("PATCH", "ipam/ip-addresses/70", {"assigned_object_type": None, "assigned_object_id": None}),
+    ]
+
+
+def test_a_retired_name_already_in_use_gets_the_record_id():
+    records = [
+        stack_record(1, "sw", 1, "S1"),
+        stack_record(2, "sw-2", 2, "S2"),
+        # Same switch retired from this slot once before.
+        {**stack_record(9, "sw-2-decom-S2", None, "S2"), "virtual_chassis": None},
+    ]
+    in_chassis = records[:2]
+
+    calls = []
+
+    def handle(request):
+        path = request.url.path.removeprefix("/api/").strip("/")
+        params = request.url.params
+        if request.method == "GET":
+            if path == "dcim/virtual-chassis/30":
+                return httpx.Response(200, json={"id": 30, "master": {"id": 1}})
+            rows = (
+                in_chassis
+                if "virtual_chassis_id" in params
+                else [row for row in records if row["name"].casefold() == params["name__ie"].casefold()]
+            )
+            return httpx.Response(200, json={"results": rows, "next": None})
+        calls.append((path, json.loads(request.content)["name"]))
+        return httpx.Response(200, json={})
+
+    with httpx.Client(
+        base_url="https://netbox.example/api/", transport=httpx.MockTransport(handle)
+    ) as client:
+        NetBoxDiscovery(client, lambda: None).reconcile_stack(
+            in_chassis[0], [member(1, "S1", "active"), member(2, "S2-NEW")], {"name": "sw"}
+        )
+    assert calls == [("dcim/devices/2", "sw-2-decom-S2-2")]
+
+
+def test_management_slot_reused_by_a_known_switch_is_left_for_review():
+    from netops_executor.netbox_discovery import SyncError
+
+    records = [stack_record(1, "sw", 1, "S1"), stack_record(2, "sw-2", 2, "S2")]
+    with pytest.raises(SyncError, match="management switch left the stack"):
+        reconcile(records, [member(1, "S2", "active"), member(3, "S3")])
