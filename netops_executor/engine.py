@@ -1,14 +1,14 @@
-import json
 import math
 import os
 import re
 import time
 from datetime import datetime, timezone
 
+from . import f5_operations as ops
 from .admin_password import PasswordCheckUnavailable, matches_admin_password, reset_admin_password
 from .config import under
 from .credentials import Vault
-from .device import BigIP, differences, matches, name
+from .device import BigIP, Plateau, differences, ltm_report, matches, name
 from .image_cache import cached_image
 from .models import JobRequest
 from .ssh import SSH, DeviceError, digest
@@ -139,8 +139,9 @@ class Runner:
         # Minor monitor differences remain reportable warnings. Config inventory must be present.
         baseline = self.result.get("pre_validation")
         if baseline:
-            if baseline["waf_policy_names"] != health["waf_policy_names"]:
-                raise DeviceError("peer WAF policy inventory differs")
+            # Count only, as nornir-netops settled on: names and attributes are informational.
+            if len(baseline["waf_policy_names"]) != len(health["waf_policy_names"]):
+                raise DeviceError("peer WAF policy count differs")
             for category in ("virtual_servers", "pools", "nodes", "virtual_ips"):
                 if set(baseline[category]["objects"]) != set(health[category]["objects"]):
                     raise DeviceError("peer object inventory differs: " + category)
@@ -373,16 +374,30 @@ class Runner:
                     self.intent("delete_installer", image=filename)
                     self.ssh.tmsh("delete /sys software " + kind + " " + name(filename))
 
+    def target_installed(self, request):
+        """A boot volume already on the final version/build needs only the configuration copy."""
+        final = request.images[-1]
+        if not matches(self.device.volumes().get(request.target_volume), final.version, final.build):
+            return False
+        self.result["reused_volume"] = request.target_volume
+        self.event(
+            "target_volume_already_installed",
+            volume=request.target_volume,
+            version=final.version,
+            build=final.build,
+        )
+        return True
+
     def install(self, request):
+        final = request.images[-1]
+        if matches(self.device.volumes().get(request.target_volume), final.version, final.build):
+            self.event("install_already_complete", image=final.name, volume=request.target_volume)
+            return
         if self.device.free_bytes() < request.minimum_free_bytes:
             if request.cleanup_images:
                 self.cleanup_images(request)
             if self.device.free_bytes() < request.minimum_free_bytes:
                 raise DeviceError("image filesystem reserve is below minimum_free_bytes")
-        final = request.images[-1]
-        if matches(self.device.volumes().get(request.target_volume), final.version, final.build):
-            self.event("install_already_complete", image=final.name, volume=request.target_volume)
-            return
         for image in request.images:
             self.checkpoint()
             volumes = self.device.volumes()
@@ -418,6 +433,8 @@ class Runner:
         self.result["drain"] = {
             "initial_connections": baseline,
             "threshold": threshold,
+            "plateau_percent": request.drain_plateau_percent,
+            "plateau_window_seconds": request.drain_plateau_window,
             "address_states": states,
             "changed_addresses": [],
             "timed_out": False,
@@ -432,20 +449,66 @@ class Runner:
                 self.intent("disable_virtual_address", address=address)
                 self.device.set_enabled(address, False)
         deadline = self.clock() + request.drain_timeout
+        plateau = Plateau(request.drain_plateau_percent, request.drain_plateau_window, self.clock(), baseline)
         while True:
             self.checkpoint()
             current = self.device.connections()
             self.result["drain"]["final_connections"] = current
+            reason = "threshold" if current <= threshold else None
+            if reason is None and plateau.reached(self.clock(), current):
+                reason = "plateau"
+            if plateau.reduction is not None:
+                self.result["drain"]["window_reduction_percent"] = plateau.reduction
             self.event("drain_sample", connections=current, threshold=threshold)
-            if current <= threshold:
+            if reason:
+                self.result["drain"]["reason"] = reason
                 return
             if self.clock() >= deadline:
                 self.result["drain"]["timed_out"] = True
+                self.result["drain"]["reason"] = "timeout"
                 self.event("drain_timeout", forced_reboot=request.reboot_on_drain_timeout)
                 if not request.reboot_on_drain_timeout:
                     raise DeviceError("drain timed out; reboot was not authorized on timeout")
                 return
             self.wait(min(5, max(0, deadline - self.clock())))
+
+    def hold_drained(self, timeout=120):
+        """Drained addresses must boot disabled and stay so until validation passes."""
+        if not self.changed_addresses:
+            return
+        deadline = self.clock() + timeout
+        while True:
+            try:
+                states = self.device.address_states()
+                break
+            except DeviceError:
+                if self.clock() >= deadline:
+                    raise
+                self.wait(5)
+        leaked = [a for a in self.changed_addresses if states.get(a) is not False]
+        if not leaked:
+            self.event("drained_addresses_held", count=len(self.changed_addresses))
+            return
+        for address in leaked:
+            if address in states:
+                self.intent("disable_virtual_address", address=address)
+                self.device.set_enabled(address, False)
+        self.intent("save_disabled_addresses")
+        self.ssh.tmsh("save /sys config", timeout=180)
+        raise DeviceError(
+            "a drained virtual address booted enabled or is missing; disabled again, recovery required"
+        )
+
+    def device_time(self):
+        return ops.utc(self.ssh.shell(ops.DEVICE_CLOCK, timeout=30).strip()).isoformat()
+
+    def mark_request_boundary(self):
+        # Only requests the unit logs after the verified reboot prove the upgraded ASM inspects traffic.
+        try:
+            self.result["waf_request_after"] = self.device_time()
+        except (DeviceError, ValueError):
+            # The request check reads the clock itself; a later boundary is conservative.
+            self.result.pop("waf_request_after", None)
 
     def restore_addresses(self):
         for address in self.changed_addresses[:]:
@@ -507,6 +570,14 @@ class Runner:
                 findings = differences(baseline, snapshot, self.changed_addresses)
                 if not snapshot.get("asm_ready", True):
                     critical.append("ASM is not ready")
+                # Every policy type counts, parents included. A lost policy blocks; renamed or
+                # re-flagged policies stay noncritical findings.
+                before_count, after_count = (
+                    len(baseline["waf_policy_names"]),
+                    len(snapshot["waf_policy_names"]),
+                )
+                if before_count != after_count:
+                    critical.append(f"WAF policy count changed: {before_count} before, {after_count} after")
                 if request.reboot:
                     active = snapshot["active"]
                     if (active["volume"], active["version"], active["build"]) != (
@@ -577,50 +648,61 @@ class Runner:
             self.wait(min(10, max(0, deadline - self.clock())))
 
     def waf_requests(self, request):
-        if not request.validation_policy.waf_request_check:
-            return
+        """Prove the upgraded ASM inspects traffic: one request logged after the verified reboot."""
         latest = self.result.get("post_validation", self.result["pre_validation"])
-        if not latest["waf_policies"] or self.device.topology()["role"] != "active":
-            self.result["waf_request_check"] = {
-                "status": "skipped",
-                "reason": "no policies or unit is standby",
-            }
-            self.event("waf_request_check_skipped")
+        reason = None
+        if request.validation_policy.waf_request_check is False:
+            reason = "disabled by validation_policy.waf_request_check"
+        elif latest.get("asm_provision", "none") == "none":
+            reason = "ASM is not provisioned"
+        elif not latest["waf_policies"]:
+            reason = "no WAF policies"
+        elif self.device.topology()["role"] != "active":
+            reason = "unit is standby"
+        if reason:
+            self.result["waf_request_check"] = {"status": "skipped", "reason": reason}
+            self.event("waf_request_check_skipped", reason=reason)
             return
-        command = self.settings.device(self.job["device"]).waf_request_command
-        if not command:
-            self.store.open_gate(
-                self.job["id"],
-                self.worker,
-                "waf_requests",
-                {"critical": ["configure a read-only waf_request_command or manually validate WAF traffic"]},
-                self.result,
-            )
+        command = self.settings.device(self.job["device"]).waf_request_command or ops.ASM_REQUESTS
+        record = self.result["waf_request_check"] = {"status": "waiting", "attempts": 0}
         deadline = self.clock() + request.validation_timeout
         while True:
             self.checkpoint()
+            record["attempts"] += 1
             try:
-                data = json.loads(self.ssh.shell(command, timeout=30))
-                stamp = datetime.fromisoformat(data["timestamp"].replace("Z", "+00:00"))
-                boundary = datetime.fromisoformat(self.result["reboot_requested_at"])
-                if stamp.tzinfo and stamp >= boundary and stamp <= datetime.now(timezone.utc) and data["id"]:
-                    self.result["waf_request_check"] = {
-                        "status": "passed",
-                        "id": str(data["id"])[:128],
-                        "timestamp": stamp.isoformat(),
-                    }
+                if not self.result.get("waf_request_after"):
+                    self.result["waf_request_after"] = self.device_time()
+                after = ops.utc(self.result["waf_request_after"])
+                newer = [
+                    (request_id, stamp)
+                    for request_id, stamp in ops.asm_requests(self.ssh.shell(command, timeout=60))
+                    if stamp > after
+                ]
+                record.pop("last_error", None)
+                if newer:
+                    request_id, stamp = max(newer, key=lambda pair: pair[1])
+                    record.update(
+                        status="passed",
+                        id=request_id,
+                        timestamp=stamp.isoformat(),
+                        after=self.result["waf_request_after"],
+                    )
                     self.event("waf_request_check_completed")
                     return
-            except (DeviceError, ValueError, KeyError, TypeError):
-                pass
+            except (DeviceError, ValueError) as exc:
+                # A fixed category only: request-log reads never retain request content.
+                record["last_error"] = type(exc).__name__
+            self.event("waf_request_check_waiting", attempts=record["attempts"])
             if self.clock() >= deadline:
+                record["status"] = "timed_out"
+                message = "no ASM request logged after the upgrade; check local request logging and traffic"
                 if request.validation_policy.on_timeout == "fail":
-                    raise DeviceError("no post-upgrade WAF request observed before timeout")
+                    raise DeviceError(message)
                 self.store.open_gate(
                     self.job["id"],
                     self.worker,
                     "waf_requests",
-                    {"critical": ["no new WAF request observed"]},
+                    {"critical": [message]},
                     self.result,
                 )
             self.wait(min(10, max(0, deadline - self.clock())))
@@ -784,9 +866,19 @@ class Runner:
         # The active member is the authoritative configuration source after failover.
         source = self.device if topology["role"] == "active" else peer
         self.checkpoint()
-        for group in topology["groups"]:
-            self.intent("config_sync", group=group)
-            source.ssh.tmsh("run /cm config-sync to-group " + name(group), timeout=180)
+        targets = ops.sync_targets(source, [m["name"] for m in topology["members"]]) or {
+            group: False for group in topology["groups"]
+        }
+        for group, conflict in sorted(targets.items()):
+            # Each member saved and booted its own configuration while versions differed. The pair then
+            # reports a change conflict that an incremental sync never clears, so the active member's
+            # full configuration is pushed instead.
+            self.intent("config_sync", group=group, full_load=conflict)
+            push = "force-full-load-push " if conflict else ""
+            source.ssh.tmsh("run /cm config-sync " + push + "to-group " + name(group), timeout=180)
+        forced = sorted(group for group, conflict in targets.items() if conflict)
+        if forced:
+            self.result["config_sync_forced"] = forced
         deadline = self.clock() + 120
         while self.device.topology()["sync"] != "in sync" or peer.topology()["sync"] != "in sync":
             if self.clock() >= deadline:
@@ -893,7 +985,8 @@ class Runner:
         if "create_ucs" in r.plan():
             self.backup(r)
         self.checkpoint()
-        if r.transfer or r.install:
+        reused = r.install and self.target_installed(r)
+        if (r.transfer or r.install) and not reused:
             self.images(r)
         if r.install:
             self.install(r)
@@ -905,12 +998,14 @@ class Runner:
             self.copy_config(r)
         if r.reboot:
             self.reboot(r.target_volume, r.expected_version, r.expected_build, r.reboot_timeout)
+            self.mark_request_boundary()
             self.checkpoint()
             remaining = r.validation_policy.settling_seconds
             while remaining > 0:
                 self.checkpoint()
                 self.wait(min(5, remaining))
                 remaining -= min(5, remaining)
+            self.hold_drained()
         self.postvalidate(before, r if r.reboot else r.model_copy(update={"validation_timeout": 0}))
         if r.reboot:
             self.complete_upgrade(r)
@@ -961,12 +1056,17 @@ class Runner:
     def run(self):
         try:
             self.rollback() if self.job["kind"] == "rollback" else self.upgrade()
+            if self.result.get("pre_validation") and self.result.get("post_validation"):
+                report = ltm_report(self.result["pre_validation"], self.result["post_validation"])
+                self.result["ltm_report"] = report
+                self.event("ltm_report", **{c: len(v["changes"]) for c, v in report.items()})
             self.result["completed"] = True
             self.event("completed")
             audit = self.store.get(self.job["id"])["credential_summary"]
             warnings = bool(
                 self.result.get("validation_differences")
                 or self.result.get("manual_validations")
+                or self.result.get("config_sync_forced")
                 or audit.get("multiple_profiles_used")
             )
             self.store.finish(

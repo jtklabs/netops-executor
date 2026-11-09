@@ -112,6 +112,13 @@ class F5Drain(Model):
     )
     remaining_connections: int | None = Field(default=None, ge=0)
     reduction_percent: float | None = Field(default=None, ge=0, le=100)
+    plateau_percent: float | None = Field(
+        default=None,
+        gt=0,
+        le=100,
+        description="Also drained when connections fall less than this percent over one plateau window",
+    )
+    plateau_window_seconds: int = Field(default=60, ge=5, le=3600)
     timeout_seconds: int = Field(default=600, ge=0, le=86400)
     proceed_on_timeout: bool = Field(
         default=False, description="Upgrade even when connections stay above the threshold at timeout"

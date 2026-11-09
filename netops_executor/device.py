@@ -25,7 +25,13 @@ def blocks(text, prefix):
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     lexer.commenters = ""
-    tokens = list(lexer)
+    # tmsh quotes only with double quotes; unquoted show values such as
+    # "either don't have service checking enabled" contain apostrophes.
+    lexer.quotes = '"'
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        raise DeviceError("unparseable tmsh object output") from None
     # shlex groups adjacent punctuation.
     tokens = [part for t in tokens for part in (list(t) if t and set(t) <= {"{", "}", "\n"} else [t])]
     expected, result, i = prefix.split(), {}, 0
@@ -157,10 +163,14 @@ class BigIP:
             if not columns or columns[0] not in result:
                 continue
             key = columns[0]
-            if key in seen or len(columns) < 6 or columns[1] != "BIG-IP":
+            if key in seen:
                 raise DeviceError("unrecognized software status row")
             seen.add(key)
+            # A volume still being created or installed may show blank product, version
+            # and build columns; only complete volumes supply the authoritative build.
             if result[key]["status"] == "complete":
+                if len(columns) < 6 or columns[1] != "BIG-IP":
+                    raise DeviceError("unrecognized software status row")
                 if columns[5] != "complete" or columns[2] != result[key]["version"]:
                     raise DeviceError("software status changed while being read")
                 result[key]["build"] = columns[3]
@@ -214,7 +224,9 @@ class BigIP:
                 ("virtual_ips", "virtual-address"),
             )
         }
-        provision = blocks(self.ssh.tmsh("list /sys provision asm"), "sys provision")
+        # Naming the property prints its default too: plain "list" shows "sys provision asm { }" when
+        # ASM is not provisioned (BIG-IP 17.5).
+        provision = blocks(self.ssh.tmsh("list /sys provision asm level"), "sys provision")
         if "asm" not in provision:
             raise DeviceError("ASM provisioning status missing")
         level = required(provision["asm"], "level")
@@ -237,11 +249,10 @@ class BigIP:
             "configuration": config,
             "collection_errors": errors,
             "asm_ready": ready,
+            # One-line tmsh prints "policy-type parent" for parents and omits it for security
+            # policies; it never prints the enforcement mode. Parents have no active state.
             "waf_policy_attributes": {
-                key: {
-                    "active": flag(body, "active"),
-                    **{k: field(body, k) for k in ("enforcement-mode", "type")},
-                }
+                key: {"active": flag(body, "active"), "policy-type": field(body, "policy-type", "security")}
                 for key, body in policies.items()
             },
             "active": active,
@@ -407,3 +418,72 @@ def differences(before, after, drained=False):
     for category, error in after.get("collection_errors", {}).items():
         result.append({"category": category, "change": "unavailable", "message": error})
     return result
+
+
+LTM_CATEGORIES = ("virtual_servers", "pools", "nodes", "virtual_ips")
+
+
+def ltm_state(record):
+    text = f"{record.get('availability')}/{record.get('enabled')}"
+    if "active_members" in record:
+        text += f" ({record['active_members']} active members)"
+    return text
+
+
+def ltm_report(before, after):
+    """Operator report of LTM object changes between the pre-upgrade and final snapshots.
+
+    Validation tolerates these by default because applications go up and down; the report
+    still names every virtual server, pool, node and virtual address whose state differs.
+    Connection counts are not states and never appear.
+    """
+    report = {}
+    for category in LTM_CATEGORIES:
+        old, new = before[category]["objects"], after[category]["objects"]
+        changes = []
+        for key in sorted(old.keys() | new.keys()):
+            was = ltm_state(old[key]) if key in old else None
+            now = ltm_state(new[key]) if key in new else None
+            if key in old and key in new and was == now and old[key].get("up") == new[key].get("up"):
+                continue
+            if now is None:
+                change = "removed"
+            elif was is None:
+                change = "added"
+            elif old[key].get("up") and not new[key].get("up"):
+                change = "went down"
+            elif new[key].get("up") and not old[key].get("up"):
+                change = "came up"
+            else:
+                change = "changed"
+            changes.append({"object": key, "change": change, "before": was, "after": now})
+        total = len(old.keys() | new.keys())
+        report[category] = {
+            "before": {"up": before[category]["up"], "total": before[category]["total"]},
+            "after": {"up": after[category]["up"], "total": after[category]["total"]},
+            "unchanged_percent": round(100 * (total - len(changes)) / total, 1) if total else 100.0,
+            "changes": changes,
+        }
+    return report
+
+
+class Plateau:
+    """Drain completion by stalled decline: connections fell less than `percent` over one window.
+
+    Long-lived connections may never reach a count or percent threshold. Rising traffic is not a
+    plateau, so it still runs into the drain timeout.
+    """
+
+    def __init__(self, percent, window, now, connections):
+        self.percent, self.window = percent, window
+        self.started, self.previous = now, connections
+        self.reduction = None
+
+    def reached(self, now, connections):
+        if self.percent is None or now - self.started < self.window:
+            return False
+        previous, self.started, self.previous = self.previous, now, connections
+        if previous <= 0:
+            return False
+        self.reduction = round(100 * (previous - connections) / previous, 2)
+        return 0 <= self.reduction < self.percent

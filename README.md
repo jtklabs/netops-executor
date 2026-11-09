@@ -70,6 +70,8 @@ keeps the token only in tab memory and uses the same API.
 | GET | `/api/v1/queues` | Queued, due and running jobs and workers per queue |
 | GET | `/api/v1/webhooks` | Webhook configuration and delivery backlog |
 | POST | `/api/v1/webhooks/test` or `/retry` | Send a signed `ping`, or requeue failed deliveries |
+| GET | `/api/v1/email` | SMTP relay and email report backlog |
+| POST | `/api/v1/email/test` or `/retry` | Send a test message, or requeue failed reports |
 | GET | `/api/v1/jobs/{id}/events?after=0&limit=500` | Ordered events; advance cursor to last `seq` |
 | GET | `/api/v1/jobs/{id}/backup` | Download completed UCS backup (or the first PAN-OS config backup) |
 | GET | `/api/v1/jobs/{id}/artifacts/{name}` | Download a saved PAN-OS running config or tech support file |
@@ -311,6 +313,58 @@ sends a signed `{"event": "ping"}` and returns the receiver's status. Delivered 
 are kept for 7 days and failed ones for 30. Jobs that finish while no webhook is
 configured are not sent later.
 
+## Email reports
+
+Add `notify_email` to any job or batch request, as one address or a list of up to 20, and
+the remote emails an HTML report (with a plain-text part) when the work finishes:
+
+```json
+{"name": "dc1-f5-november", "notify_email": ["netops@example.com", "change-board@example.com"], "defaults": {}, "waves": []}
+```
+
+| Request | Report |
+| --- | --- |
+| A job | One report when the job becomes `succeeded`, `completed_with_warnings`, `failed`, `cancelled`, `expired`, `recovery_required`, `resolved` or `manually_completed`. A later status, such as `resolved` after `recovery_required`, sends another. `needs_review` sends none. |
+| A batch (`notify_email` at the top level) | One report for the whole batch when every device has passed, or when nothing more can run: no device is running or waiting for review, and every device left waits behind an earlier wave that did not pass. If an operator then moves the batch on, a new report follows when it settles again. |
+| Batch `defaults` or `overrides` | Each of those devices also gets its own job report. |
+
+An F5 report shows the device and its inventory name, the software before and after (version,
+build and volume), start, finish and duration, the HA role and sync-failover group, the drain
+(connections before and after, and why it ended), the reused volume or the UCS backup, config
+sync, the ASM request log check, WAF policy counts, the traffic object table from `ltm_report`
+with every object that changed state (up to 25 per category; the job record has the rest),
+operator validation decisions and a timeline of the main steps. A "Needs attention" box at the
+top names the error, what to do for `recovery_required`, forced full-load syncs, accepted
+differences and sign-ins with more than one credential profile. Other job kinds get the same
+summary, notes and timeline. A batch report adds a wave table, a device table (status,
+software, duration, traffic object changes) and the detail of every device with notes or
+changes.
+
+Set the relay in `service.env` (Ansible: `executor_smtp_host`, `executor_smtp_from`,
+`executor_smtp_username` and `executor_smtp_password` from Vault):
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `NETOPS_SMTP_HOST` | none | Relay host; setting it turns reports on |
+| `NETOPS_SMTP_FROM` | required | Sender, `netops@example.com` or `NetOps Executor <netops@example.com>` |
+| `NETOPS_SMTP_SECURITY` | `starttls` | `starttls`, `ssl` (implicit TLS) or `none` (plain text) |
+| `NETOPS_SMTP_PORT` | 587, or 465 for `ssl` | Relay port |
+| `NETOPS_SMTP_USERNAME`, `NETOPS_SMTP_PASSWORD` | none | Both or neither; not allowed with `none` unless the relay is on this host |
+| `NETOPS_SMTP_CA_FILE` | system CAs | CA bundle for a private relay certificate |
+
+A request with `notify_email` is refused with 409 while no relay is configured. A report is
+queued in the same database transaction as the status change, and the API process sends it, as
+it does webhooks. Connection errors and temporary (4xx) refusals are retried after 30, 60, 120
+seconds and so on, up to every 10 minutes, for 72 hours, and all reports wait while the relay
+is failing. A permanent (5xx) refusal of the sender, the message or every recipient is not
+retried. Recipients refused while others were accepted are recorded on the delivery.
+
+`GET /api/v1/email` reports the relay and the `pending`, `delivered`, `skipped` and `failed`
+counts with recent errors. `POST /api/v1/email/test` with `{"to": ["netops@example.com"]}`
+sends a test message and returns `{"sent": true, "refused": [], "error": null}`.
+`POST /api/v1/email/retry` requeues reports that gave up. Records are kept for 7 days, or 30
+when failed. Jobs that finish while no relay is configured are not emailed later.
+
 ## SSH and HTTPS cipher scans
 
 Submit `POST /api/v1/cipher-scans` with the usual bearer token and an optional
@@ -425,6 +479,7 @@ No root user, raw-socket capability or privileged container is needed.
     "standalone_drain": {
       "enabled": true,
       "remaining_connections": 100,
+      "plateau_percent": 5,
       "timeout_seconds": 600,
       "reboot_on_timeout": true
     },
@@ -492,9 +547,12 @@ Inventory/HTTP target defaults may restrict the eligible profiles for a target.
 | `reboot_timeout` | Verified reboot timeout; default 900 seconds |
 | `validation_timeout` | Bounded validation window; default 600, maximum 86400 seconds |
 
-The installer reuses an exact final version/build when available. **It always
-saves the current configuration and runs `cpcfg --source=<current> <target>`,
-including reused volumes.** It requires a verified zero exit status. Copy progress
+The installer reuses an exact final version/build when available. A target
+volume that already runs the final version/build skips the image transfer, image
+checks, free-space reserve and installation, and `result.reused_volume` names it.
+An explicit `target_volume` is still honored. **It always saves the current
+configuration and runs `cpcfg --source=<current> <target>`, including reused
+volumes.** It requires a verified zero exit status. Copy progress
 and its private on-device log directory are recorded. An ambiguous install/copy
 is never automatically replayed.
 
@@ -626,6 +684,14 @@ remaining count or `reduction_percent` (not both) in `standalone_drain`.
 A 90% reduction from 1,000 connections means 100 remaining. Counts sum clientside
 virtual-server connections; they are not a complete system connection-table count.
 
+Long-lived connections may never reach that target. Add `plateau_percent` to also
+treat the unit as drained once connections fall by less than that percent over one
+`plateau_window_seconds` window (default 60). With `plateau_percent: 5`, 400
+connections that are still 390 a minute later count as drained. Whichever rule is
+met first ends the drain, and `result.drain.reason` records `threshold`, `plateau`
+or `timeout`. Rising traffic is never a plateau. The flat field is
+`drain_plateau_percent` with `drain_plateau_window`.
+
 The flat fields `drain`, `drain_connections`, `drain_percent`, `drain_timeout`, and
 `reboot_on_drain_timeout` remain supported. Their default timeout is 300 seconds;
 `standalone_drain.timeout_seconds` defaults to 600. With no threshold, drain to zero.
@@ -633,8 +699,11 @@ Draining requires reboot. Timeout restores addresses and stops unless forced
 reboot on timeout was explicitly selected.
 
 Disabled states are saved and copied into the target so traffic stays drained
-through reboot and validation. After successful or manually accepted validation,
-restore only addresses disabled by this job, save, and collect the final snapshot.
+through reboot and validation. After the reboot the job checks that every drained
+address booted disabled. One that booted enabled, or is missing, is disabled again
+and the job stops as `recovery_required` before validation. After successful or
+manually accepted validation, restore only addresses disabled by this job, save,
+collect the final snapshot, then run the ASM request check below.
 Before reboot, cancellation/error attempts restoration. Uncertain boots retain
 recovery state and reservations instead of issuing blind cleanup.
 
@@ -646,8 +715,14 @@ handoff, then reboot. HA jobs **do not disable shared virtual addresses**.
 Before upgrading the second member, verify that the upgraded peer has completed
 validation and can carry traffic. Mixed-version handoffs need that saved peer
 validation; a manually completed peer counts only if its post-upgrade validation passed. Sync is deferred while versions/builds differ; when equal, use the
-active member as the sync source and verify completion. Unknown topology,
-active-active groups, unhealthy peers and changing ownership stop the operation.
+active member as the sync source and verify completion. The sync covers every
+pending group that holds exactly the pair, including ASM's `datasync-global-dg`;
+auto-sync groups and device trust sync themselves. Upgrading the members one at a
+time leaves a "possible change conflict", which an incremental sync never clears,
+so a group reporting one gets `force-full-load-push` from the active member. The
+job then lists those groups in `result.config_sync_forced` and completes with
+warnings. Unknown topology, active-active groups, unhealthy peers and changing
+ownership stop the operation.
 
 Within each wave, devices are claimed in submitted order when eligible, up to
 `upgrade_at_a_time`; a reserved pair cannot overlap. A later wave starts only
@@ -663,15 +738,37 @@ pool active members; VLANs, self IPs, routes, management routes/IPs, provisionin
 interfaces, trunks, iRule names and certificate expiry fields. Collection gaps
 are explicit. Dynamic `_auto` nodes are excluded from stable inventory comparisons.
 
+WAF policies are read with tmsh and every policy type counts, including parent
+policies, which have no active state (over REST they also lack `enforcementMode`).
+Only the count blocks: a unit with fewer or more policies after the upgrade fails
+validation, and an HA peer must hold the same number. Names, `active` and
+`policy-type` are compared and reported as noncritical findings.
+
 Object deltas are reported individually. Minor monitor or inventory differences
 are **warnings by default**, so a few nodes going down cannot trap the wave.
-ASM readiness, boot identity/version and HA health are blocking checks. Validation
+ASM readiness, the WAF policy count, boot identity/version and HA health are
+blocking checks. Validation
 has bounded settling/retries. `on_timeout` chooses `needs_review` (default) or
 `fail`. Strict environments may select `noncritical_differences: require_review`
 and set `ltm_min_unchanged_percent`/`waf_min_unchanged_percent`; both default to 100.
 Other configuration changes still require review in strict mode. Two consecutive
 acceptable samples are the default; a zero-second validation window takes one.
 No-reboot jobs validate the current runtime, not the staged software.
+
+Tolerated differences are still reported. Every completed job that validated a
+unit ends with `result.ltm_report`, comparing the pre-upgrade snapshot with the
+final one taken after traffic is restored. For each of `virtual_servers`, `pools`,
+`nodes` and `virtual_ips` it gives up/total before and after, `unchanged_percent`,
+and one entry per object whose state differs:
+
+```json
+{"object": "/Common/app-pool", "change": "went down",
+ "before": "available/enabled (2 active members)", "after": "offline/enabled (0 active members)"}
+```
+
+`change` is `went down`, `came up`, `changed`, `added` or `removed`. Connection
+counts are not states and never appear. The `ltm_report` job event carries the
+number of changes per category.
 
 A waiting job exposes a gate with `id`, `revision`, `phase` and `findings`. Send:
 
@@ -711,14 +808,23 @@ boot state and saved drain state, then send:
 Use `/jobs/{id}/resolve`. These are operator attestations, not remotely proven
 facts. Resolving a manually completed item preserves its wave completion status.
 
-Optional `validation_policy.waf_request_check: true` checks for new WAF traffic
-after restoration. Standby units and units without policies skip it. Configure a
-read-only inventory `waf_request_command` that emits JSON
-`{"id":"request-id","timestamp":"2026-10-28T12:00:00+00:00"}` over SSH from your
-local request-log adapter. The timestamp must be timezone-aware and between the
-reboot request and now. No HTTP calls or log-byte-growth guesses are used.
-Without an adapter/new request, the bounded gate requires manual validation;
-request logging and incoming traffic must exist for automatic proof.
+Every reboot job then proves the upgraded ASM is inspecting traffic: it needs one
+ASM request logged after the verified reboot, by the unit's own clock. It runs after
+the drained addresses are restored, so the restored traffic can produce that log.
+Units without ASM provisioned, units without WAF policies and standby units skip
+it, and `result.waf_request_check` records the reason. Set
+`validation_policy.waf_request_check: false` to turn it off, or `true` to require it
+(which then requires `reboot`).
+
+The check runs, over SSH, a read of the unit's local iControl REST port:
+`curl -sf -u admin: http://localhost:8100/mgmt/tm/asm/events/requests` with
+`$select=id,requestDatetime`, newest first. No credentials leave the executor, and
+only the request ID and timestamp are kept. An inventory `waf_request_command` can
+replace it; it must print `{"id":"request-id","timestamp":"2026-10-28T12:00:00Z"}`
+or the same REST collection. The virtual servers need a security logging profile
+with local storage that logs the traffic, such as "Log all requests"; a profile that
+logs only illegal requests may never log a normal request. Without a new log entry
+within `validation_timeout`, `on_timeout` opens the review gate (default) or fails.
 
 ### Rollback
 
@@ -1003,6 +1109,7 @@ HTTP jobs, so none can overlap it.
 | `device` | Required: the related F5 |
 | `addresses` | Virtual addresses to drain, such as `/Common/10.1.1.10`; default every enabled address |
 | `remaining_connections` or `reduction_percent` | Drain target from F5 clientside virtual-server connections; neither means zero |
+| `plateau_percent`, `plateau_window_seconds` | Also drained once connections fall less than this percent over one window; window default 60 seconds |
 | `timeout_seconds` | Default 600 |
 | `proceed_on_timeout` | Default false: restore the addresses and stop; true upgrades anyway |
 
