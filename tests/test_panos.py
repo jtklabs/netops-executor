@@ -949,6 +949,27 @@ def test_f5_drain_proceeds_on_timeout_when_allowed(settings, store, panorama):
     assert job["result"]["f5_drain"]["threshold"] == 50 and job["result"]["f5_drain"]["timed_out"]
 
 
+def test_f5_drain_ends_when_connections_plateau(settings, store, panorama):
+    fw = panorama.add(FakeFirewall("0079510001"))
+    f5 = logged_f5(panorama)
+    f5.counts = iter([100, 80, 79])
+    job = drain_run(
+        settings,
+        store,
+        fw.serial,
+        f5,
+        {
+            "remaining_connections": 10,
+            "plateau_percent": 5,
+            "plateau_window_seconds": 60,
+            "timeout_seconds": 600,
+        },
+    )
+    assert job["status"] == "succeeded", job["result"]
+    drain = job["result"]["f5_drain"]
+    assert drain["reason"] == "plateau" and not drain["timed_out"] and drain["final_connections"] == 79
+
+
 def test_unvalidated_upgrade_keeps_the_f5_drained(settings, store, panorama):
     fw = panorama.add(FakeFirewall("0079510001"))
     fw.bgp_after_upgrade = "Idle"

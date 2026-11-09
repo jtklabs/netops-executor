@@ -94,6 +94,22 @@ def test_quoted_and_nested_blocks():
     assert list(blocks(output, "asm policy")) == ["/Tenant/policy"]
 
 
+def test_apostrophe_in_unquoted_show_value():
+    # 17.5 prints this reason unquoted until monitors report, for example just after a reboot.
+    output = """ltm pool Common/lab-backend {
+    status.availability-state unknown
+    status.enabled-state enabled
+    status.status-reason The children pool member(s) either don't have service checking enabled, or service check results are not available yet
+}
+"""
+    assert list(blocks(output, "ltm pool")) == ["Common/lab-backend"]
+
+
+def test_unbalanced_quote_is_a_device_error():
+    with pytest.raises(DeviceError, match="unparseable"):
+        blocks('ltm pool Common/p {\n    description "open\n}\n', "ltm pool")
+
+
 def test_argument_inheritance(image):
     r = JobRequest(
         device="lab", install=True, images=[image], target_volume="HD1.2", allowed_source_versions=["16.1.5"]
@@ -178,6 +194,79 @@ HD1.2    BIG-IP   17.5.1.9  0.0.12      no  complete              yes
 """
 
 
+def test_snapshot_reads_default_asm_level(monkeypatch):
+    # Plain "list /sys provision asm" prints "sys provision asm { }" on an LTM-only unit (17.5.1.9).
+    from netops_executor import f5_operations as ops
+
+    ssh = Mock()
+    ssh.tmsh.side_effect = lambda command, **kwargs: (
+        "sys provision asm {\n    level none\n}\n" if command == "list /sys provision asm level" else ""
+    )
+    device = BigIP(ssh)
+    monkeypatch.setattr(device, "active", lambda: {"volume": "HD1.2"})
+    monkeypatch.setattr(device, "stats", lambda kind: {"up": 0, "total": 0, "objects": {}})
+    monkeypatch.setattr(device, "boot_id", lambda: "boot")
+    monkeypatch.setattr(ops, "details", lambda d: ({}, {}))
+    snapshot = device.snapshot()
+    assert snapshot["asm_provision"] == "none" and snapshot["waf_policies"] == 0 and snapshot["asm_ready"]
+
+
+def test_parent_waf_policies_count_without_active_state(monkeypatch):
+    # Captured on BIG-IP 17.5.1.10. Over REST the parent has no active or enforcementMode
+    # field, which nornir-netops once rejected; every policy type must count.
+    from netops_executor import f5_operations as ops
+
+    outputs = {
+        "list /sys provision asm level": "sys provision asm {\n    level nominal\n}\n",
+        "cd /; list /asm policy recursive one-line": (
+            "asm policy Common/lab-upgrade-waf-01 { active encoding utf-8 policy-template POLICY_TEMPLATE_FUNDAMENTAL }\n"
+            "asm policy Common/netops-parent-test { encoding utf-8 policy-template POLICY_TEMPLATE_FUNDAMENTAL policy-type parent }\n"
+        ),
+    }
+    ssh = Mock()
+    ssh.tmsh.side_effect = lambda command, **kwargs: outputs.get(command, "")
+    device = BigIP(ssh)
+    monkeypatch.setattr(device, "active", lambda: {"volume": "HD1.2"})
+    monkeypatch.setattr(device, "stats", lambda kind: {"up": 0, "total": 0, "objects": {}})
+    monkeypatch.setattr(device, "boot_id", lambda: "boot")
+    monkeypatch.setattr(ops, "details", lambda d: ({}, {}))
+    monkeypatch.setattr(ops, "readiness", lambda d: True)
+    snapshot = device.snapshot()
+    assert snapshot["waf_policies"] == 2
+    assert snapshot["waf_policy_attributes"] == {
+        "Common/lab-upgrade-waf-01": {"active": True, "policy-type": "security"},
+        "Common/netops-parent-test": {"active": False, "policy-type": "parent"},
+    }
+
+
+def test_ltm_report_names_added_removed_and_changed_objects():
+    from netops_executor.device import ltm_report
+
+    def snap(objects):
+        records = {
+            k: dict(zip(("availability", "enabled"), v.split("/")), up=v == "available/enabled")
+            for k, v in objects.items()
+        }
+        stats = {"up": sum(r["up"] for r in records.values()), "total": len(records), "objects": records}
+        empty = {"up": 0, "total": 0, "objects": {}}
+        return {"virtual_servers": stats, "pools": empty, "nodes": empty, "virtual_ips": empty}
+
+    before = snap(
+        {"/Common/a": "available/enabled", "/Common/b": "available/enabled", "/Common/c": "unknown/enabled"}
+    )
+    after = snap(
+        {"/Common/a": "available/enabled", "/Common/b": "unknown/enabled", "/Common/d": "available/enabled"}
+    )
+    report = ltm_report(before, after)["virtual_servers"]
+    assert [(c["object"], c["change"], c["before"], c["after"]) for c in report["changes"]] == [
+        ("/Common/b", "went down", "available/enabled", "unknown/enabled"),
+        ("/Common/c", "removed", "unknown/enabled", None),
+        ("/Common/d", "added", None, "available/enabled"),
+    ]
+    assert report["before"] == {"up": 2, "total": 3} and report["after"] == {"up": 2, "total": 3}
+    assert report["unchanged_percent"] == 25.0
+
+
 def test_volumes_parse_bare_boolean_properties():
     ssh = Mock()
     ssh.tmsh.side_effect = [VOLUMES_17_5, STATUS_17_5]
@@ -185,6 +274,31 @@ def test_volumes_parse_bare_boolean_properties():
     assert volumes["HD1.1"]["active"] and volumes["HD1.1"]["active_requested"]
     assert not volumes["HD1.2"]["active"] and not volumes["HD1.2"]["active_requested"]
     assert (volumes["HD1.2"]["version"], volumes["HD1.2"]["build"]) == ("17.5.1.9", "0.0.12")
+
+
+def test_volume_being_created_has_blank_status_columns():
+    # While "install ... create-volume" builds HD1.3, its row has no product, version or build.
+    volumes = (
+        VOLUMES_17_5
+        + """sys software volume HD1.3 {
+    media none
+    status "creating volume"
+}
+"""
+    )
+    status = STATUS_17_5 + "HD1.3                                  no  creating volume              yes\n"
+    ssh = Mock()
+    ssh.tmsh.side_effect = [volumes, status]
+    result = BigIP(ssh).volumes()
+    assert result["HD1.3"]["status"] == "creating volume" and not result["HD1.3"]["active"]
+    assert (result["HD1.2"]["version"], result["HD1.2"]["build"]) == ("17.5.1.9", "0.0.12")
+
+
+def test_complete_volume_with_malformed_status_row_is_rejected():
+    ssh = Mock()
+    ssh.tmsh.side_effect = [VOLUMES_17_5, STATUS_17_5.replace("HD1.2    BIG-IP", "HD1.2    OTHER")]
+    with pytest.raises(DeviceError, match="unrecognized software status row"):
+        BigIP(ssh).volumes()
 
 
 def test_multiline_values_are_never_read_as_property_names():

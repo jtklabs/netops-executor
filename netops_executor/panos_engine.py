@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from functools import partial
 
 from .config import HTTPTarget, under
-from .device import BigIP
+from .device import BigIP, Plateau
 from .image_cache import cached_image
 from .panos import (
     FUNCTIONAL,
@@ -420,17 +420,22 @@ class PanosRunner(StepRunner):
             self.intent("f5_disable_virtual_address", address=address)
             f5.set_enabled(address, False)
         deadline = self.clock() + drain.timeout_seconds
+        plateau = Plateau(drain.plateau_percent, drain.plateau_window_seconds, self.clock(), baseline)
         while True:
             self.checkpoint()
             connections = f5.connections()
             state["final_connections"] = connections
+            reason = "threshold" if connections <= threshold else None
+            if reason is None and plateau.reached(self.clock(), connections):
+                reason = "plateau"
+            if plateau.reduction is not None:
+                state["window_reduction_percent"] = plateau.reduction
             span = baseline - threshold
-            drained = (
-                100 if connections <= threshold else 100 * (baseline - connections) / span if span > 0 else 0
-            )
+            drained = 100 if reason else 100 * (baseline - connections) / span if span > 0 else 0
             self.report("f5_drain", percent=max(0, drained), connections=connections, threshold=threshold)
             self.event("f5_drain_sample", connections=connections, threshold=threshold)
-            if connections <= threshold:
+            if reason:
+                state["reason"] = reason
                 return
             if self.clock() >= deadline:
                 state["timed_out"] = True

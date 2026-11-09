@@ -35,6 +35,9 @@ WEBHOOK_STATUSES = (
     "needs_review",
 )
 WEBHOOK_RETRY_SECONDS = 72 * 3600
+# Statuses that finish a job; entering one queues the report to the request's notify_email.
+EMAIL_STATUSES = tuple(status for status in WEBHOOK_STATUSES if status != "needs_review")
+EMAIL_RETRY_SECONDS = 72 * 3600
 # Statuses that can still run or resume, and so still need a job's encrypted secret.
 SECRET_STATUSES = "'queued','running','needs_review'"
 
@@ -130,6 +133,13 @@ class Store:
                     attempts INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, next_attempt REAL NOT NULL,
                     expires REAL NOT NULL, last_attempt REAL, last_error TEXT, delivered REAL);
                 CREATE INDEX IF NOT EXISTS webhook_due ON webhook_deliveries(state,next_attempt,seq);
+                CREATE TABLE IF NOT EXISTS email_deliveries (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
+                    subject TEXT NOT NULL, status TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, next_attempt REAL NOT NULL,
+                    expires REAL NOT NULL, last_attempt REAL, last_error TEXT, delivered REAL);
+                CREATE INDEX IF NOT EXISTS email_due ON email_deliveries(state,next_attempt,seq);
+                CREATE INDEX IF NOT EXISTS email_subject ON email_deliveries(kind,subject,state);
                 CREATE INDEX IF NOT EXISTS webhook_job ON webhook_deliveries(job,state);
                 CREATE INDEX IF NOT EXISTS resources_job ON resources(job);
                 CREATE INDEX IF NOT EXISTS gates_job ON gates(job);
@@ -193,6 +203,43 @@ class Store:
                     WHERE NOT EXISTS(SELECT 1 FROM webhook_deliveries
                         WHERE job=NEW.id AND state='pending' AND attempts=0);
                 END""")
+            self.create_email_trigger(db)
+
+    def create_email_trigger(self, db):
+        """Queue a report in the same transaction as the status change that finishes a job: one
+        for a job whose request has notify_email, and one check of its batch when the batch has.
+        The sender decides whether the batch has finished; an unattempted check covers later ones."""
+        statuses = ",".join(f"'{s}'" for s in EMAIL_STATUSES)
+        db.execute("DROP TRIGGER IF EXISTS jobs_email")
+        db.execute(f"""CREATE TRIGGER jobs_email AFTER UPDATE OF status ON jobs
+            WHEN NEW.status IS NOT OLD.status AND NEW.status IN ({statuses})
+            AND EXISTS(SELECT 1 FROM options WHERE key='email')
+            BEGIN
+                UPDATE email_deliveries SET status=NEW.status
+                WHERE kind='job' AND subject=NEW.id AND state='pending' AND attempts=0;
+                INSERT INTO email_deliveries(id,kind,subject,status,created,next_attempt,expires)
+                SELECT lower(hex(randomblob(16))),'job',NEW.id,NEW.status,NEW.updated,0,
+                NEW.updated+{EMAIL_RETRY_SECONDS}
+                WHERE json_extract(NEW.request,'$.notify_email') IS NOT NULL
+                AND NOT EXISTS(SELECT 1 FROM email_deliveries
+                    WHERE kind='job' AND subject=NEW.id AND state='pending' AND attempts=0);
+                INSERT INTO email_deliveries(id,kind,subject,status,created,next_attempt,expires)
+                SELECT lower(hex(randomblob(16))),'batch',m.batch,'',NEW.updated,0,
+                NEW.updated+{EMAIL_RETRY_SECONDS}
+                FROM batch_members m JOIN batches b ON b.id=m.batch
+                WHERE m.job=NEW.id AND json_extract(b.request,'$.notify_email') IS NOT NULL
+                AND NOT EXISTS(SELECT 1 FROM email_deliveries
+                    WHERE kind='batch' AND subject=m.batch AND state='pending' AND attempts=0);
+            END""")
+
+    def require_email(self, db, request):
+        if (
+            request.get("notify_email")
+            and not db.execute("SELECT 1 FROM options WHERE key='email'").fetchone()
+        ):
+            raise Conflict(
+                "notify_email needs the executor's SMTP settings (NETOPS_SMTP_HOST, NETOPS_SMTP_FROM)"
+            )
 
     @staticmethod
     def scheduled_request(request):
@@ -200,11 +247,14 @@ class Store:
         window = ScheduledRequest.model_validate(
             {key: request.get(key) for key in ("start_at", "latest_start_at", "queue")}
         )
-        for key, value in window.model_dump().items():
+        for key, value in window.model_dump(include={"start_at", "latest_start_at", "queue"}).items():
             if value is None:
                 request.pop(key, None)
             else:
                 request[key] = value
+        # Omitted unless set, so requests saved before the field existed keep matching resubmissions.
+        if request.get("notify_email") is None:
+            request.pop("notify_email", None)
         return (
             request,
             window.start_at.timestamp() if window.start_at is not None else None,
@@ -329,6 +379,7 @@ class Store:
         payload = json.dumps(request, sort_keys=True)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self.require_email(db, request)
             self.expire_pending(db, time.time())
             if key:
                 existing = db.execute(
@@ -721,10 +772,15 @@ class Store:
 
     def create_batch(self, batch, key, lock_key, kind="upgrade"):
         payload = batch.model_dump_json(
-            exclude={key for key in ("start_at", "latest_start_at", "queue") if getattr(batch, key) is None}
+            exclude={
+                key
+                for key in ("start_at", "latest_start_at", "queue", "notify_email")
+                if getattr(batch, key) is None
+            }
         )
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self.require_email(db, json.loads(payload))
             self.expire_pending(db, time.time())
             if key:
                 old = db.execute("SELECT * FROM batches WHERE key=?", (key,)).fetchone()
@@ -741,6 +797,7 @@ class Store:
                     request, start_at, latest_start_at = self.scheduled_request(
                         batch.request_for(member).model_dump(mode="json")
                     )
+                    self.require_email(db, request)
                     job = str(uuid.uuid4())
                     db.execute(
                         "INSERT INTO jobs(id,device,lock_key,kind,request,status,created,updated,start_at,latest_start_at,queue) VALUES (?,?,?,?,?,'queued',?,?,?,?,?)",
@@ -801,6 +858,7 @@ class Store:
             "id": batch,
             "kind": jobs[0]["kind"] if jobs else "upgrade",
             "name": json.loads(row["request"])["name"],
+            "notify_email": json.loads(row["request"]).get("notify_email"),
             "start_at": json.loads(row["request"]).get("start_at"),
             "latest_start_at": json.loads(row["request"]).get("latest_start_at"),
             "status": "completed"
@@ -1026,6 +1084,123 @@ class Store:
             "oldest_pending_seconds": round(now - oldest, 1) if oldest is not None else None,
             "recent_failures": failures,
         }
+
+    def set_email(self, enabled):
+        """Finishing jobs queue reports only while the API has SMTP settings."""
+        with self.connect() as db:
+            if enabled:
+                db.execute("INSERT OR IGNORE INTO options VALUES ('email','enabled')")
+            else:
+                db.execute("DELETE FROM options WHERE key='email'")
+                db.execute("DELETE FROM email_deliveries WHERE state='pending'")
+
+    def email_due(self, now, limit=20):
+        with self.connect() as db:
+            db.execute(
+                """DELETE FROM email_deliveries WHERE (state IN ('delivered','skipped') AND last_attempt<?)
+                OR (state='failed' AND last_attempt<?)""",
+                (now - 7 * 86400, now - 30 * 86400),
+            )
+            return [
+                dict(r)
+                for r in db.execute(
+                    "SELECT * FROM email_deliveries WHERE state='pending' AND next_attempt<=? ORDER BY seq LIMIT ?",
+                    (now, limit),
+                )
+            ]
+
+    def email_attempt(self, delivery, now):
+        """Count the attempt first, so a later status change queues a new report instead of
+        changing one that may already have been sent. Returns None when a newer report for the
+        same job or batch is queued, which then reports the newer state instead."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM email_deliveries WHERE id=?", (delivery,)).fetchone()
+            if db.execute(
+                "SELECT 1 FROM email_deliveries WHERE kind=? AND subject=? AND state='pending' AND seq>?",
+                (row["kind"], row["subject"], row["seq"]),
+            ).fetchone():
+                db.execute(
+                    "UPDATE email_deliveries SET state='skipped',last_attempt=?,last_error=? WHERE id=?",
+                    (now, "superseded by a newer report", delivery),
+                )
+                return None
+            db.execute(
+                "UPDATE email_deliveries SET attempts=attempts+1,last_attempt=? WHERE id=?", (now, delivery)
+            )
+            return dict(db.execute("SELECT * FROM email_deliveries WHERE id=?", (delivery,)).fetchone())
+
+    def email_last_sent(self, kind, subject):
+        """The status (for a batch, the member status digest) of the last report sent."""
+        with self.connect() as db:
+            row = db.execute(
+                """SELECT status FROM email_deliveries WHERE kind=? AND subject=? AND state='delivered'
+                ORDER BY seq DESC LIMIT 1""",
+                (kind, subject),
+            ).fetchone()
+            return row[0] if row else None
+
+    def email_done(self, delivery, state, now, status=None, error=None):
+        """Record a report as delivered, or skipped (with the reason in error)."""
+        with self.connect() as db:
+            db.execute(
+                """UPDATE email_deliveries SET state=?,status=coalesce(?,status),last_error=?,
+                delivered=CASE WHEN ?='delivered' THEN ? END WHERE id=?""",
+                (state, status, error, state, now, delivery),
+            )
+
+    def email_failed(self, delivery, error, retry_at, permanent=False):
+        with self.connect() as db:
+            db.execute(
+                """UPDATE email_deliveries SET last_error=?,next_attempt=?,
+                state=CASE WHEN ? OR ?>=expires THEN 'failed' ELSE 'pending' END WHERE id=?""",
+                (error, retry_at, permanent, retry_at, delivery),
+            )
+
+    def email_retry(self, now=None):
+        now = time.time() if now is None else now
+        with self.connect() as db:
+            return db.execute(
+                "UPDATE email_deliveries SET state='pending',next_attempt=?,expires=? WHERE state='failed'",
+                (now, now + EMAIL_RETRY_SECONDS),
+            ).rowcount
+
+    def email_summary(self, now=None, limit=20):
+        now = time.time() if now is None else now
+        with self.connect() as db:
+            counts = dict(db.execute("SELECT state,count(*) FROM email_deliveries GROUP BY state").fetchall())
+            oldest = db.execute("SELECT min(created) FROM email_deliveries WHERE state='pending'").fetchone()[
+                0
+            ]
+            failures = [
+                dict(r)
+                for r in db.execute(
+                    """SELECT id,kind,subject,status,state,attempts,created,last_attempt,next_attempt,last_error
+                    FROM email_deliveries WHERE state IN ('pending','failed') AND last_error IS NOT NULL
+                    ORDER BY last_attempt DESC LIMIT ?""",
+                    (limit,),
+                )
+            ]
+        return {
+            **{state: counts.get(state, 0) for state in ("pending", "delivered", "skipped", "failed")},
+            "oldest_pending_seconds": round(now - oldest, 1) if oldest is not None else None,
+            "recent_failures": failures,
+        }
+
+    def milestones(self, job, limit=80):
+        """Start, finish and decision events for a report timeline, without polling samples."""
+        with self.connect() as db:
+            return [
+                {**dict(r), "data": json.loads(r["data"])}
+                for r in db.execute(
+                    r"""SELECT time,step,data FROM events WHERE job=? AND (step LIKE '%\_started' ESCAPE '\'
+                    OR step LIKE '%\_completed' ESCAPE '\' OR step LIKE '%\_requested' ESCAPE '\'
+                    OR step IN ('completed','failed','cancel_acknowledged','manual_validation_applied',
+                    'suspending_after_failed_validation','operator_resolution','start_window_expired'))
+                    ORDER BY seq LIMIT ?""",
+                    (job, limit),
+                )
+            ]
 
     def worker_seen(self, worker, job=None, state="available", queues=None):
         # Each heartbeat carries the release of the code running in that worker process.

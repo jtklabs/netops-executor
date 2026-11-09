@@ -1,5 +1,6 @@
 import hmac
 import os
+import smtplib
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,7 +24,8 @@ from .fortigate_models import FortigateBatch, FortigateUpgradeRequest
 from .ios_models import IosBatch, IosUpgradeRequest
 from .iosxe_config import compare as compare_configs
 from .iosxe_models import ConfigComparison, IosxeBatch, IosxeUpgradeRequest
-from .models import JobRequest, Model, Name, Queue, RecoveryResolution, RollbackRequest
+from .models import Email, JobRequest, Model, Name, Queue, RecoveryResolution, RollbackRequest
+from .notify import EmailSender, Permanent
 from .opengear_models import OpengearBatch, OpengearUpgradeRequest
 from .panos_models import PanosBatch, PanosUpgradeRequest
 from .password_devices import check_password_syntax
@@ -134,6 +136,7 @@ class BatchResponse(Model):
         "opengear_upgrade",
     ] = "upgrade"
     name: str
+    notify_email: list[str] | None = None
     status: Literal["completed", "needs_attention", "in_progress"]
     device_count: int
     jobs: list[BatchItem]
@@ -141,6 +144,10 @@ class BatchResponse(Model):
     status_url: str
     start_at: AwareDatetime | None = None
     latest_start_at: AwareDatetime | None = None
+
+
+class EmailTest(Model):
+    to: list[Email] = Field(min_length=1, max_length=20)
 
 
 class CredentialMetadata(Model):
@@ -214,17 +221,24 @@ def create_app(settings=None):
     store = Store(settings.data_dir / "jobs.sqlite3")
     webhooks = WebhookSender(settings, store) if settings.webhook_url else None
     store.set_webhooks(webhooks is not None)
+    email = EmailSender(settings, store) if settings.smtp_host else None
+    store.set_email(email is not None)
 
     @asynccontextmanager
     async def lifespan(app):
-        # The API delivers webhooks for jobs that workers finish; deliveries wait while it is down.
+        # The API delivers webhooks and email reports for jobs that workers finish; deliveries
+        # wait while it is down.
         stop = threading.Event()
-        sender = threading.Thread(target=webhooks.run, args=(stop,), daemon=True) if webhooks else None
-        if sender:
+        senders = [
+            threading.Thread(target=sender.run, args=(stop,), daemon=True)
+            for sender in (webhooks, email)
+            if sender
+        ]
+        for sender in senders:
             sender.start()
         yield
         stop.set()
-        if sender:
+        for sender in senders:
             sender.join(15)
 
     # Behind a reverse proxy at a sub-path, root_path makes /docs and status URLs include the prefix.
@@ -238,6 +252,7 @@ def create_app(settings=None):
     )
     app.state.store = store
     app.state.webhooks = webhooks
+    app.state.email = email
     vault = Vault(store, settings.credential_key_file)
     bearer = HTTPBearer(auto_error=False)
 
@@ -631,6 +646,35 @@ def create_app(settings=None):
                 "delivered": False,
                 "error": str(exc) if isinstance(exc, Rejected) else type(exc).__name__,
             }
+
+    @app.get("/api/v1/email", dependencies=authenticated, tags=["Email"])
+    def email_status() -> dict:
+        return {
+            "enabled": email is not None,
+            "host": settings.smtp_host,
+            "port": settings.smtp_port if email else None,
+            "security": settings.smtp_security if email else None,
+            "from": settings.smtp_from,
+            **store.email_summary(),
+        }
+
+    @app.post("/api/v1/email/retry", dependencies=authenticated, tags=["Email"])
+    def email_retry() -> dict:
+        if not email:
+            raise Conflict("no SMTP relay is configured")
+        return {"requeued": store.email_retry()}
+
+    @app.post("/api/v1/email/test", dependencies=authenticated, tags=["Email"])
+    def email_test(request: EmailTest) -> dict:
+        if not email:
+            raise Conflict("no SMTP relay is configured")
+        try:
+            refused = email.test(request.to)
+        except (Permanent, smtplib.SMTPException, OSError) as exc:
+            code = getattr(exc, "smtp_code", None)
+            error = str(exc) if isinstance(exc, Permanent) else type(exc).__name__
+            return {"sent": False, "refused": [], "error": error + (f" {code}" if code else "")}
+        return {"sent": True, "refused": refused, "error": None}
 
     @app.get("/api/v1/queues", dependencies=authenticated, response_model=list[QueueStatus])
     def queues():

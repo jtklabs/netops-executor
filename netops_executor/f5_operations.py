@@ -1,8 +1,10 @@
 """SSH-only platform checks, configuration copy, and HA observations."""
 
 import hashlib
+import json
 import re
 import shlex
+from datetime import datetime, timezone
 from ipaddress import ip_address
 
 from .device import blocks, field, name, required
@@ -95,6 +97,39 @@ def topology(device):
             ("in sync", "changes pending", "awaiting initial sync", "disconnected", "sync failure"),
         ),
     }
+
+
+SYNC_DETAIL = re.compile(r"^\s*details\.\d+\.details\s+(\S+) \(([^)]*)\): (.*)$")
+
+
+def sync_targets(device, members):
+    """Map each pending device group that holds exactly this pair to whether it reports a change conflict.
+
+    Covers the failover group and ASM's datasync-global-dg; auto-sync groups and device trust sync themselves.
+    """
+    pair = {qualified(member) for member in members}
+    groups = {
+        key.rsplit("/", 1)[-1]: row
+        for key, row in blocks(
+            device.ssh.tmsh("list /cm device-group all-properties"), "cm device-group"
+        ).items()
+    }
+    result = {}
+    for line in device.ssh.tmsh("show /cm sync-status field-fmt").splitlines():
+        match = SYNC_DETAIL.match(line)
+        if not match or match[2].lower() == "in sync":
+            continue
+        short = match[1].rsplit("/", 1)[-1]
+        row = groups.get(short)
+        if (
+            row is None
+            or short == "device_trust_group"
+            or field(row, "auto-sync") == "enabled"
+            or {qualified(member) for member in children(row, "devices")} != pair
+        ):
+            continue
+        result[short] = "change conflict" in match[3].lower()
+    return result
 
 
 def owners(device):
@@ -236,3 +271,45 @@ def copy_status(device, directory):
     if output != "0":
         raise DeviceError("configuration copy failed; inspect its recorded device log")
     return True
+
+
+# Newest ASM request-log entry, read through the unit's local iControl REST port from bash.
+# No credentials leave the executor, and $select keeps request content out of the output.
+ASM_REQUESTS = (
+    "curl -sf -m 30 -u admin: "
+    "'http://localhost:8100/mgmt/tm/asm/events/requests"
+    "?$select=id,requestDatetime&$top=1&$orderby=requestDatetime%20desc'"
+)
+DEVICE_CLOCK = "date -u +%Y-%m-%dT%H:%M:%SZ"
+
+
+def utc(value):
+    if not isinstance(value, str):
+        raise ValueError("timestamp missing")
+    stamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        raise ValueError("timestamp has no timezone")
+    return stamp.astimezone(timezone.utc)
+
+
+def asm_requests(text):
+    """(id, UTC time) pairs from the ASM request log, or from a configured adapter's single record.
+
+    The adapter format is {"id": ..., "timestamp": ...}; the built-in query returns the REST
+    collection {"items": [{"id": ..., "requestDatetime": ...}]}.
+    """
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("request log response is not an object")
+    if "items" not in data:
+        rows = [{"id": data.get("id"), "requestDatetime": data.get("timestamp")}]
+    elif isinstance(data["items"], list):
+        rows = data["items"]
+    else:
+        raise ValueError("request log items are not a list")
+    pairs = []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("id"):
+            raise ValueError("request log entry has no id")
+        pairs.append((str(row["id"])[:128], utc(row.get("requestDatetime"))))
+    return pairs

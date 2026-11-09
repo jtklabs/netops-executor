@@ -51,6 +51,20 @@ def test_failed_command_output_redacted(settings, code, stdout, stderr):
     channel.close.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "error", [paramiko.SSHException("booting"), paramiko.ChannelException(2, "refused"), EOFError()]
+)
+def test_session_refused_after_login_is_a_device_error(settings, error):
+    # Reboot checks retry on DeviceError; a raw paramiko error here once failed a job mid-boot.
+    ssh = SSH(settings, settings.devices["lab"])
+    ssh.connect = Mock()
+    ssh.connect.return_value.get_transport.return_value.open_session.side_effect = error
+    ssh.close = Mock()
+    with pytest.raises(DeviceError):
+        ssh.shell("cat /proc/sys/kernel/random/boot_id")
+    ssh.close.assert_called_once()
+
+
 def test_backup_download_checks_digest_and_permissions(settings, tmp_path):
     ssh = SSH(settings, settings.devices["lab"])
     sftp = MagicMock()

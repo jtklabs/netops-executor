@@ -132,11 +132,13 @@ class SSH:
 
     def execute(self, command, timeout=120, stdin_text=None):
         self.guard()
-        channel = self.connect().get_transport().open_session(timeout=15)
-        channel.settimeout(15)
         output, errors = bytearray(), bytearray()
         deadline = time.monotonic() + timeout
+        channel = None
         try:
+            # A booting BIG-IP can accept the login and then refuse the session.
+            channel = self.connect().get_transport().open_session(timeout=15)
+            channel.settimeout(15)
             channel.exec_command(command)
             if stdin_text is not None:
                 channel.sendall(stdin_text.encode())
@@ -169,7 +171,8 @@ class SSH:
             self.close()
             raise DeviceError("SSH command interrupted; outcome may be unknown") from None
         finally:
-            channel.close()
+            if channel is not None:
+                channel.close()
 
     def shell(self, command, timeout=120, stdin_text=None):
         result = self.execute(command, timeout, stdin_text)
