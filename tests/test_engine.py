@@ -161,19 +161,72 @@ def test_unverified_reboot_retains_lock_and_drain_recovery(settings, store):
     assert store.claim("next") is None
 
 
+def test_lost_waf_policy_blocks_validation(settings, store):
+    fake = FakeDevice()
+    original = fake.reboot
+
+    def reboot(volume):
+        original(volume)
+        fake.snap["waf_policy_names"] = []
+
+    fake.reboot = reboot
+    options = reboot_options(validation_timeout=0, validation_policy={"on_timeout": "fail"})
+    j, _ = execute(settings, store, options, fake)
+    assert j["status"] == "recovery_required"
+    assert "WAF policy count changed: 1 before, 0 after" in j["result"]["validation_issues"]
+
+
+def test_renamed_waf_policy_is_only_reported(settings, store):
+    fake = FakeDevice()
+    original = fake.reboot
+
+    def reboot(volume):
+        original(volume)
+        fake.snap["waf_policy_names"] = ["/Tenant/renamed"]
+
+    fake.reboot = reboot
+    j, _ = execute(settings, store, reboot_options(validation_timeout=0), fake)
+    assert j["status"] == "completed_with_warnings", j["result"]
+    assert any(f["category"] == "waf_policies" for f in j["result"]["validation_differences"])
+
+
 def test_post_validation_detects_individual_regression(settings, store):
     fake = FakeDevice()
     original = fake.reboot
 
     def reboot(volume):
         original(volume)
-        fake.snap["pools"]["objects"]["/Common/up"]["up"] = False
-        fake.snap["pools"]["objects"]["/Common/disabled"]["up"] = True
+        pools = fake.snap["pools"]["objects"]
+        pools["/Common/up"].update(up=False, availability="offline")
+        pools["/Common/disabled"].update(up=True, enabled="enabled")
 
     fake.reboot = reboot
     j, _ = execute(settings, store, reboot_options(validation_timeout=0), fake)
     assert j["status"] == "completed_with_warnings"
     assert any(i["category"] == "pools" for i in j["result"]["validation_differences"])
+    # The tolerated changes are still reported by name at the end of the job.
+    report = j["result"]["ltm_report"]
+    assert report["pools"]["changes"] == [
+        {
+            "object": "/Common/disabled",
+            "change": "came up",
+            "before": "available/disabled",
+            "after": "available/enabled",
+        },
+        {
+            "object": "/Common/up",
+            "change": "went down",
+            "before": "available/enabled",
+            "after": "offline/enabled",
+        },
+    ]
+    assert report["pools"]["unchanged_percent"] == 0.0
+    assert report["virtual_servers"] == {
+        "before": {"up": 1, "total": 2},
+        "after": {"up": 1, "total": 2},
+        "unchanged_percent": 100.0,
+        "changes": [],
+    }
 
 
 def test_wrong_image_digest_prevents_install(settings, store, image):

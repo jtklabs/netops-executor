@@ -661,8 +661,14 @@ handoff, then reboot. HA jobs **do not disable shared virtual addresses**.
 Before upgrading the second member, verify that the upgraded peer has completed
 validation and can carry traffic. Mixed-version handoffs need that saved peer
 validation; a manually completed peer counts only if its post-upgrade validation passed. Sync is deferred while versions/builds differ; when equal, use the
-active member as the sync source and verify completion. Unknown topology,
-active-active groups, unhealthy peers and changing ownership stop the operation.
+active member as the sync source and verify completion. The sync covers every
+pending group that holds exactly the pair, including ASM's `datasync-global-dg`;
+auto-sync groups and device trust sync themselves. Upgrading the members one at a
+time leaves a "possible change conflict", which an incremental sync never clears,
+so a group reporting one gets `force-full-load-push` from the active member. The
+job then lists those groups in `result.config_sync_forced` and completes with
+warnings. Unknown topology, active-active groups, unhealthy peers and changing
+ownership stop the operation.
 
 Within each wave, devices are claimed in submitted order when eligible, up to
 `upgrade_at_a_time`; a reserved pair cannot overlap. A later wave starts only
@@ -678,15 +684,37 @@ pool active members; VLANs, self IPs, routes, management routes/IPs, provisionin
 interfaces, trunks, iRule names and certificate expiry fields. Collection gaps
 are explicit. Dynamic `_auto` nodes are excluded from stable inventory comparisons.
 
+WAF policies are read with tmsh and every policy type counts, including parent
+policies, which have no active state (over REST they also lack `enforcementMode`).
+Only the count blocks: a unit with fewer or more policies after the upgrade fails
+validation, and an HA peer must hold the same number. Names, `active` and
+`policy-type` are compared and reported as noncritical findings.
+
 Object deltas are reported individually. Minor monitor or inventory differences
 are **warnings by default**, so a few nodes going down cannot trap the wave.
-ASM readiness, boot identity/version and HA health are blocking checks. Validation
+ASM readiness, the WAF policy count, boot identity/version and HA health are
+blocking checks. Validation
 has bounded settling/retries. `on_timeout` chooses `needs_review` (default) or
 `fail`. Strict environments may select `noncritical_differences: require_review`
 and set `ltm_min_unchanged_percent`/`waf_min_unchanged_percent`; both default to 100.
 Other configuration changes still require review in strict mode. Two consecutive
 acceptable samples are the default; a zero-second validation window takes one.
 No-reboot jobs validate the current runtime, not the staged software.
+
+Tolerated differences are still reported. Every completed job that validated a
+unit ends with `result.ltm_report`, comparing the pre-upgrade snapshot with the
+final one taken after traffic is restored. For each of `virtual_servers`, `pools`,
+`nodes` and `virtual_ips` it gives up/total before and after, `unchanged_percent`,
+and one entry per object whose state differs:
+
+```json
+{"object": "/Common/app-pool", "change": "went down",
+ "before": "available/enabled (2 active members)", "after": "offline/enabled (0 active members)"}
+```
+
+`change` is `went down`, `came up`, `changed`, `added` or `removed`. Connection
+counts are not states and never appear. The `ltm_report` job event carries the
+number of changes per category.
 
 A waiting job exposes a gate with `id`, `revision`, `phase` and `findings`. Send:
 

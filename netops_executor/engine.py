@@ -8,7 +8,7 @@ from . import f5_operations as ops
 from .admin_password import PasswordCheckUnavailable, matches_admin_password, reset_admin_password
 from .config import under
 from .credentials import Vault
-from .device import BigIP, Plateau, differences, matches, name
+from .device import BigIP, Plateau, differences, ltm_report, matches, name
 from .image_cache import cached_image
 from .models import JobRequest
 from .ssh import SSH, DeviceError, digest
@@ -139,8 +139,9 @@ class Runner:
         # Minor monitor differences remain reportable warnings. Config inventory must be present.
         baseline = self.result.get("pre_validation")
         if baseline:
-            if baseline["waf_policy_names"] != health["waf_policy_names"]:
-                raise DeviceError("peer WAF policy inventory differs")
+            # Count only, as nornir-netops settled on: names and attributes are informational.
+            if len(baseline["waf_policy_names"]) != len(health["waf_policy_names"]):
+                raise DeviceError("peer WAF policy count differs")
             for category in ("virtual_servers", "pools", "nodes", "virtual_ips"):
                 if set(baseline[category]["objects"]) != set(health[category]["objects"]):
                     raise DeviceError("peer object inventory differs: " + category)
@@ -569,6 +570,14 @@ class Runner:
                 findings = differences(baseline, snapshot, self.changed_addresses)
                 if not snapshot.get("asm_ready", True):
                     critical.append("ASM is not ready")
+                # Every policy type counts, parents included. A lost policy blocks; renamed or
+                # re-flagged policies stay noncritical findings.
+                before_count, after_count = (
+                    len(baseline["waf_policy_names"]),
+                    len(snapshot["waf_policy_names"]),
+                )
+                if before_count != after_count:
+                    critical.append(f"WAF policy count changed: {before_count} before, {after_count} after")
                 if request.reboot:
                     active = snapshot["active"]
                     if (active["volume"], active["version"], active["build"]) != (
@@ -857,9 +866,19 @@ class Runner:
         # The active member is the authoritative configuration source after failover.
         source = self.device if topology["role"] == "active" else peer
         self.checkpoint()
-        for group in topology["groups"]:
-            self.intent("config_sync", group=group)
-            source.ssh.tmsh("run /cm config-sync to-group " + name(group), timeout=180)
+        targets = ops.sync_targets(source, [m["name"] for m in topology["members"]]) or {
+            group: False for group in topology["groups"]
+        }
+        for group, conflict in sorted(targets.items()):
+            # Each member saved and booted its own configuration while versions differed. The pair then
+            # reports a change conflict that an incremental sync never clears, so the active member's
+            # full configuration is pushed instead.
+            self.intent("config_sync", group=group, full_load=conflict)
+            push = "force-full-load-push " if conflict else ""
+            source.ssh.tmsh("run /cm config-sync " + push + "to-group " + name(group), timeout=180)
+        forced = sorted(group for group, conflict in targets.items() if conflict)
+        if forced:
+            self.result["config_sync_forced"] = forced
         deadline = self.clock() + 120
         while self.device.topology()["sync"] != "in sync" or peer.topology()["sync"] != "in sync":
             if self.clock() >= deadline:
@@ -1037,12 +1056,17 @@ class Runner:
     def run(self):
         try:
             self.rollback() if self.job["kind"] == "rollback" else self.upgrade()
+            if self.result.get("pre_validation") and self.result.get("post_validation"):
+                report = ltm_report(self.result["pre_validation"], self.result["post_validation"])
+                self.result["ltm_report"] = report
+                self.event("ltm_report", **{c: len(v["changes"]) for c, v in report.items()})
             self.result["completed"] = True
             self.event("completed")
             audit = self.store.get(self.job["id"])["credential_summary"]
             warnings = bool(
                 self.result.get("validation_differences")
                 or self.result.get("manual_validations")
+                or self.result.get("config_sync_forced")
                 or audit.get("multiple_profiles_used")
             )
             self.store.finish(

@@ -99,6 +99,39 @@ def topology(device):
     }
 
 
+SYNC_DETAIL = re.compile(r"^\s*details\.\d+\.details\s+(\S+) \(([^)]*)\): (.*)$")
+
+
+def sync_targets(device, members):
+    """Map each pending device group that holds exactly this pair to whether it reports a change conflict.
+
+    Covers the failover group and ASM's datasync-global-dg; auto-sync groups and device trust sync themselves.
+    """
+    pair = {qualified(member) for member in members}
+    groups = {
+        key.rsplit("/", 1)[-1]: row
+        for key, row in blocks(
+            device.ssh.tmsh("list /cm device-group all-properties"), "cm device-group"
+        ).items()
+    }
+    result = {}
+    for line in device.ssh.tmsh("show /cm sync-status field-fmt").splitlines():
+        match = SYNC_DETAIL.match(line)
+        if not match or match[2].lower() == "in sync":
+            continue
+        short = match[1].rsplit("/", 1)[-1]
+        row = groups.get(short)
+        if (
+            row is None
+            or short == "device_trust_group"
+            or field(row, "auto-sync") == "enabled"
+            or {qualified(member) for member in children(row, "devices")} != pair
+        ):
+            continue
+        result[short] = "change conflict" in match[3].lower()
+    return result
+
+
 def owners(device):
     text = device.ssh.tmsh("show /cm traffic-group field-fmt")
     try:

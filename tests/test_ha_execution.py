@@ -21,6 +21,7 @@ class Pair:
         self.a, self.b = factory(), factory()
         self.active = "a"
         self.sync = "in sync"
+        self.outputs = {"a": {}, "b": {}}
         self.members = [
             {"name": "/Common/a", "host": "192.0.2.10"},
             {"name": "/Common/b", "host": "192.0.2.11"},
@@ -44,8 +45,11 @@ class Pair:
                 if command.startswith("modify /auth user admin password "):
                     # Local user accounts are synchronized configuration (verified on BIG-IP 17.5).
                     self.sync = "changes pending"
-                if command.startswith("run /cm config-sync to-group "):
+                if command.startswith("run /cm config-sync "):
                     self.sync = "in sync"
+                if command in self.outputs[label]:
+                    original(command, **kwargs)
+                    return self.outputs[label][command]
                 return original(command, **kwargs)
 
             device.ssh.tmsh = tmsh
@@ -78,6 +82,69 @@ def test_healthy_active_first_then_peer(settings, store):
     assert pair.active == "a"
     assert pair.b.reboots == ["HD1.2"]
     assert second["result"]["config_sync"] == "in sync"
+
+
+# Captured from the BIG-IP VE 17.5.1.10 lab pair after upgrading both members one at a time.
+GROUPS_17_5 = """cm device-group datasync-device-a-dg { auto-sync enabled devices { a { } b { } } full-load-on-sync true }
+cm device-group datasync-global-dg { devices { a { } b { } } full-load-on-sync true network-failover disabled }
+cm device-group device_trust_group { auto-sync enabled devices { a { } b { } } network-failover disabled }
+cm device-group gtm { devices { a { } } network-failover disabled }
+cm device-group lab-ha { asm-sync enabled devices { a { } b { } } type sync-failover }
+"""
+CONFLICT_17_5 = """cm cmi-sync-status {
+    color red
+    details.0.details b: connected
+    details.1.details datasync-global-dg (Changes Pending): There is a possible change conflict between a and b.
+    details.2.details  - Recommended action: Synchronize b to group datasync-global-dg
+    details.3.details lab-ha (Changes Pending): There is a possible change conflict between a and b.
+    details.4.details  - Recommended action: Synchronize b to group lab-ha
+    mode high-availability
+    status Changes Pending
+    summary There is a possible change conflict between a and b.
+}
+"""
+
+
+def test_sync_targets_cover_failover_and_asm_groups_only():
+    outputs = {
+        "list /cm device-group all-properties": GROUPS_17_5,
+        "show /cm sync-status field-fmt": CONFLICT_17_5,
+    }
+    device = SimpleNamespace(ssh=SimpleNamespace(tmsh=lambda c: outputs[c]))
+    assert ops.sync_targets(device, ["/Common/a", "/Common/b"]) == {
+        "datasync-global-dg": True,
+        "lab-ha": True,
+    }
+    outputs["show /cm sync-status field-fmt"] = CONFLICT_17_5.replace(
+        "There is a possible change conflict", "x"
+    )
+    assert ops.sync_targets(device, ["/Common/a", "/Common/b"]) == {
+        "datasync-global-dg": False,
+        "lab-ha": False,
+    }
+
+
+def test_change_conflict_after_both_upgrades_gets_full_push_from_active(settings, store):
+    settings.devices["peer"] = Device(id="peer", host="192.0.2.11")
+    pair = Pair()
+    first = run_pair(settings, store, pair, "a")
+    assert first["status"] == "succeeded", first
+    # After b's upgrade and failback a is active again and both report a change conflict.
+    pair.sync = "changes pending"
+    pair.outputs["a"] = {
+        "list /cm device-group all-properties": GROUPS_17_5,
+        "show /cm sync-status field-fmt": CONFLICT_17_5,
+    }
+    second = run_pair(settings, store, pair, "b")
+    assert second["status"] == "completed_with_warnings", second["result"]
+    assert second["result"]["config_sync"] == "in sync"
+    assert second["result"]["config_sync_forced"] == ["datasync-global-dg", "lab-ha"]
+    syncs = [c for c, _ in pair.a.ssh.commands if c.startswith("run /cm config-sync")]
+    assert syncs == [
+        "run /cm config-sync force-full-load-push to-group datasync-global-dg",
+        "run /cm config-sync force-full-load-push to-group lab-ha",
+    ]
+    assert not any(c.startswith("run /cm config-sync") for c, _ in pair.b.ssh.commands)
 
 
 def rollback_pair(settings, store, pair, source):
@@ -158,6 +225,17 @@ def test_unhealthy_peer_blocks_before_backup(settings, store):
     first = run_pair(settings, store, pair, "a")
     assert first["status"] == "failed"
     assert not pair.a.ssh.commands and not pair.a.reboots
+
+
+@pytest.mark.parametrize("names,status", [(["/Tenant/renamed"], "succeeded"), ([], "failed")])
+def test_peer_waf_policies_compare_by_count(settings, store, names, status):
+    settings.devices["peer"] = Device(id="peer", host="192.0.2.11")
+    pair = Pair()
+    pair.b.snap["waf_policy_names"] = names
+    first = run_pair(settings, store, pair, "a")
+    assert first["status"] == status, first["result"]
+    if status == "failed":
+        assert first["result"]["error"] == "peer WAF policy count differs"
 
 
 def test_cluster_reservation_blocks_other_batch_and_generic_ssh(settings, store):
