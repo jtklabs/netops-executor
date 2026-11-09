@@ -25,6 +25,13 @@
     executor_webhook_url: ""
     executor_webhook_token: ""
     executor_webhook_secret: ""
+    # SMTP relay for job and batch reports to a request's notify_email. The password comes from
+    # Ansible Vault; set NETOPS_SMTP_PORT, NETOPS_SMTP_SECURITY or NETOPS_SMTP_CA_FILE through
+    # executor_environment when the defaults (587, starttls, system CAs) do not fit.
+    executor_smtp_host: ""
+    executor_smtp_from: ""
+    executor_smtp_username: ""
+    executor_smtp_password: ""
     # Other NETOPS_* settings for service.env, which every run rewrites, for example
     # {NETOPS_STAGING_ADDRESS: 192.0.2.5, NETOPS_SSH_HOST_KEYS: pin}.
     executor_environment: {}
@@ -39,6 +46,9 @@
           - executor_worker_instances | length > 0
           - executor_webhook_url == '' or executor_webhook_token is match('^[!-~]{16,}$')
           - executor_webhook_secret == '' or executor_webhook_secret | length >= 32
+          - executor_smtp_host == '' or executor_smtp_from != ''
+          - (executor_smtp_username == '') == (executor_smtp_password == '')
+          - (executor_smtp_host ~ executor_smtp_from ~ executor_smtp_username ~ executor_smtp_password) is not search('[\r\n]')
           - executor_environment | dict2items | rejectattr('key', 'match', '^NETOPS_[A-Z0-9_]+$') | list | length == 0
           - executor_environment.values() | map('string') | select('search', '[\r\n]') | list | length == 0
       no_log: true
@@ -177,6 +187,14 @@
           NETOPS_WEBHOOK_TOKEN={{ executor_webhook_token }}
           {% if executor_webhook_secret %}
           NETOPS_WEBHOOK_SECRET={{ executor_webhook_secret }}
+          {% endif %}
+          {% endif %}
+          {% if executor_smtp_host %}
+          NETOPS_SMTP_HOST={{ executor_smtp_host }}
+          NETOPS_SMTP_FROM={{ executor_smtp_from }}
+          {% if executor_smtp_username %}
+          NETOPS_SMTP_USERNAME={{ executor_smtp_username }}
+          NETOPS_SMTP_PASSWORD={{ executor_smtp_password }}
           {% endif %}
           {% endif %}
           {% for name, value in executor_environment.items() %}

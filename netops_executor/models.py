@@ -21,6 +21,16 @@ QUEUES = ("priority", "upgrade", "scheduled")
 # Worker pools: the queue a worker claims from first. Scheduled work has no pool of its own.
 POOLS = ("priority", "upgrade")
 Queue = Literal["priority", "upgrade", "scheduled"]
+# One address, without a display name: letters, digits and the usual local-part symbols, then a
+# dotted domain. Excludes spaces, commas, angle brackets and line breaks, so no header injection.
+Email = Annotated[
+    str,
+    Field(
+        pattern=r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@"
+        r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$",
+        max_length=254,
+    ),
+]
 
 
 class Model(BaseModel):
@@ -43,6 +53,23 @@ class ScheduledRequest(Model):
         examples=["priority"],
         description="Worker queue. priority: operator-initiated work that must not wait behind bulk jobs; scheduled: recurring bulk work; upgrade: firmware upgrades. Priority and upgrade pool workers claim from their own queue first, then the other, then scheduled. Omitted: upgrades and upgrade batches use upgrade, rollbacks and password rotations use priority, all other jobs use scheduled.",
     )
+    notify_email: list[Email] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=20,
+        examples=[["netops@example.com"]],
+        description="Addresses that receive an HTML report when the job finishes (or, on a batch, one report when the whole batch has finished or stopped). One address or a list. Requires the executor's SMTP settings.",
+    )
+
+    @field_validator("notify_email", mode="before")
+    @classmethod
+    def email_list(cls, value):
+        return [value] if isinstance(value, str) else value
+
+    @field_validator("notify_email")
+    @classmethod
+    def unique_emails(cls, value):
+        return list(dict.fromkeys(value)) if value is not None else None
 
     @field_validator("start_at", "latest_start_at", mode="before")
     @classmethod

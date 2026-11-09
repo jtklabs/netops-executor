@@ -70,6 +70,8 @@ keeps the token only in tab memory and uses the same API.
 | GET | `/api/v1/queues` | Queued, due and running jobs and workers per queue |
 | GET | `/api/v1/webhooks` | Webhook configuration and delivery backlog |
 | POST | `/api/v1/webhooks/test` or `/retry` | Send a signed `ping`, or requeue failed deliveries |
+| GET | `/api/v1/email` | SMTP relay and email report backlog |
+| POST | `/api/v1/email/test` or `/retry` | Send a test message, or requeue failed reports |
 | GET | `/api/v1/jobs/{id}/events?after=0&limit=500` | Ordered events; advance cursor to last `seq` |
 | GET | `/api/v1/jobs/{id}/backup` | Download completed UCS backup (or the first PAN-OS config backup) |
 | GET | `/api/v1/jobs/{id}/artifacts/{name}` | Download a saved PAN-OS running config or tech support file |
@@ -310,6 +312,58 @@ requeues deliveries that gave up, for another 72 hours, and `POST /api/v1/webhoo
 sends a signed `{"event": "ping"}` and returns the receiver's status. Delivered records
 are kept for 7 days and failed ones for 30. Jobs that finish while no webhook is
 configured are not sent later.
+
+## Email reports
+
+Add `notify_email` to any job or batch request, as one address or a list of up to 20, and
+the remote emails an HTML report (with a plain-text part) when the work finishes:
+
+```json
+{"name": "dc1-f5-november", "notify_email": ["netops@example.com", "change-board@example.com"], "defaults": {}, "waves": []}
+```
+
+| Request | Report |
+| --- | --- |
+| A job | One report when the job becomes `succeeded`, `completed_with_warnings`, `failed`, `cancelled`, `expired`, `recovery_required`, `resolved` or `manually_completed`. A later status, such as `resolved` after `recovery_required`, sends another. `needs_review` sends none. |
+| A batch (`notify_email` at the top level) | One report for the whole batch when every device has passed, or when nothing more can run: no device is running or waiting for review, and every device left waits behind an earlier wave that did not pass. If an operator then moves the batch on, a new report follows when it settles again. |
+| Batch `defaults` or `overrides` | Each of those devices also gets its own job report. |
+
+An F5 report shows the device and its inventory name, the software before and after (version,
+build and volume), start, finish and duration, the HA role and sync-failover group, the drain
+(connections before and after, and why it ended), the reused volume or the UCS backup, config
+sync, the ASM request log check, WAF policy counts, the traffic object table from `ltm_report`
+with every object that changed state (up to 25 per category; the job record has the rest),
+operator validation decisions and a timeline of the main steps. A "Needs attention" box at the
+top names the error, what to do for `recovery_required`, forced full-load syncs, accepted
+differences and sign-ins with more than one credential profile. Other job kinds get the same
+summary, notes and timeline. A batch report adds a wave table, a device table (status,
+software, duration, traffic object changes) and the detail of every device with notes or
+changes.
+
+Set the relay in `service.env` (Ansible: `executor_smtp_host`, `executor_smtp_from`,
+`executor_smtp_username` and `executor_smtp_password` from Vault):
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `NETOPS_SMTP_HOST` | none | Relay host; setting it turns reports on |
+| `NETOPS_SMTP_FROM` | required | Sender, `netops@example.com` or `NetOps Executor <netops@example.com>` |
+| `NETOPS_SMTP_SECURITY` | `starttls` | `starttls`, `ssl` (implicit TLS) or `none` (plain text) |
+| `NETOPS_SMTP_PORT` | 587, or 465 for `ssl` | Relay port |
+| `NETOPS_SMTP_USERNAME`, `NETOPS_SMTP_PASSWORD` | none | Both or neither; not allowed with `none` unless the relay is on this host |
+| `NETOPS_SMTP_CA_FILE` | system CAs | CA bundle for a private relay certificate |
+
+A request with `notify_email` is refused with 409 while no relay is configured. A report is
+queued in the same database transaction as the status change, and the API process sends it, as
+it does webhooks. Connection errors and temporary (4xx) refusals are retried after 30, 60, 120
+seconds and so on, up to every 10 minutes, for 72 hours, and all reports wait while the relay
+is failing. A permanent (5xx) refusal of the sender, the message or every recipient is not
+retried. Recipients refused while others were accepted are recorded on the delivery.
+
+`GET /api/v1/email` reports the relay and the `pending`, `delivered`, `skipped` and `failed`
+counts with recent errors. `POST /api/v1/email/test` with `{"to": ["netops@example.com"]}`
+sends a test message and returns `{"sent": true, "refused": [], "error": null}`.
+`POST /api/v1/email/retry` requeues reports that gave up. Records are kept for 7 days, or 30
+when failed. Jobs that finish while no relay is configured are not emailed later.
 
 ## SSH and HTTPS cipher scans
 

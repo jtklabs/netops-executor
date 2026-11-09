@@ -2,6 +2,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from email.utils import formataddr, parseaddr
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Literal
@@ -10,7 +11,7 @@ from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from pydantic import Field, TypeAdapter, model_validator
 
-from .models import Model, Name
+from .models import Email, Model, Name
 from .platforms import DeviceType
 from .snmp_models import PollerInstance, SnmpProfile
 
@@ -101,6 +102,15 @@ class Settings:
     webhook_ca_file: Path | None = None
     # SNMP rows included in a walk's webhook; the rest are read from the results endpoint.
     webhook_max_rows: int = 10000
+    # SMTP relay for job and batch reports to the request's notify_email addresses.
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    # starttls upgrades a plain connection; ssl is implicit TLS (usually port 465); none is plain text.
+    smtp_security: Literal["starttls", "ssl", "none"] = "starttls"
+    smtp_username: str | None = None
+    smtp_password: str | None = field(default=None, repr=False)
+    smtp_from: str | None = None
+    smtp_ca_file: Path | None = None
     netbox_url: str | None = None
     netbox_token: str | None = field(default=None, repr=False)
     netbox_ca_file: Path | None = None
@@ -182,6 +192,8 @@ class Settings:
             if not rows.isdigit() or int(rows) > 100000:
                 raise ValueError("NETOPS_WEBHOOK_MAX_ROWS must be a number from 0 to 100000")
             result.webhook_max_rows = int(rows)
+        if env("NETOPS_SMTP_HOST"):
+            smtp(result)
         result.ssh_host_keys = env("NETOPS_SSH_HOST_KEYS", "known_hosts")
         if result.ssh_host_keys not in ("known_hosts", "pin"):
             raise ValueError("NETOPS_SSH_HOST_KEYS must be known_hosts or pin")
@@ -213,6 +225,41 @@ class Settings:
         result.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         result.backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         return result
+
+
+def smtp(result):
+    """Read and check the SMTP relay settings."""
+    host = env("NETOPS_SMTP_HOST")
+    if not re.fullmatch(r"[A-Za-z0-9:._-]{1,253}", host):
+        raise ValueError("NETOPS_SMTP_HOST must be a host name or address")
+    security = env("NETOPS_SMTP_SECURITY", "starttls")
+    if security not in ("starttls", "ssl", "none"):
+        raise ValueError("NETOPS_SMTP_SECURITY must be starttls, ssl or none")
+    port = env("NETOPS_SMTP_PORT", "465" if security == "ssl" else "587")
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError("NETOPS_SMTP_PORT must be a port number")
+    sender = env("NETOPS_SMTP_FROM", "")
+    name, address = parseaddr(sender)
+    try:
+        if "\r" in sender or "\n" in sender:
+            raise ValueError("line break")
+        TypeAdapter(Email).validate_python(address)
+    except ValueError:
+        raise ValueError("NETOPS_SMTP_FROM must be an address such as NetOps <netops@example.com>") from None
+    username, password = env("NETOPS_SMTP_USERNAME") or None, env("NETOPS_SMTP_PASSWORD") or None
+    if (username is None) != (password is None):
+        raise ValueError("set both NETOPS_SMTP_USERNAME and NETOPS_SMTP_PASSWORD, or neither")
+    try:
+        loopback = host == "localhost" or ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if username and security == "none" and not loopback:
+        raise ValueError("NETOPS_SMTP_SECURITY=none would send the SMTP password in plain text")
+    result.smtp_host, result.smtp_port, result.smtp_security = host, int(port), security
+    result.smtp_from = formataddr((name, address)) if name else address
+    result.smtp_username, result.smtp_password = username, password
+    if env("NETOPS_SMTP_CA_FILE"):
+        result.smtp_ca_file = Path(env("NETOPS_SMTP_CA_FILE"))
 
 
 def webhook_url(url, variable="NETOPS_WEBHOOK_URL"):
