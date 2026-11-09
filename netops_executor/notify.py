@@ -13,6 +13,7 @@ import smtplib
 import ssl
 import time
 from datetime import datetime, timezone
+from email import policy
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, parseaddr
 
@@ -652,7 +653,9 @@ def batch_report(batch, jobs, state, label, generated=None):
 
 
 def message(sender, recipients, subject, text, html_body, headers=None):
-    msg = EmailMessage()
+    # Header lines up to the RFC 5322 limit: Python 3.11 folds a long subject with quotes or angle
+    # brackets onto a continuation line that some readers show with a leading space.
+    msg = EmailMessage(policy=policy.default.clone(max_line_length=998))
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
     # Device and batch names come from requests; keep the subject on one line.

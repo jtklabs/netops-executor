@@ -118,7 +118,7 @@ def test_jobs_without_notify_email_queue_nothing_and_keep_their_saved_request(st
 
 def test_notify_email_needs_smtp_settings(store):
     with pytest.raises(Conflict, match="SMTP"):
-        ssh_job(store, notify_email=TO)
+        ssh_job(store, notify_email=[TO])
     waves = [{"wave": 1, "ips": ["192.0.2.1"]}]
     with pytest.raises(Conflict, match="SMTP"):
         store.create_batch(Batch(name="b", waves=waves, notify_email=TO), None, lambda ip: ip)
@@ -129,7 +129,7 @@ def test_notify_email_needs_smtp_settings(store):
 
 
 def test_unsent_report_takes_the_newer_status_and_older_ones_are_superseded(store, sender, relay):
-    job = ssh_job(store, notify_email=TO)
+    job = ssh_job(store, notify_email=[TO])
     run_next(store, "recovery_required")
     with store.connect() as db:
         db.execute("UPDATE jobs SET status='resolved',updated=? WHERE id=?", (time.time(), job["id"]))
@@ -139,7 +139,7 @@ def test_unsent_report_takes_the_newer_status_and_older_ones_are_superseded(stor
     assert "resolved by operator" in relay.messages[0]["Subject"]
 
     # A report already attempted stays; a newer one replaces it if both are still waiting.
-    second = ssh_job(store, notify_email=TO)
+    second = ssh_job(store, notify_email=[TO])
     run_next(store, "recovery_required")
     relay.errors.append(smtplib.SMTPServerDisconnected("gone"))
     assert sender.deliver_due(time.time() + 2) == 0
@@ -152,7 +152,7 @@ def test_unsent_report_takes_the_newer_status_and_older_ones_are_superseded(stor
 
 
 def test_relay_failures_retry_with_backoff_and_refusals_stop(store, sender, relay):
-    ssh_job(store, notify_email=TO)
+    ssh_job(store, notify_email=[TO])
     run_next(store, "succeeded")
     now = time.time() + 1
     relay.errors.append(smtplib.SMTPServerDisconnected("connection lost"))
@@ -163,7 +163,7 @@ def test_relay_failures_retry_with_backoff_and_refusals_stop(store, sender, rela
     assert sender.deliver_due(now + 10) == 0  # paused while the relay is failing
     assert sender.deliver_due(now + 31) == 1
 
-    ssh_job(store, notify_email=TO)
+    ssh_job(store, notify_email=[TO])
     run_next(store, "succeeded")
     relay.errors.append(smtplib.SMTPRecipientsRefused({TO: (550, b"no such user")}))
     assert sender.deliver_due(now + 60) == 0
