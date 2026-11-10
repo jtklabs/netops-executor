@@ -2342,8 +2342,13 @@ Set `NETOPS_NETBOX_CA_FILE` if the executor needs a private CA.
 `poller_instance`. Native Ansible installs can set these in
 `executor_environment`. The URL and token are executor settings.
 
-NetBox looks up the device by its reported name and polled IP, using the
-`snmp_discovery_ip` custom field or an existing matching primary IP. The
+A polled IP is unique within one poller, but pollers in other networks can reach
+other devices at the same IP, so NetBox can hold the same address more than once.
+Discovery therefore finds the device by its poller tag and `snmp_discovery_ip`
+custom field, whatever its name, so a renamed device keeps its record. A device
+recorded outside discovery (without the `discovered` tag) is adopted when its name
+and polled IP match, using `snmp_discovery_ip` or its primary IP; a device another
+poller discovered is never taken over. The
 executor creates missing sites and poller tags, reuses a matching manufacturer
 and model or part number from the device type catalog, and creates a basic
 device type when no match exists. It tags new devices `discovered` and sets a
@@ -2380,13 +2385,18 @@ when it identifies the OS family, such as Cisco IOS, Cisco IOS-XE, or Cisco NX-O
 It preserves an existing platform assignment. When SNMP identifies the interface
 and prefix for the polled address, discovery assigns the IP to that interface
 and sets it as the device's primary IPv4 or IPv6. It reuses a matching interface
-or creates it with type Other. It uses the interface's NetBox VRF and refuses
-to move an address already assigned to a different object in that VRF.
+or creates it with type Other, in the interface's NetBox VRF. It reuses the IP
+record already assigned to this device (moving it from another of the device's
+interfaces after a rename), or claims an unassigned record that carries the poller
+tag or is the address's only record. A record assigned to another device belongs to
+that device's poller and is never moved: discovery creates this device's own record,
+tagged with the poller. If NetBox enforces unique IPs in that VRF and refuses the
+duplicate, the job reports it; give each poller's network its own VRF.
 When the interface or prefix cannot be confirmed, the job reports
 `result.discovery.management_ip` as null and keeps the address in the discovery
 custom field. NetBox requires unique
-device names within each site and tenant, so a different IP with the same
-name in that scope reports a conflict.
+device names within each site and tenant, so a device with the same name in that
+scope from another poller or address reports a conflict.
 
 Cisco StackWise discovery joins present switch rows to their ENTITY-MIB chassis
 records. A stack gets a NetBox virtual chassis and one device per switch.

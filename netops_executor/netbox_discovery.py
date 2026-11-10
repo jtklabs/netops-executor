@@ -202,10 +202,31 @@ class NetBoxDiscovery:
             {"manufacturer": manufacturer["id"], "model": model, "slug": slug},
         )
 
-    def device(self, name, address):
-        matches = []
-        for device in self.records("dcim/devices/", name__ie=name):
-            if (device["name"] or "").casefold() != name.casefold():
+    def device(self, name, address, poller_tag, discovered_tag):
+        """The device this poller discovered at this address.
+
+        A polled IP is unique per poller, but pollers in other networks can reach other
+        devices at the same IP, so NetBox can hold the address more than once. The poller
+        tag and discovery IP identify the device, whatever its name.
+        """
+        path = "dcim/devices/"
+
+        def tagged(device, tag):
+            return any(existing["id"] == tag["id"] for existing in device["tags"])
+
+        matches = [
+            device
+            for device in self.records(path, tag=poller_tag["slug"], **{f"cf_{DISCOVERY_IP}": address})
+            if device["custom_fields"].get(DISCOVERY_IP) == address and tagged(device, poller_tag)
+        ]
+        if len(matches) > 1:
+            raise SyncError("Multiple NetBox devices from this poller share the polled address")
+        if matches:
+            return matches[0]
+        # A device recorded outside discovery, by name and address. A device another
+        # poller discovered carries the discovered tag and is never taken over.
+        for device in self.records(path, name__ie=name):
+            if (device["name"] or "").casefold() != name.casefold() or tagged(device, discovered_tag):
                 continue
             fields = device["custom_fields"]
             primary = device.get("primary_ip6" if ":" in address else "primary_ip4")
@@ -221,7 +242,9 @@ class NetBoxDiscovery:
 
     def sync(self, site_name, poller, address, facts):
         action, device = self.sync_inventory(site_name, poller, address, facts)
-        if (management_ip := facts.get("management_ip")) and self.assign_primary_ip(device, management_ip):
+        if (management_ip := facts.get("management_ip")) and self.assign_primary_ip(
+            device, management_ip, self.named_object("extras/tags/", poller, poller)
+        ):
             if action == "unchanged":
                 action = "updated"
         if facts.get("stack_member_id"):
@@ -700,7 +723,7 @@ class NetBoxDiscovery:
             pass
         return {"status": "failed", "error": "NetBox did not accept the running software observation"}
 
-    def assign_primary_ip(self, device, management_ip):
+    def assign_primary_ip(self, device, management_ip, poller_tag):
         interface_path = "dcim/interfaces/"
         address_path = "ipam/ip-addresses/"
         name = management_ip["interface"]
@@ -723,33 +746,60 @@ class NetBoxDiscovery:
         vrf_id = (interface.get("vrf") or {}).get("id")
         assignment = {"assigned_object_type": "dcim.interface", "assigned_object_id": interface["id"]}
 
-        def find_address():
-            matches = [
-                row
-                for row in self.records(address_path, address=str(cidr.ip))
-                if (row.get("vrf") or {}).get("id") == vrf_id and ip_interface(row["address"]).ip == cidr.ip
-            ]
-            if len(matches) > 1:
-                raise SyncError("Multiple NetBox IP records match the polled address in the interface VRF")
-            return matches[0] if matches else None
+        rows = [
+            row
+            for row in self.records(address_path, address=str(cidr.ip))
+            if (row.get("vrf") or {}).get("id") == vrf_id and ip_interface(row["address"]).ip == cidr.ip
+        ]
 
-        address = self.ensure(
-            address_path,
-            find_address,
-            {
-                **assignment,
-                "address": str(cidr),
-                "vrf": vrf_id,
-                "status": "dhcp" if management_ip["dhcp"] else "active",
-            },
-        )
+        def assigned_device(row):
+            if row.get("assigned_object_type") != "dcim.interface" or row.get("assigned_object_id") is None:
+                return None
+            return ((row.get("assigned_object") or {}).get("device") or {}).get("id")
+
+        def tagged(row):
+            return any(tag["id"] == poller_tag["id"] for tag in row.get("tags") or [])
+
+        # The same address can be recorded for devices behind other pollers: records assigned
+        # to other devices are theirs and stay untouched. This device's own record is reused,
+        # even from another of its interfaces after a rename.
+        own = [row for row in rows if row["assigned_object_id"] == interface["id"]] or [
+            row for row in rows if assigned_device(row) == device_id
+        ]
+        # An unassigned record is claimed when it is this poller's, or the address's only record.
+        free = [row for row in rows if row["assigned_object_id"] is None and (tagged(row) or len(rows) == 1)]
+        candidates = own or free
+        if len(candidates) > 1:
+            raise SyncError("Multiple NetBox IP records for this device or poller match the polled address")
+        if candidates:
+            address = candidates[0]
+        else:
+            try:
+                address = self.request(
+                    "POST",
+                    address_path,
+                    json={
+                        **assignment,
+                        "address": str(cidr),
+                        "vrf": vrf_id,
+                        "status": "dhcp" if management_ip["dhcp"] else "active",
+                        "tags": [poller_tag["id"]],
+                    },
+                )
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code != 400:
+                    raise
+                raise SyncError(
+                    "NetBox refused another IP record for the polled address; it may enforce unique "
+                    "IPs in this VRF, so give each poller's network its own VRF"
+                ) from None
         ip_data = {}
-        if address["assigned_object_id"] is None:
+        if any(address.get(key) != value for key, value in assignment.items()):
             ip_data.update(assignment)
-        elif any(address[key] != value for key, value in assignment.items()):
-            raise SyncError("The polled IP is already assigned to another NetBox object in the interface VRF")
         if ip_interface(address["address"]) != cidr:
             ip_data["address"] = str(cidr)
+        if not tagged(address):
+            ip_data["add_tags"] = [poller_tag["id"]]
         if ip_data:
             self.request("PATCH", f"{address_path}{address['id']}/", json=ip_data)
 
@@ -766,9 +816,10 @@ class NetBoxDiscovery:
         self.custom_field(SOFTWARE_VERSION, "Software version", "Running software version reported by SNMP.")
         site = self.named_object("dcim/sites/", site_name)
         tag = self.named_object("extras/tags/", poller, poller)
+        discovered = self.named_object("extras/tags/", DISCOVERED_TAG)
         path = "dcim/devices/"
         name = facts["name"]
-        current = self.device(name, address)
+        current = self.device(name, address, tag, discovered)
         members = facts.get("stack_members")
         existing_stack = current and current.get("virtual_chassis") and facts["manufacturer"] == "Cisco"
         if members:
@@ -801,7 +852,6 @@ class NetBoxDiscovery:
             data["platform"] = self.named_object("dcim/platforms/", platform)["id"]
         if current is None:
             role = self.named_object("dcim/device-roles/", discovery_role(facts))
-            discovered = self.named_object("extras/tags/", DISCOVERED_TAG)
             try:
                 created = self.request(
                     "POST",
@@ -819,14 +869,14 @@ class NetBoxDiscovery:
             except httpx.HTTPStatusError as error:
                 if error.response.status_code not in (400, 409):
                     raise
-                current = self.device(name, address)
+                current = self.device(name, address, tag, discovered)
                 if current is None:
                     if any(
                         (row["name"] or "").casefold() == name.casefold() and row["tenant"] is None
                         for row in self.records(path, site_id=site["id"], name__ie=name)
                     ):
                         raise SyncError(
-                            "NetBox already has this name at the site with a different address"
+                            "NetBox already has this name at the site for another poller or address"
                         ) from None
                     raise
         if current.get("platform"):

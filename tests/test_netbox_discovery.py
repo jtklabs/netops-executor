@@ -102,8 +102,78 @@ def test_device_type_lookup_uses_exact_normalized_model_after_punctuation_search
     assert match["id"] == 1
 
 
-@pytest.mark.parametrize("foreign", [False, True])
-def test_primary_ip_uses_the_interface_vrf_and_preserves_other_assignments(foreign):
+POLLER = {"id": 7, "slug": "checkmk-au"}
+ASSIGN = {"assigned_object_type": "dcim.interface", "assigned_object_id": 147}
+
+
+def ip_row(id_, interface=None, device=None, tags=()):
+    return {
+        "id": id_,
+        "vrf": {"id": 10},
+        "address": "192.0.2.15/24",
+        "assigned_object_type": "dcim.interface" if interface else None,
+        "assigned_object_id": interface,
+        "assigned_object": {"id": interface, "device": {"id": device}} if interface else None,
+        "tags": [{"id": tag} for tag in tags],
+    }
+
+
+@pytest.mark.parametrize(
+    ("records", "primary", "post_status", "expected"),
+    [
+        # The address's only record, unassigned: claimed and tagged for this poller.
+        (
+            [ip_row(2)],
+            None,
+            None,
+            [
+                ("PATCH", "ipam/ip-addresses/2", {**ASSIGN, "add_tags": [7]}),
+                ("PATCH", "dcim/devices/6", {"primary_ip4": 2}),
+            ],
+        ),
+        # Another poller's device has the same IP: its record is left alone and this device
+        # gets its own record.
+        (
+            [ip_row(2, interface=207, device=99, tags=[9])],
+            None,
+            201,
+            [
+                (
+                    "POST",
+                    "ipam/ip-addresses",
+                    {**ASSIGN, "address": "192.0.2.15/24", "vrf": 10, "status": "active", "tags": [7]},
+                ),
+                ("PATCH", "dcim/devices/6", {"primary_ip4": 50}),
+            ],
+        ),
+        # This device's record on a renamed interface moves instead of being duplicated.
+        (
+            [ip_row(2, interface=140, device=6, tags=[7]), ip_row(3, interface=207, device=99)],
+            {"id": 2},
+            None,
+            [("PATCH", "ipam/ip-addresses/2", ASSIGN)],
+        ),
+        # Already assigned, tagged and primary: nothing to do.
+        ([ip_row(2, interface=147, device=6, tags=[7])], {"id": 2}, None, []),
+        # Unassigned duplicates that are not this poller's are not guessed at.
+        (
+            [ip_row(2, tags=[9]), ip_row(3)],
+            None,
+            201,
+            [
+                (
+                    "POST",
+                    "ipam/ip-addresses",
+                    {**ASSIGN, "address": "192.0.2.15/24", "vrf": 10, "status": "active", "tags": [7]},
+                ),
+                ("PATCH", "dcim/devices/6", {"primary_ip4": 50}),
+            ],
+        ),
+        # NetBox enforcing unique IPs refuses the duplicate: a clear error, no primary change.
+        ([ip_row(2, interface=207, device=99)], None, 400, None),
+    ],
+)
+def test_primary_ip_is_scoped_to_this_device_and_poller(records, primary, post_status, expected):
     from netops_executor.netbox_discovery import SyncError
 
     calls = []
@@ -117,18 +187,15 @@ def test_primary_ip_uses_the_interface_vrf_and_preserves_other_assignments(forei
             else:
                 assert path == "ipam/ip-addresses"
                 assert request.url.params["address"] == "192.0.2.15"
-                rows = [
-                    {"id": 1, "vrf": None, "address": "192.0.2.15/24", "assigned_object_id": 208},
-                    {
-                        "id": 2,
-                        "vrf": {"id": 10},
-                        "address": "192.0.2.15/24",
-                        "assigned_object_id": 207 if foreign else None,
-                        "assigned_object_type": "dcim.interface" if foreign else None,
-                    },
-                ]
+                # A record in another VRF is never considered.
+                rows = [{**ip_row(1, interface=208, device=98), "vrf": None}, *records]
             return httpx.Response(200, json={"results": rows, "next": None})
         calls.append((request.method, path, json.loads(request.content)))
+        if request.method == "POST":
+            body = {**ip_row(50, interface=147, device=6, tags=[7])}
+            return httpx.Response(
+                post_status, json=body if post_status == 201 else {"address": ["duplicate"]}
+            )
         return httpx.Response(200, json={})
 
     with httpx.Client(
@@ -136,20 +203,14 @@ def test_primary_ip_uses_the_interface_vrf_and_preserves_other_assignments(forei
     ) as client:
         discovery = NetBoxDiscovery(client, lambda: None)
         management_ip = {"interface": "eth0", "address": "192.0.2.15/24", "dhcp": False}
-        if foreign:
-            with pytest.raises(SyncError, match="already assigned"):
-                discovery.assign_primary_ip({"id": 6}, management_ip)
-            assert calls == []
+        device = {"id": 6, "primary_ip4": primary}
+        if expected is None:
+            with pytest.raises(SyncError, match="unique"):
+                discovery.assign_primary_ip(device, management_ip, POLLER)
+            assert [call[0] for call in calls] == ["POST"]
         else:
-            assert discovery.assign_primary_ip({"id": 6}, management_ip)
-            assert calls == [
-                (
-                    "PATCH",
-                    "ipam/ip-addresses/2",
-                    {"assigned_object_type": "dcim.interface", "assigned_object_id": 147},
-                ),
-                ("PATCH", "dcim/devices/6", {"primary_ip4": 2}),
-            ]
+            assert discovery.assign_primary_ip(device, management_ip, POLLER) is bool(expected)
+            assert calls == expected
 
 
 @pytest.mark.parametrize(
@@ -608,3 +669,70 @@ def test_f5_ve_snmp_serial_fallback_never_replaces_a_recorded_serial(existing, s
         NetBoxDiscovery(client, lambda: None).sync_inventory("Lab", "checkmk-au", "192.0.2.15", facts)
     serials = [data.get("serial") for _, _, data in calls if "serial" in data]
     assert serials == ([patched] if patched else [])
+
+
+@pytest.mark.parametrize("ours", [True, False])
+def test_device_is_found_by_poller_and_address_not_by_name(ours):
+    calls = []
+
+    def record(id_, name, tags):
+        return {
+            "id": id_,
+            "name": name,
+            "serial": "",
+            "tenant": None,
+            "site": {"id": 1},
+            "device_type": {"id": 4},
+            "role": {"slug": "switch"},
+            "platform": {"id": 9},
+            "custom_fields": {"snmp_discovery_ip": "192.0.2.1", "software_version": ""},
+            "tags": [{"id": tag} for tag in tags],
+        }
+
+    devices = [record(21, "Switch", [30, 8])]  # another poller's switch at the same IP
+    if ours:
+        devices.append(record(20, "old-name", [7, 8]))  # this poller's, since renamed
+    rows = {
+        "extras/custom-fields": [
+            {"name": field, "object_types": ["dcim.device"], "type": {"value": "text"}}
+            for field in ("software_version", "snmp_discovery_ip")
+        ],
+        "dcim/sites": [{"id": 1, "name": "Lab", "slug": "lab"}],
+        "extras/tags": [
+            {"id": 7, "name": "checkmk-au", "slug": "checkmk-au"},
+            {"id": 8, "name": "discovered", "slug": "discovered"},
+        ],
+        "dcim/manufacturers": [{"id": 3, "name": "Cisco", "slug": "cisco"}],
+        "dcim/device-types": [{"id": 4, "model": "Catalyst 9300-48P", "part_number": "C9300-48P"}],
+        "dcim/device-roles": [{"id": 5, "name": "Switch", "slug": "switch"}],
+        "dcim/platforms": [{"id": 9, "name": "Cisco IOS-XE", "slug": "cisco-ios-xe"}],
+        "dcim/devices": devices,
+    }
+
+    def handle(request):
+        path = request.url.path.removeprefix("/api/").strip("/")
+        if request.method == "GET":
+            # The mock ignores filters: the lookup must check poller and address itself.
+            return httpx.Response(200, json={"results": rows[path], "next": None})
+        calls.append((request.method, path, json.loads(request.content)))
+        return httpx.Response(200, json={"id": 11})
+
+    facts = {
+        "name": "Switch",
+        "manufacturer": "Cisco",
+        "model": "C9300-48P",
+        "platform": "Cisco IOS-XE",
+        "serial": "FOC1",
+        "software_version": "",
+    }
+    with httpx.Client(
+        base_url="https://netbox.example/api/", transport=httpx.MockTransport(handle)
+    ) as client:
+        action, device = NetBoxDiscovery(client, lambda: None).sync_inventory(
+            "Lab", "checkmk-au", "192.0.2.1", facts
+        )
+    assert all(path != "dcim/devices/21" for _, path, _ in calls)
+    if ours:
+        assert action == "updated" and calls == [("PATCH", "dcim/devices/20", {"serial": "FOC1"})]
+    else:
+        assert action == "created" and [(m, p) for m, p, _ in calls] == [("POST", "dcim/devices")]
