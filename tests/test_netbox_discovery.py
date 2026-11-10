@@ -551,3 +551,60 @@ def test_management_slot_reused_by_a_known_switch_is_left_for_review():
     records = [stack_record(1, "sw", 1, "S1"), stack_record(2, "sw-2", 2, "S2")]
     with pytest.raises(SyncError, match="management switch left the stack"):
         reconcile(records, [member(1, "S2", "active"), member(3, "S3")])
+
+
+@pytest.mark.parametrize(
+    ("existing", "source", "patched"),
+    [
+        ("UVW1234", "snmp", None),  # a license serial is kept when SSH is unavailable this time
+        ("", "snmp", "chassis-uuid"),  # an empty serial is filled from SNMP
+        ("chassis-uuid", "license", "UVW1234"),  # a license serial replaces the SNMP fallback
+    ],
+)
+def test_f5_ve_snmp_serial_fallback_never_replaces_a_recorded_serial(existing, source, patched):
+    calls = []
+    rows = {
+        "extras/custom-fields": [
+            {"name": field, "object_types": ["dcim.device"], "type": {"value": "text"}}
+            for field in ("software_version", "snmp_discovery_ip")
+        ],
+        "dcim/sites": [{"id": 1, "name": "Lab", "slug": "lab"}],
+        "extras/tags": [{"id": 7, "name": "checkmk-au", "slug": "checkmk-au"}],
+        "dcim/manufacturers": [{"id": 3, "name": "F5", "slug": "f5"}],
+        "dcim/device-types": [{"id": 4, "model": "BIG-IP Virtual Edition", "part_number": ""}],
+        "dcim/devices": [
+            {
+                "id": 11,
+                "name": "bigip",
+                "serial": existing,
+                "site": {"id": 1},
+                "device_type": {"id": 4},
+                "role": {"slug": "load-balancer"},
+                "platform": {"id": 2},
+                "custom_fields": {"snmp_discovery_ip": "192.0.2.15", "software_version": "17.5.1"},
+                "tags": [{"id": 7}],
+            }
+        ],
+    }
+
+    def handle(request):
+        path = request.url.path.removeprefix("/api/").strip("/")
+        if request.method == "GET":
+            return httpx.Response(200, json={"results": rows[path], "next": None})
+        calls.append((request.method, path, json.loads(request.content)))
+        return httpx.Response(200, json={"id": 11})
+
+    facts = {
+        "name": "bigip",
+        "manufacturer": "F5",
+        "model": "BIG-IP Virtual Edition",
+        "serial": "chassis-uuid" if source == "snmp" else "UVW1234",
+        "serial_source": source,
+        "software_version": "17.5.1",
+    }
+    with httpx.Client(
+        base_url="https://netbox.example/api/", transport=httpx.MockTransport(handle)
+    ) as client:
+        NetBoxDiscovery(client, lambda: None).sync_inventory("Lab", "checkmk-au", "192.0.2.15", facts)
+    serials = [data.get("serial") for _, _, data in calls if "serial" in data]
+    assert serials == ([patched] if patched else [])

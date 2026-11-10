@@ -836,6 +836,10 @@ class NetBoxDiscovery:
                 del data[field]
         if data.get("serial") == current["serial"]:
             data.pop("serial", None)
+        if facts.get("serial_source") == "snmp" and current["serial"]:
+            # A VE whose license could not be read this time keeps the serial NetBox
+            # already has, so a license serial is not swapped for the SNMP chassis serial.
+            data.pop("serial", None)
         if any(current["custom_fields"].get(key) != value for key, value in fields.items()):
             data["custom_fields"] = fields
         tag_ids = [tag["id"]]

@@ -534,16 +534,48 @@ def test_discovery_configuration_and_required_identity(client, settings, store, 
 
 
 @pytest.mark.parametrize(
-    ("model", "configured", "output", "serial"),
+    ("model", "configured", "output", "snmp_serial", "serial", "source", "lookup", "status"),
     [
-        ("BIG-IP Virtual Edition", True, "Registration key    ABCDE-FGHIJ-KLMNO-PQRST-UVW1234", "UVW1234"),
-        ("BIG-IP Virtual Edition", True, "Registration key    none", ""),
-        ("BIG-IP Virtual Edition", False, None, ""),
-        ("BIG-IP i4600", True, None, "SNMP-SERIAL"),
+        (
+            "BIG-IP Virtual Edition",
+            True,
+            "Registration key    ABCDE-FGHIJ-KLMNO-PQRST-UVW1234",
+            "SNMP-SERIAL",
+            "UVW1234",
+            "license",
+            "succeeded",
+            "succeeded",
+        ),
+        # An inventory VE whose license cannot be read falls back to SNMP, with a warning.
+        (
+            "BIG-IP Virtual Edition",
+            True,
+            "Registration key    none",
+            "SNMP-SERIAL",
+            "SNMP-SERIAL",
+            "snmp",
+            "failed",
+            "completed_with_warnings",
+        ),
+        # Without an inventory entry no SSH is attempted; the SNMP serial is used as is.
+        ("BIG-IP Virtual Edition", False, None, "SNMP-SERIAL", "SNMP-SERIAL", "snmp", "skipped", "succeeded"),
+        ("BIG-IP Virtual Edition", False, None, "", "", None, "skipped", "completed_with_warnings"),
+        ("BIG-IP i4600", True, None, "SNMP-SERIAL", "SNMP-SERIAL", None, None, "succeeded"),
     ],
 )
-def test_f5_discovery_uses_license_suffix_for_ve(
-    client, settings, store, monkeypatch, model, configured, output, serial
+def test_f5_discovery_uses_license_suffix_for_ve_and_falls_back_to_snmp(
+    client,
+    settings,
+    store,
+    monkeypatch,
+    model,
+    configured,
+    output,
+    snmp_serial,
+    serial,
+    source,
+    lookup,
+    status,
 ):
     from netops_executor.config import Device
     from netops_executor.snmp_identity import SYS_NAME, SYS_OBJECT_ID
@@ -559,7 +591,7 @@ def test_f5_discovery_uses_license_suffix_for_ve(
             SYS_NAME: rfc1902.OctetString("bigip"),
             SYS_OBJECT_ID: rfc1902.ObjectName("1.3.6.1.4.1.3375.2.1.3.2"),
             "1.3.6.1.4.1.3375.2.1.3.5.2.0": rfc1902.OctetString(model),
-            "1.3.6.1.4.1.3375.2.1.3.3.3.0": rfc1902.OctetString("SNMP-SERIAL"),
+            "1.3.6.1.4.1.3375.2.1.3.3.3.0": rfc1902.OctetString(snmp_serial),
             "1.3.6.1.4.1.3375.2.1.4.2.0": rfc1902.OctetString("17.5.1"),
         },
     )
@@ -588,8 +620,13 @@ def test_f5_discovery_uses_license_suffix_for_ve(
     assert response.status_code == 202
     process(settings, store, store.claim("worker"), "worker")
     job = store.get(response.json()["id"])
-    assert job["status"] == ("succeeded" if serial else "completed_with_warnings")
-    assert job["result"]["discovery"]["missing"] == ([] if serial else ["serial"])
+    discovery = job["result"]["discovery"]
+    assert job["status"] == status
+    assert discovery["missing"] == ([] if serial else ["serial"])
+    assert discovery.get("serial_source") == source
+    assert (discovery.get("license_lookup") or {}).get("status") == lookup
+    if lookup in ("skipped", "failed"):
+        assert discovery["license_lookup"]["reason"]
     assert "ABCDE-FGHIJ" not in json.dumps(job["result"])
     assert seen == (["read", "close"] if output is not None else [])
 

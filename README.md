@@ -2364,11 +2364,18 @@ device or in **Lifecycle → Compliance Report**. The executor token needs add
 and change permissions on Lifecycle's Device Software model for this step.
 For F5 BIG-IP Virtual Edition, discovery
 uses the last seven characters of the base registration key as the serial.
-Configure one `f5` device with the polled IP as its `host`, working SSH
-credentials, and a trusted host key. The executor runs the read-only
-`show /sys license` command over SSH and retains only the serial suffix.
-If the lookup is unavailable, discovery reports a missing serial and preserves
-the existing NetBox serial. Discovery fills an unset NetBox platform
+This happens in the same discovery job, not a separate one: configure one `f5`
+device with the polled IP as its `host`, working SSH credentials, and a trusted
+host key, and the executor runs the read-only `show /sys license` command over
+SSH and retains only the serial suffix. When SSH is not available, discovery
+falls back to the chassis serial SNMP reports. `result.discovery.serial_source`
+is `license` or `snmp`, and `result.discovery.license_lookup` gives the lookup's
+`status` and, unless it succeeded, the `reason`: `skipped` when no single `f5`
+inventory device has the polled IP (no SSH is attempted), or `failed` when SSH or
+the license read failed, which also completes the job with warnings. The SNMP
+serial fills an empty NetBox serial but never replaces one NetBox already has, so
+a recorded license serial is not swapped for the chassis serial when SSH is
+unavailable; a license serial does replace an earlier SNMP serial. Discovery fills an unset NetBox platform
 when it identifies the OS family, such as Cisco IOS, Cisco IOS-XE, or Cisco NX-OS.
 It preserves an existing platform assignment. When SNMP identifies the interface
 and prefix for the polled address, discovery assigns the IP to that interface

@@ -360,7 +360,13 @@ class SnmpRunner:
         if discovery["manufacturer"] == "F5" and re.search(
             r"\bBIG-IP\s+(?:Virtual Edition|VE)\b", discovery["model"], re.I
         ):
-            discovery["serial"] = self.read_f5_license_serial(checkpoint)
+            serial, discovery["license_lookup"] = self.read_f5_license_serial(checkpoint)
+            if serial:
+                discovery.update(serial=serial, serial_source="license")
+            elif discovery["serial"]:
+                # Without SSH, keep the chassis serial SNMP reported. It never replaces a
+                # serial NetBox already holds (see netbox_discovery.sync_inventory).
+                discovery["serial_source"] = "snmp"
 
         missing = [
             field
@@ -396,12 +402,18 @@ class SnmpRunner:
             discovery["netbox"] = {"status": action, "device_id": device_id}
             optional_failure = any(
                 discovery.get(field, {}).get("status") in {"failed", "warning"}
-                for field in ("software_inventory", "stack_inventory", "access_point_inventory")
+                for field in (
+                    "software_inventory",
+                    "stack_inventory",
+                    "access_point_inventory",
+                    "license_lookup",
+                )
             )
             return "completed_with_warnings" if missing or optional_failure else "succeeded"
         return "failed"
 
     def read_f5_license_serial(self, checkpoint):
+        """Return the VE license serial (or "") and why, without device output."""
         # SNMP jobs may target arbitrary IPs. Only send SSH credentials to an
         # unambiguous F5 endpoint configured by the executor administrator.
         targets = [
@@ -410,17 +422,22 @@ class SnmpRunner:
             if d.host == str(self.request.device_ip) and d.device_type == "f5"
         ]
         if len(targets) != 1:
-            return ""
+            reason = "no f5 inventory device has" if not targets else "several f5 inventory devices have"
+            return "", {"status": "skipped", "reason": reason + " this IP as their host"}
         ssh = SSH(
             self.settings,
             targets[0],
             guard=checkpoint,
             audit=lambda data: self.store.credential_event(self.job["id"], self.worker, data),
         )
+        lookup = {"device": targets[0].id}
         try:
-            return license_serial(ssh)
-        except (DeviceError, OSError, EOFError, SSHException):
-            return ""
+            return license_serial(ssh), {**lookup, "status": "succeeded"}
+        except DeviceError as error:
+            # Messages from SSH and the license parser carry no device output.
+            return "", {**lookup, "status": "failed", "reason": str(error)}
+        except (OSError, EOFError, SSHException):
+            return "", {**lookup, "status": "failed", "reason": "SSH connection failed"}
         finally:
             ssh.close()
 
