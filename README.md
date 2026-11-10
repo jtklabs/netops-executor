@@ -1783,10 +1783,23 @@ operation has completed. Credentials are selected automatically when
 ### Upgrade behavior and prerequisites
 
 Inventory may use `device_type: opengear`; raw management IPs also work. A root
-shell (UID 0), or an administrator account authorized to use `sudo`, is required.
-The executor uses the password of the selected SSH credential for sudo, through
-standard input only. Passwordless sudo also works. SCP elevation waits for sudo's
-password prompt and a verified root-session marker before starting the file protocol.
+shell (UID 0), or an account authorized to use `sudo` such as a TACACS login, is
+required. For a login without UID 0, each command runs through `sudo` on its own SSH
+terminal, as an operator's `sudo -i` does, so `requiretty` policies, sudo's lecture
+(shown again after every reboot because `/var` is a tmpfs), TACACS/PAM prompt wording
+and a PAM stack that asks twice all work. The executor answers password prompts with
+the password of the selected SSH credential, at most twice per command and never on a
+command line; `Sorry, try again` or a third prompt stops the job at once so a wrong
+password cannot lock the TACACS account. Passwordless sudo also works. Output is used
+only after the root shell confirms UID 0.
+
+SCP cannot run through sudo's terminal. With sudo, the login account copies files
+through its own private `/tmp/netops-transfer.*` directory (mode 0700), and root moves
+the image into, or copies the configuration export out of, the root-only staging
+directory, so the SHA-256 checks still run as root. Uploading through sudo needs free
+`/tmp` space for the image, in addition to the staging directory's own check when it is
+on another filesystem. The unencrypted configuration export is readable only by the login
+account while it is copied, and the directory is removed afterwards.
 SCP, `config`, `netflash`, and either `sha256sum` or OpenSSL with SHA-256 are required.
 The worker identifies the IM7200 model/version from `/etc/version` (and
 `config -g config.system.model` when the version identifies only IM72xx),
@@ -1864,7 +1877,10 @@ Physical lab verification on an IM7248-2-DAC covered 4.13.6 → 5.5.2 through th
 executor API and worker using an administrator SSH account with password-authenticated
 sudo: configuration export/download, SCP staging and SHA-256 verification, native
 netflash, a new boot on 5.5.2, retained device identity and Ethernet state, and restored
-SSH/HTTPS access. The device returned after about ten minutes. Configuration checksum
+SSH/HTTPS access. That test used `sudo -S` without a terminal and SCP through sudo; the
+terminal-based sudo and `/tmp` transfer path for TACACS logins (0.24.1) is covered by
+tests, including a loopback SSH server that enforces `requiretty`, and still needs
+validation on a physical unit. The device returned after about ten minutes. Configuration checksum
 validation detected added storage-format/system-name fields and changed SD device/mount
 settings; XML comparison found no removed fields or changes to user/network settings.
 Review configuration differences before accepting the validation gate. Other hardware

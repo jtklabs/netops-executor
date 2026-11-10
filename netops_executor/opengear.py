@@ -1,7 +1,8 @@
 """IM7200 Linux shell, config export and netflash over the audited SSH transport.
 
 No version/product/signature bypass flags are passed to netflash. SCP is used because
-legacy console-server releases need not provide an SFTP subsystem.
+legacy console-server releases need not provide an SFTP subsystem. An account without
+UID 0 (a TACACS login) runs each command through sudo on a terminal; see opengear_sudo.
 """
 
 import os
@@ -13,11 +14,12 @@ from pathlib import Path
 import paramiko
 from scp import SCPClient, SCPException
 
-from .opengear_sudo import PROMPT, READY, SudoSCPClient, root_command
+from .opengear_sudo import run_as_root
 from .ssh import SSH, DeviceError, digest
 
 MODEL = re.compile(r"\b(IM72(?:08|16|32|48)(?:-[A-Za-z0-9]+)*)(?=\s|$)", re.I)
 VERSION = re.compile(r"\bversion\s+(\S+)", re.I)
+SCRATCH = re.compile(r"/tmp/netops-transfer\.[A-Za-z0-9]{6,}")
 
 
 def parse_version(version, issue=""):
@@ -39,7 +41,7 @@ def version_key(version):
 class Opengear:
     def __init__(self, settings, device, guard, profiles, audit, ssh=None):
         self.ssh = ssh or SSH(settings, device, guard, profiles, audit)
-        self._sudo = None
+        self._uid = None
 
     def sudo_password(self):
         """Use only the credential that authenticated this connection."""
@@ -52,29 +54,33 @@ class Opengear:
             return candidates[0].get("password") if candidates else None
         return os.environ.get(self.ssh.device.password_env or "")
 
-    def execute(self, command, timeout=120):
-        if self._sudo is None:
+    def uid(self):
+        """The login account's UID: the connection's own identity, before any sudo."""
+        if self._uid is None:
             identity = self.ssh.execute("id -u")
             if identity["exit_code"] != 0 or not re.fullmatch(r"\d+", identity["stdout"].strip()):
                 raise DeviceError("Opengear shell identity is unavailable")
-            self._sudo = identity["stdout"].strip() != "0"
-        if not self._sudo:
+            self._uid = identity["stdout"].strip()
+        return self._uid
+
+    def elevated(self):
+        return self.uid() != "0"
+
+    def execute(self, command, timeout=120):
+        if not self.elevated():
             return self.ssh.execute(command, timeout=timeout)
-        password = self.sudo_password()
-        # The elevated command cannot read leftover password input if sudo uses a cached ticket.
-        response = self.ssh.execute(
-            root_command("exec sh -c " + shlex.quote(command) + " < /dev/null"),
-            timeout=timeout,
-            stdin_text=password + "\n" if password else None,
+        # The terminal belongs to sudo's prompt; the root command never reads from it.
+        response = run_as_root(
+            self.ssh.connect().get_transport(),
+            "exec sh -c " + shlex.quote(command) + " < /dev/null",
+            self.sudo_password(),
+            self.ssh.guard,
+            timeout,
         )
-        prefix = READY + "\n"
-        if not response["stdout"].startswith(prefix):
-            raise DeviceError("Opengear upgrades require a root shell or working sudo authentication")
-        return {
-            **response,
-            "stdout": response["stdout"][len(prefix) :],
-            "stderr": response.get("stderr", "").replace(PROMPT, ""),
-        }
+        selector = getattr(self.ssh, "selector", None)
+        if selector is not None:
+            response["stdout"] = selector.redact(response["stdout"])
+        return response
 
     def text(self, command, timeout=120):
         try:
@@ -177,7 +183,8 @@ class Opengear:
             self.text("if [ -f " + q + " ] && [ ! -L " + q + " ]; then echo yes; else echo no; fi") == "yes"
         )
 
-    def transfer(self, local, remote, timeout, progress, download=False):
+    def scp(self, local, remote, timeout, progress, download=False):
+        """Copy one file as the login account."""
         deadline = time.monotonic() + timeout
 
         def updated(filename, size, done):
@@ -187,19 +194,57 @@ class Opengear:
             progress(done, size)
 
         try:
-            self.text("id -u")
-            password = self.sudo_password() if self._sudo else None
-            client = SudoSCPClient if self._sudo else SCPClient
-            options = {"password": password, "guard": self.ssh.guard} if self._sudo else {}
-            with client(
-                self.ssh.connect().get_transport(), socket_timeout=30, progress=updated, **options
-            ) as scp:
+            with SCPClient(self.ssh.connect().get_transport(), socket_timeout=30, progress=updated) as scp:
                 if download:
                     scp.get(remote, str(local))
                 else:
                     scp.put(str(local), remote_path=remote)
         except (SCPException, OSError, paramiko.SSHException):
             raise DeviceError("Opengear SCP transfer failed; device output omitted") from None
+
+    def scratch(self):
+        """A private directory the login account owns, for files root moves in or out."""
+        response = self.ssh.execute("umask 077; mktemp -d /tmp/netops-transfer.XXXXXX")
+        path = response["stdout"].strip()
+        if response["exit_code"] != 0 or not SCRATCH.fullmatch(path):
+            raise DeviceError("cannot create a private /tmp transfer directory for the login account")
+        return path
+
+    def discard(self, scratch):
+        if SCRATCH.fullmatch(scratch):
+            try:
+                self.ssh.execute("rm -rf " + shlex.quote(scratch))
+            except DeviceError:
+                pass
+
+    def transfer(self, local, remote, timeout, progress, download=False):
+        if not self.elevated():
+            self.scp(local, remote, timeout, progress, download)
+            return
+        # SCP cannot pass through sudo's terminal. The login account copies files through its own
+        # private /tmp directory, and root moves them to and from the root-only staging directory.
+        scratch = self.scratch()
+        staged = scratch + ("/download" if download else "/upload")
+        q, s = shlex.quote(remote), shlex.quote(staged)
+        try:
+            if download:
+                self.text(
+                    f"test -f {q} && test ! -L {q} && test ! -e {s} && test ! -L {s}"
+                    f" && cp {q} {s} && chown {self.uid()} {s} && chmod 600 {s}",
+                    timeout=300,
+                )
+                self.scp(local, staged, timeout, progress, download=True)
+            else:
+                if self.free_bytes("/tmp") < Path(local).stat().st_size:
+                    raise DeviceError("insufficient /tmp space to transfer the image through sudo")
+                self.scp(local, staged, timeout, progress)
+                self.text(
+                    f"test -f {s} && test ! -L {s} && test ! -e {q} && mv -f {s} {q}"
+                    f" && test -f {q} && test ! -L {q} && chown 0:0 {q} && chmod 600 {q}",
+                    timeout=300,
+                )
+        finally:
+            self.discard(scratch)
 
     def upload(self, local, remote, timeout, progress, job_id):
         partial = remote + "." + job_id + ".partial"
@@ -249,4 +294,5 @@ class Opengear:
 
     def close(self):
         self.ssh.close()
-        self._sudo = None
+        # A reconnect may authenticate as another account (local root after a TACACS outage).
+        self._uid = None
