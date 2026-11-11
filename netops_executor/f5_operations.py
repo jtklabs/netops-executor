@@ -225,14 +225,49 @@ def license_date(device):
 
 
 def license_serial(ssh):
+    return license_details(ssh)["serial"]
+
+
+def license_details(ssh):
     output = ssh.tmsh("show /sys license", timeout=10)
     matches = re.findall(
-        r"(?im)^[ \t]*(?:base )?registration key[ \t:]+(?:[a-z0-9]+-)+([a-z0-9]{7})[ \t\r]*$",
+        r"(?im)^[ \t]*(?:base )?registration key[ \t:]+((?:[a-z0-9]+-)+[a-z0-9]{7})[ \t\r]*$",
         output,
     )
     if len(matches) != 1:
         raise DeviceError("F5 license serial unavailable")
-    return matches[0]
+    modules = []
+    active = False
+    for line in output.splitlines():
+        if line.strip() == "Active Modules":
+            active = True
+            continue
+        if not active or not line.strip():
+            continue
+        if not line[0].isspace():
+            break
+        module = re.sub(r"\([A-Z0-9]{5,}(?:-[A-Z0-9]{5,})+\)", "", line).strip()
+        if module and module not in modules:
+            modules.append(module)
+
+    def reported_date(label):
+        match = re.search(r"(?im)^\s*" + label + r"\s+(\d{4})[/.-](\d{2})[/.-](\d{2})\s*$", output)
+        if match:
+            try:
+                return datetime(*map(int, match.groups())).date().isoformat()
+            except ValueError:
+                pass
+        return None
+
+    return {
+        "reference": matches[0],
+        "serial": matches[0].rsplit("-", 1)[-1],
+        "product": modules[0][:150] if modules else "BIG-IP",
+        "installed_modules": modules,
+        "reported_expiration": reported_date("License End Date"),
+        "service_check_date": reported_date("Service Check Date"),
+        "verified_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def free_bytes(device):

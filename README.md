@@ -2367,6 +2367,24 @@ that can be approved in **Lifecycle → Software Standards**. A standard can
 approve multiple versions for a device type or platform. See the result on the
 device or in **Lifecycle → Compliance Report**. The executor token needs add
 and change permissions on Lifecycle's Device Software model for this step.
+F5 discovery reads the base registration key, active modules, license expiration,
+and service-check date from the same SSH response. It creates or updates a
+Lifecycle License Entitlement and a License Assignment linked to the discovered
+device. The full registration key is stored in the entitlement's Reference
+field. Module names, reported dates, and the verification time are stored on
+the assignment. Both records receive the poller and discovered tags. Rescans
+reuse the same records, preserve purchased seat counts and vault references,
+and migrate an existing linked support-serial reference to the full key.
+The NetBox token needs view, add, and change permissions on License Entitlement
+and License Assignment. The existing plugin APIs support this operation.
+
+The job reports the write separately under
+`result.discovery.license_inventory`, including its status, entitlement ID,
+assignment ID, module count, and reported expiration. Plugin permission or API
+failures produce `completed_with_warnings` after the device update succeeds.
+Registration keys remain outside the persisted discovery job result and diagnostic
+output.
+
 For F5 BIG-IP Virtual Edition, discovery uses the last seven characters of the
 base registration key as the serial. The same discovery job runs the read-only
 `show /sys license` command over SSH. An `f5` entry with the polled IP as its

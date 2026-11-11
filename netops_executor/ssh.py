@@ -192,6 +192,7 @@ class SSH:
             r"\1[REDACTED LICENSE KEY]",
             value,
         )
+        value = re.sub(r"\([A-Z0-9]{5,}(?:-[A-Z0-9]{5,})+\)", "([REDACTED LICENSE KEY])", value)
         return value[:4096] + ("\n[truncated]" if len(value) > 4096 else "")
 
     def shell(self, command, timeout=120, stdin_text=None, *, diagnostics=False):
