@@ -25,6 +25,7 @@ class SSH:
     def __init__(self, settings, device, guard=lambda: None, credential_profiles=None, audit=None):
         self.settings, self.device, self.guard = settings, device, guard
         self.client = None
+        self.f5_shell_type = None
         self.enable_password = None
         self.transfer_guard = guard
         self.progress = lambda done, total: None
@@ -133,6 +134,7 @@ class SSH:
         if self.client:
             self.client.close()
         self.client = None
+        self.f5_shell_type = None
 
     def execute(self, command, timeout=120, stdin_text=None):
         self.guard()
@@ -204,6 +206,7 @@ class SSH:
                     "SSH command failed",
                     diagnostics={
                         "command": command,
+                        "shell": self.f5_shell_type,
                         "exit_code": result["exit_code"],
                         "stdout": self.diagnostic_output(result["stdout"]),
                         "stderr": self.diagnostic_output(result["stderr"]),
@@ -212,15 +215,40 @@ class SSH:
             raise DeviceError("SSH command failed; remote output withheld")
         return result["stdout"]
 
+    def detect_f5_shell(self, timeout):
+        self.connect()
+        if self.f5_shell_type is not None:
+            return self.f5_shell_type
+        attempts = []
+        probes = (
+            ("tmsh", "show /sys version", "Sys::Version"),
+            ("bash", "printf '__NETOPS_BASH_SHELL__\\n'", "__NETOPS_BASH_SHELL__"),
+        )
+        for shell_type, command, marker in probes:
+            result = self.execute(command, timeout)
+            if result["exit_code"] == 0 and any(
+                line.strip() == marker for line in result["stdout"].splitlines()
+            ):
+                self.f5_shell_type = shell_type
+                return shell_type
+            attempts.append(
+                {
+                    "command": command,
+                    "exit_code": result["exit_code"],
+                    "stdout": self.diagnostic_output(result["stdout"]),
+                    "stderr": self.diagnostic_output(result["stderr"]),
+                }
+            )
+        raise DeviceError("Could not detect the F5 login shell", diagnostics={"shell_detection": attempts})
+
     def tmsh(self, command, timeout=120, secret=False):
         if secret:
             # Keep the UCS passphrase off process argument lists and never persist the command/output.
             return self.shell("tmsh -q", timeout, command + "\nquit\n")
-        return self.shell(
-            "tmsh -q -c " + shlex.quote(command),
-            timeout,
-            diagnostics=command == "show /sys license",
-        )
+        diagnostics = command == "show /sys license"
+        if diagnostics and self.detect_f5_shell(timeout) == "tmsh":
+            return self.shell(command, timeout, diagnostics=True)
+        return self.shell("tmsh -q -c " + shlex.quote(command), timeout, diagnostics=diagnostics)
 
     def put(self, local, remote):
         self.guard()

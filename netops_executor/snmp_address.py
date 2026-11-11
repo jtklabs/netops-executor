@@ -41,15 +41,18 @@ async def collect_polled_address(get, address):
         legacy = await get([legacy_index, mask_oid])
         value = legacy.get(legacy_index, "")
         legacy_index = int(value) if value.isdecimal() else 0
-        if not legacy_index or index not in (0, legacy_index):
+        if legacy_index and index not in (0, legacy_index):
             return None
+        index = legacy_index or index
         try:
             network = IPv4Network((0, legacy.get(mask_oid, "")))
         except ValueError:
-            return None
-        if str(network.netmask) != legacy.get(mask_oid):
-            return None
-        index, prefix = legacy_index, network.prefixlen
+            network = None
+        if network is not None and str(network.netmask) == legacy.get(mask_oid):
+            prefix = network.prefixlen
+    host_prefix = address.version == 4 and prefix is None
+    if host_prefix:
+        prefix = 32
     if not index or prefix is None:
         return None
     name_oid, descr_oid = f"{IF_NAME}.{index}", f"{IF_DESCR}.{index}"
@@ -57,4 +60,7 @@ async def collect_polled_address(get, address):
     name = interface.get(name_oid) or interface.get(descr_oid)
     if not name or any(ord(char) < 32 or ord(char) == 127 for char in name):
         return None
-    return {"interface": name, "address": f"{address}/{prefix}", "dhcp": row.get(origin_oid) == "4"}
+    result = {"interface": name, "address": f"{address}/{prefix}", "dhcp": row.get(origin_oid) == "4"}
+    if host_prefix:
+        result["prefix_source"] = "host"
+    return result

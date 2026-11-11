@@ -221,3 +221,55 @@ def test_other_tmsh_commands_keep_remote_output_out_of_errors(settings, monkeypa
         ssh.tmsh("list /auth user admin", secret=secret)
     assert raised.value.diagnostics is None
     assert "sensitive configuration" not in str(raised.value)
+
+
+@pytest.mark.parametrize("initial_shell", ["bash", "tmsh"])
+def test_f5_license_detects_shell_and_rechecks_after_reconnect(settings, monkeypatch, initial_shell):
+    ssh = SSH(settings, Device(id="bigip", host="192.0.2.1", device_type="f5"))
+    active_shell = initial_shell
+    commands = []
+    monkeypatch.setattr(ssh, "connect", lambda: None)
+
+    def execute(command, timeout=120, stdin_text=None):
+        commands.append(command)
+        if command == "show /sys version":
+            if active_shell == "tmsh":
+                return {"exit_code": 0, "stdout": "Sys::Version\nMain Package", "stderr": ""}
+            return {"exit_code": 127, "stdout": "", "stderr": "bash: show: command not found"}
+        if command.startswith("printf "):
+            assert active_shell == "bash"
+            return {"exit_code": 0, "stdout": "__NETOPS_BASH_SHELL__\n", "stderr": ""}
+        expected = "show /sys license" if active_shell == "tmsh" else "tmsh -q -c 'show /sys license'"
+        assert command == expected
+        return {"exit_code": 0, "stdout": "license response", "stderr": ""}
+
+    monkeypatch.setattr(ssh, "execute", execute)
+    assert ssh.tmsh("show /sys license") == "license response"
+    assert ssh.f5_shell_type == initial_shell
+    first_probe_count = commands.count("show /sys version")
+    assert ssh.tmsh("show /sys license") == "license response"
+    assert commands.count("show /sys version") == first_probe_count
+    ssh.close()
+    active_shell = "tmsh" if initial_shell == "bash" else "bash"
+    assert ssh.tmsh("show /sys license") == "license response"
+    assert ssh.f5_shell_type == active_shell
+    assert commands.count("show /sys version") == first_probe_count + 1
+
+
+def test_f5_unknown_shell_reports_probe_errors_without_running_license(settings, monkeypatch):
+    ssh = SSH(settings, Device(id="bigip", host="192.0.2.1", device_type="f5"))
+    ssh.selector.secrets.add("probe-secret")
+    monkeypatch.setattr(ssh, "connect", lambda: None)
+    commands = []
+
+    def execute(command, *args):
+        commands.append(command)
+        return {"exit_code": 1, "stdout": "", "stderr": "Permission denied probe-secret"}
+
+    monkeypatch.setattr(ssh, "execute", execute)
+    with pytest.raises(DeviceError, match="Could not detect") as raised:
+        ssh.tmsh("show /sys license")
+    assert len(commands) == 2 and all("license" not in command for command in commands)
+    attempts = raised.value.diagnostics["shell_detection"]
+    assert len(attempts) == 2
+    assert all(attempt["stderr"] == "Permission denied [REDACTED]" for attempt in attempts)

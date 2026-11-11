@@ -364,8 +364,13 @@ class SnmpRunner:
         }
         if management_ip is None:
             address_lookup["reason"] = (
-                "SNMP did not provide a usable interface and subnet prefix for the polled IP. "
+                "SNMP could not resolve the polled IP to a usable interface address. "
                 "Check the address tables, SNMP view, and VRF context shown in the queries."
+            )
+        elif management_ip.get("prefix_source") == "host":
+            address_lookup.update(
+                prefix_source="host",
+                reason="SNMP confirmed the interface but omitted the subnet; using an IPv4 /32 host address.",
             )
         self.result["discovery"] = {
             **facts,
@@ -480,7 +485,10 @@ class SnmpRunner:
         )
         lookup = {"device": target.id, "source": "inventory" if targets else "discovery"}
         try:
-            return license_serial(ssh), {**lookup, "status": "succeeded"}
+            serial = license_serial(ssh)
+            if shell_type := getattr(ssh, "f5_shell_type", None):
+                lookup["shell"] = shell_type
+            return serial, {**lookup, "status": "succeeded"}
         except DeviceError as error:
             failure = {**lookup, "status": "failed", "reason": str(error)}
             if error.diagnostics is not None:

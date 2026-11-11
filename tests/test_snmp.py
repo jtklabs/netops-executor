@@ -658,6 +658,10 @@ def test_f5_license_lookup_reports_redacted_command_diagnostics(
             super().__init__(*args, **kwargs)
             self.selector.secrets.add("diagnostic-secret")
 
+        def detect_f5_shell(self, timeout):
+            self.f5_shell_type = "bash"
+            return "bash"
+
         def execute(self, command, timeout=120, stdin_text=None):
             assert command == "tmsh -q -c 'show /sys license'"
             return {"exit_code": exit_code, "stdout": stdout, "stderr": stderr}
@@ -816,6 +820,10 @@ def test_cisco_platform_uses_the_os_family_reported_by_snmp(description, platfor
         ("192.0.2.15", "arista-legacy", "192.0.2.15/24"),
         ("192.0.2.15", "arista-name-only-legacy", "192.0.2.15/24"),
         ("192.0.2.15", "nexus-legacy", "192.0.2.15/24"),
+        ("192.0.2.15", "arista-no-mask-legacy", "192.0.2.15/32"),
+        ("192.0.2.15", "arista-modern-no-prefix", "192.0.2.15/32"),
+        ("192.0.2.15", "no-interface", None),
+        ("192.0.2.15", "conflicting-interface-legacy", None),
         ("2001:db8::15", "modern", "2001:db8::15/64"),
         ("2001:db8::15", "modern-origin-error", "2001:db8::15/64"),
         ("2001:db8::15", "no-prefix", None),
@@ -851,11 +859,17 @@ def test_discovery_reads_polled_ip_interface_and_prefix(
     values[f"{IF_NAME}.2"] = rfc1902.OctetString(interface)
     if table.endswith("legacy"):
         values[f"{IPV4_ENTRY}.2.{address}"] = rfc1902.Integer32(2)
-        values[f"{IPV4_ENTRY}.3.{address}"] = rfc1902.IpAddress("255.255.255.0")
+        if table == "conflicting-interface-legacy":
+            suffix = ".".join(map(str, (1, 4, *ip_address(address).packed)))
+            values[f"{IP_ADDRESS_ENTRY}.3.{suffix}"] = rfc1902.Integer32(3)
+        if table != "arista-no-mask-legacy":
+            values[f"{IPV4_ENTRY}.3.{address}"] = rfc1902.IpAddress("255.255.255.0")
     else:
-        suffix = ".".join(map(str, (2, 16, *ip_address(address).packed)))
-        values[f"{IP_ADDRESS_ENTRY}.3.{suffix}"] = rfc1902.Integer32(2)
-        values[f"{IP_ADDRESS_ENTRY}.6.{suffix}"] = rfc1902.Integer32(4)
+        kind = 1 if ip_address(address).version == 4 else 2
+        suffix = ".".join(map(str, (kind, len(ip_address(address).packed), *ip_address(address).packed)))
+        if table != "no-interface":
+            values[f"{IP_ADDRESS_ENTRY}.3.{suffix}"] = rfc1902.Integer32(2)
+        values[f"{IP_ADDRESS_ENTRY}.6.{suffix}"] = rfc1902.Integer32(1 if table.startswith("arista") else 4)
         if table.startswith("modern"):
             network = ".".join(map(str, ip_address("2001:db8::").packed))
             values[f"{IP_ADDRESS_ENTRY}.5.{suffix}"] = rfc1902.ObjectName(
@@ -881,6 +895,8 @@ def test_discovery_reads_polled_ip_interface_and_prefix(
     process(settings, store, store.claim("worker"), "worker")
     job = store.get(response.json()["id"])
     expected = {"interface": interface, "address": cidr, "dhcp": table == "modern"} if cidr else None
+    if cidr and cidr.endswith("/32"):
+        expected["prefix_source"] = "host"
     facts = job["result"]["discovery"]
     assert facts["management_ip"] == expected
     lookup = facts["management_ip_lookup"]
@@ -888,7 +904,7 @@ def test_discovery_reads_polled_ip_interface_and_prefix(
     assert lookup["context_name"] == ""
     assert lookup["queries"]
     if cidr is None:
-        assert "subnet prefix" in lookup["reason"]
+        assert "usable interface address" in lookup["reason"]
     if table == "arista-name-only-legacy":
         assert any(query.get("error") for query in lookup["queries"])
         assert any(

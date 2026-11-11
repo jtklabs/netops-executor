@@ -796,7 +796,7 @@ class NetBoxDiscovery:
         ip_data = {}
         if any(address.get(key) != value for key, value in assignment.items()):
             ip_data.update(assignment)
-        if ip_interface(address["address"]) != cidr:
+        if management_ip.get("prefix_source") != "host" and ip_interface(address["address"]) != cidr:
             ip_data["address"] = str(cidr)
         if not tagged(address):
             ip_data["add_tags"] = [poller_tag["id"]]
