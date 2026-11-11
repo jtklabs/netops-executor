@@ -632,6 +632,66 @@ def test_f5_discovery_uses_license_suffix_for_ve_and_falls_back_to_snmp(
 
 
 @pytest.mark.parametrize(
+    ("exit_code", "stderr", "stdout"),
+    [
+        (
+            127,
+            "bash: tmsh: command not found; credential diagnostic-secret",
+            "Registration key ABCDE-FGHIJ-KLMNO-PQRST-UVW1234",
+        ),
+        (0, "Permission denied diagnostic-secret", "Base Registration Key: vendor-key-format"),
+        (0, "", "Syntax Error: unexpected argument tmsh diagnostic-secret"),
+        (1, "", "x" * 5000),
+    ],
+)
+def test_f5_license_lookup_reports_redacted_command_diagnostics(
+    client, settings, store, monkeypatch, exit_code, stderr, stdout
+):
+    from netops_executor.config import Device
+    from netops_executor.snmp_identity import SYS_NAME, SYS_OBJECT_ID
+    from netops_executor.ssh import SSH
+
+    settings.devices["bigip"] = Device(id="bigip", host="192.0.2.15", device_type="f5")
+
+    class LicenseSSH(SSH):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.selector.secrets.add("diagnostic-secret")
+
+        def execute(self, command, timeout=120, stdin_text=None):
+            assert command == "tmsh -q -c 'show /sys license'"
+            return {"exit_code": exit_code, "stdout": stdout, "stderr": stderr}
+
+    monkeypatch.setattr(snmp, "SSH", LicenseSSH)
+    job, _ = discover(
+        client,
+        settings,
+        store,
+        monkeypatch,
+        {
+            SYS_NAME: rfc1902.OctetString("bigip"),
+            SYS_OBJECT_ID: rfc1902.ObjectName("1.3.6.1.4.1.3375.2.1.3.2"),
+            "1.3.6.1.4.1.3375.2.1.3.5.2.0": rfc1902.OctetString("BIG-IP Virtual Edition"),
+            "1.3.6.1.4.1.3375.2.1.3.3.3.0": rfc1902.OctetString("SNMP-SERIAL"),
+            "1.3.6.1.4.1.3375.2.1.4.2.0": rfc1902.OctetString("17.5.1"),
+        },
+    )
+    lookup = job["result"]["discovery"]["license_lookup"]
+    assert lookup["status"] == "failed"
+    assert lookup["reason"] == "SSH command failed"
+    details = lookup["diagnostics"]
+    assert details["command"] == "tmsh -q -c 'show /sys license'"
+    assert details["exit_code"] == exit_code
+    assert details["stdout"] or details["stderr"]
+    rendered = json.dumps(job)
+    assert "diagnostic-secret" not in rendered
+    assert "ABCDE-FGHIJ" not in rendered
+    assert "vendor-key-format" not in rendered
+    if len(stdout) > 4096:
+        assert details["stdout"] == "x" * 4096 + "\n[truncated]"
+
+
+@pytest.mark.parametrize(
     ("targets", "enabled", "key_available", "lookup_status"),
     [
         (["192.0.2.15"], True, True, "succeeded"),

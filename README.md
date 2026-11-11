@@ -2380,6 +2380,10 @@ When SSH is unavailable, discovery falls back to the chassis serial SNMP reports
 `result.discovery.serial_source` is `license` or `snmp`.
 `result.discovery.license_lookup` reports its `status`, connection `source`
 (`inventory` or `discovery`), and a `reason` when the lookup is skipped or fails.
+Failed license commands include `license_lookup.diagnostics` with the command,
+exit code, stdout, and stderr. Output is limited to 4096 characters per stream,
+with saved SSH credentials and registration keys redacted. These details are
+available in the job result JSON for troubleshooting shell and permission errors.
 A skipped lookup reports missing eligible SSH profiles or ambiguous inventory
 entries. Credential-store, SSH, or license-read failures complete the job with
 warnings. The SNMP

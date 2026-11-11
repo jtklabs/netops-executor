@@ -14,7 +14,11 @@ from .store import Store
 
 
 class DeviceError(Exception):
-    """Deliberately excludes remote output and credentials from public errors."""
+    """Public error text with optional explicitly redacted command diagnostics."""
+
+    def __init__(self, message, diagnostics=None):
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 class SSH:
@@ -174,13 +178,37 @@ class SSH:
             if channel is not None:
                 channel.close()
 
-    def shell(self, command, timeout=120, stdin_text=None):
+    def diagnostic_output(self, value):
+        value = self.selector.redact(value)
+        value = re.sub(
+            r"(?i)\b(?:[a-z0-9]{5}-){4}[a-z0-9]{7}\b",
+            "[REDACTED LICENSE KEY]",
+            value,
+        )
+        value = re.sub(
+            r"(?im)^([ \t]*(?:(?:base|add[- ]?on) +)?registration +key[ \t:]+)[^\r\n]*",
+            r"\1[REDACTED LICENSE KEY]",
+            value,
+        )
+        return value[:4096] + ("\n[truncated]" if len(value) > 4096 else "")
+
+    def shell(self, command, timeout=120, stdin_text=None, *, diagnostics=False):
         result = self.execute(command, timeout, stdin_text)
         if (
             result["exit_code"] != 0
             or result["stderr"]
             or re.search(r"(?im)^.*(?:syntax error|\berror:|\bfailed\b)", result["stdout"])
         ):
+            if diagnostics:
+                raise DeviceError(
+                    "SSH command failed",
+                    diagnostics={
+                        "command": command,
+                        "exit_code": result["exit_code"],
+                        "stdout": self.diagnostic_output(result["stdout"]),
+                        "stderr": self.diagnostic_output(result["stderr"]),
+                    },
+                )
             raise DeviceError("SSH command failed; remote output withheld")
         return result["stdout"]
 
@@ -188,7 +216,11 @@ class SSH:
         if secret:
             # Keep the UCS passphrase off process argument lists and never persist the command/output.
             return self.shell("tmsh -q", timeout, command + "\nquit\n")
-        return self.shell("tmsh -q -c " + shlex.quote(command), timeout)
+        return self.shell(
+            "tmsh -q -c " + shlex.quote(command),
+            timeout,
+            diagnostics=command == "show /sys license",
+        )
 
     def put(self, local, remote):
         self.guard()

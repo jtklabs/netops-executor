@@ -439,7 +439,7 @@ class SnmpRunner:
         return "failed"
 
     def read_f5_license_serial(self, checkpoint):
-        """Return the VE license serial (or "") and why, without device output."""
+        """Return the VE license serial or a failure with redacted diagnostics."""
         address = str(self.request.device_ip)
         targets = [d for d in self.settings.devices.values() if d.host == address and d.device_type == "f5"]
         if len(targets) > 1:
@@ -482,8 +482,10 @@ class SnmpRunner:
         try:
             return license_serial(ssh), {**lookup, "status": "succeeded"}
         except DeviceError as error:
-            # Messages from SSH and the license parser carry no device output.
-            return "", {**lookup, "status": "failed", "reason": str(error)}
+            failure = {**lookup, "status": "failed", "reason": str(error)}
+            if error.diagnostics is not None:
+                failure["diagnostics"] = error.diagnostics
+            return "", failure
         except (OSError, EOFError, SSHException):
             return "", {**lookup, "status": "failed", "reason": "SSH connection failed"}
         finally:
