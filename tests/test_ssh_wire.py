@@ -207,3 +207,17 @@ def test_unknown_host_key_never_attempts_credentials(settings, store):
         with pytest.raises(DeviceError):
             ssh.connect()
         assert not state["attempts"]
+
+
+@pytest.mark.parametrize("secret", [False, True])
+def test_other_tmsh_commands_keep_remote_output_out_of_errors(settings, monkeypatch, secret):
+    ssh = SSH(settings, Device(id="test", host="192.0.2.1"))
+    monkeypatch.setattr(
+        ssh,
+        "execute",
+        lambda *args: {"exit_code": 1, "stdout": "sensitive configuration", "stderr": "denied"},
+    )
+    with pytest.raises(DeviceError) as raised:
+        ssh.tmsh("list /auth user admin", secret=secret)
+    assert raised.value.diagnostics is None
+    assert "sensitive configuration" not in str(raised.value)
