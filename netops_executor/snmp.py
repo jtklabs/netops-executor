@@ -14,8 +14,8 @@ from pysnmp.proto import rfc1902, rfc1905
 
 from .config import Device
 from .credentials import AuthenticationRejected, Selector, Vault
-from .f5_operations import license_serial
-from .netbox_discovery import SyncError, sync_device
+from .f5_operations import license_details
+from .netbox_discovery import SyncError, sync_device, sync_licenses
 from .snmp_address import collect_polled_address
 from .snmp_identity import ENTITY_CLASS, collect_identity, text
 from .snmp_models import SnmpWalkRequest
@@ -109,6 +109,7 @@ class SnmpRunner:
         self.repetitions = 0 if self.request.walk_mode == "next" else self.request.max_repetitions
         self.responded = False
         self.requests = 0
+        self._f5_license = None
         self.result = {
             "rows": 0,
             "bytes": 0,
@@ -405,13 +406,12 @@ class SnmpRunner:
         def checkpoint():
             self.store.checkpoint(self.job["id"], self.worker)
 
-        if discovery["manufacturer"] == "F5" and re.search(
-            r"\bBIG-IP\s+(?:Virtual Edition|VE)\b", discovery["model"], re.I
-        ):
+        if discovery["manufacturer"] == "F5":
             serial, discovery["license_lookup"] = self.read_f5_license_serial(checkpoint)
-            if serial:
+            virtual_edition = re.search(r"\bBIG-IP\s+(?:Virtual Edition|VE)\b", discovery["model"], re.I)
+            if serial and virtual_edition:
                 discovery.update(serial=serial, serial_source="license")
-            elif discovery["serial"]:
+            elif virtual_edition and discovery["serial"]:
                 # Without SSH, keep the chassis serial SNMP reported. It never replaces a
                 # serial NetBox already holds (see netbox_discovery.sync_inventory).
                 discovery["serial_source"] = "snmp"
@@ -448,6 +448,10 @@ class SnmpRunner:
             }
         else:
             discovery["netbox"] = {"status": action, "device_id": device_id}
+            if self._f5_license is not None:
+                discovery["license_inventory"] = sync_licenses(
+                    self.settings, device_id, discovery["poller_instance"], self._f5_license, checkpoint
+                )
             optional_failure = any(
                 discovery.get(field, {}).get("status") in {"failed", "warning"}
                 for field in (
@@ -455,6 +459,7 @@ class SnmpRunner:
                     "stack_inventory",
                     "access_point_inventory",
                     "license_lookup",
+                    "license_inventory",
                 )
             )
             return "completed_with_warnings" if missing or optional_failure else "succeeded"
@@ -463,6 +468,7 @@ class SnmpRunner:
     def read_f5_license_serial(self, checkpoint):
         """Return the VE license serial or a failure with redacted diagnostics."""
         address = str(self.request.device_ip)
+        self._f5_license = None
         targets = [d for d in self.settings.devices.values() if d.host == address and d.device_type == "f5"]
         if len(targets) > 1:
             return "", {
@@ -502,7 +508,8 @@ class SnmpRunner:
         )
         lookup = {"device": target.id, "source": "inventory" if targets else "discovery"}
         try:
-            serial = license_serial(ssh)
+            self._f5_license = license_details(ssh)
+            serial = self._f5_license["serial"]
             if shell_type := getattr(ssh, "f5_shell_type", None):
                 lookup["shell"] = shell_type
             return serial, {**lookup, "status": "succeeded"}

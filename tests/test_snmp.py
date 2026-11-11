@@ -560,7 +560,16 @@ def test_discovery_configuration_and_required_identity(client, settings, store, 
         # Without an inventory entry no SSH is attempted; the SNMP serial is used as is.
         ("BIG-IP Virtual Edition", False, None, "SNMP-SERIAL", "SNMP-SERIAL", "snmp", "skipped", "succeeded"),
         ("BIG-IP Virtual Edition", False, None, "", "", None, "skipped", "completed_with_warnings"),
-        ("BIG-IP i4600", True, None, "SNMP-SERIAL", "SNMP-SERIAL", None, None, "succeeded"),
+        (
+            "BIG-IP i4600",
+            True,
+            "Registration key    ABCDE-FGHIJ-KLMNO-PQRST-UVW1234",
+            "SNMP-SERIAL",
+            "SNMP-SERIAL",
+            None,
+            "succeeded",
+            "succeeded",
+        ),
     ],
 )
 def test_f5_discovery_uses_license_suffix_for_ve_and_falls_back_to_snmp(
@@ -616,6 +625,7 @@ def test_f5_discovery_uses_license_suffix_for_ve_and_falls_back_to_snmp(
 
     monkeypatch.setattr(snmp, "SSH", LicenseSSH)
     monkeypatch.setattr(snmp, "sync_device", sync)
+    monkeypatch.setattr(snmp, "sync_licenses", lambda *args: {"status": "created", "assignment_id": 1})
     response = client.post("/api/v1/snmp/walks", json={"device_ip": "192.0.2.15", "site": "Lab"})
     assert response.status_code == 202
     process(settings, store, store.claim("worker"), "worker")
@@ -951,6 +961,7 @@ def test_cisco_stack_discovery_joins_member_chassis_and_excludes_provisioned_slo
         )
     FakeAgent(monkeypatch, values)
     monkeypatch.setattr(snmp, "sync_device", lambda *_: ("created", 42))
+    monkeypatch.setattr(snmp, "sync_licenses", lambda *args: {"status": "created", "assignment_id": 1})
     response = client.post("/api/v1/snmp/walks", json={"device_ip": "192.0.2.15", "site": "Lab"})
     assert response.status_code == 202
     process(settings, store, store.claim("worker"), "worker")
@@ -987,6 +998,7 @@ def discover(client, settings, store, monkeypatch, values):
     settings.poller_instance = "lab"
     agent = FakeAgent(monkeypatch, values)
     monkeypatch.setattr(snmp, "sync_device", lambda *_: ("created", 42))
+    monkeypatch.setattr(snmp, "sync_licenses", lambda *args: {"status": "created", "assignment_id": 1})
     response = client.post("/api/v1/snmp/walks", json={"device_ip": "192.0.2.15", "site": "Lab"})
     assert response.status_code == 202
     process(settings, store, store.claim("worker"), "worker")

@@ -3,6 +3,7 @@
 import re
 import ssl
 import unicodedata
+from datetime import datetime
 from hashlib import sha256
 from ipaddress import ip_interface
 
@@ -74,19 +75,38 @@ def discovery_role(facts):
 
 
 def sync_device(settings, site, poller, address, facts, checkpoint):
+    with netbox_client(settings) as http:
+        return NetBoxDiscovery(http, checkpoint).sync(site, poller, address, facts)
+
+
+def sync_licenses(settings, device_id, poller, license_info, checkpoint):
+    try:
+        with netbox_client(settings) as http:
+            return NetBoxDiscovery(http, checkpoint).sync_f5_license(device_id, poller, license_info)
+    except httpx.HTTPStatusError as error:
+        return {
+            "status": "failed",
+            "error": f"NetBox license sync returned HTTP {error.response.status_code} for {error.request.method} {error.request.url.path}",
+        }
+    except SyncError as error:
+        return {"status": "failed", "error": str(error)}
+    except (httpx.RequestError, OSError, ValueError, KeyError, TypeError):
+        return {"status": "failed", "error": "Could not synchronize the NetBox Lifecycle license records"}
+
+
+def netbox_client(settings):
     token = settings.netbox_token
     scheme = "Bearer" if token.startswith("nbt_") else "Token"
     verify = (
         ssl.create_default_context(cafile=str(settings.netbox_ca_file)) if settings.netbox_ca_file else True
     )
-    with httpx.Client(
+    return httpx.Client(
         base_url=settings.netbox_url.rstrip("/") + "/api/",
         headers={"Authorization": f"{scheme} {token}", "Accept": "application/json"},
         timeout=10,
         verify=verify,
         trust_env=False,
-    ) as http:
-        return NetBoxDiscovery(http, checkpoint).sync(site, poller, address, facts)
+    )
 
 
 class NetBoxDiscovery:
@@ -703,6 +723,97 @@ class NetBoxDiscovery:
                 {**member, "collected_at": facts.get("collected_at")},
             )
         return result
+
+    def sync_f5_license(self, device_id, poller, info):
+        entitlement_path = "plugins/refresh/license-entitlements/"
+        assignment_path = "plugins/refresh/license-assignments/"
+        manufacturer = self.named_object("dcim/manufacturers/", "F5")
+        tags = [
+            self.named_object("extras/tags/", poller, poller)["id"],
+            self.named_object("extras/tags/", DISCOVERED_TAG)["id"],
+        ]
+        assignments = [
+            row for row in self.records(assignment_path, device=device_id) if row["device"] == device_id
+        ]
+        linked = {row["entitlement"] for row in assignments}
+
+        def find_entitlement():
+            legacy = None
+            for row in self.records(entitlement_path, manufacturer=manufacturer["id"]):
+                if row["manufacturer"] != manufacturer["id"]:
+                    continue
+                if row["reference"].casefold() == info["reference"].casefold():
+                    return row
+                if row["reference"] == info["serial"] and row["id"] in linked:
+                    legacy = row
+            return legacy
+
+        entitlement_data = {"reference": info["reference"], "product": info["product"]}
+        if info["reported_expiration"]:
+            entitlement_data["expires_on"] = info["reported_expiration"]
+        entitlement = self.ensure(
+            entitlement_path,
+            find_entitlement,
+            {"manufacturer": manufacturer["id"], "seats": 1, "tags": tags, **entitlement_data},
+        )
+        previous = next((row for row in assignments if row["entitlement"] == entitlement["id"]), None)
+        changes = {key: value for key, value in entitlement_data.items() if entitlement.get(key) != value}
+        existing_tags = {tag["id"] for tag in entitlement.get("tags", [])}
+        if missing := [tag for tag in tags if tag not in existing_tags]:
+            changes["add_tags"] = missing
+        assignment_data = {"verified_at": info["verified_at"]}
+        if info["installed_modules"]:
+            assignment_data["installed_modules"] = "\n".join(info["installed_modules"])
+        for field in ("reported_expiration", "service_check_date"):
+            if info[field]:
+                assignment_data[field] = info[field]
+        assignment = self.ensure(
+            assignment_path,
+            lambda: next(
+                (
+                    row
+                    for row in self.records(assignment_path, device=device_id, entitlement=entitlement["id"])
+                    if row["device"] == device_id and row["entitlement"] == entitlement["id"]
+                ),
+                None,
+            ),
+            {
+                "device": device_id,
+                "entitlement": entitlement["id"],
+                "seats": 1,
+                "tags": tags,
+                **assignment_data,
+            },
+        )
+        observed_at = datetime.fromisoformat(info["verified_at"].replace("Z", "+00:00"))
+        verified_at = assignment.get("verified_at")
+        current_time = datetime.fromisoformat(verified_at.replace("Z", "+00:00")) if verified_at else None
+        if current_time is not None and current_time > observed_at:
+            return {"status": "stale", "entitlement_id": entitlement["id"], "assignment_id": assignment["id"]}
+        if changes:
+            self.request("PATCH", f"{entitlement_path}{entitlement['id']}/", json=changes)
+        updates = {
+            key: value
+            for key, value in assignment_data.items()
+            if key != "verified_at" and assignment.get(key) != value
+        }
+        if current_time != observed_at:
+            updates["verified_at"] = info["verified_at"]
+        existing_tags = {tag["id"] for tag in assignment.get("tags", [])}
+        if missing := [tag for tag in tags if tag not in existing_tags]:
+            updates["add_tags"] = missing
+        if updates:
+            self.request("PATCH", f"{assignment_path}{assignment['id']}/", json=updates)
+        status = "created"
+        if previous:
+            status = "updated" if changes or updates else "unchanged"
+        return {
+            "status": status,
+            "entitlement_id": entitlement["id"],
+            "assignment_id": assignment["id"],
+            "module_count": len(info["installed_modules"]),
+            "reported_expiration": info["reported_expiration"],
+        }
 
     def report_software(self, device_id, facts):
         data = {"device": device_id, "version": facts["software_version"], "source": "snmp"}
