@@ -336,12 +336,17 @@ class SnmpRunner:
                     "status": "failed",
                     "error": "Aruba access point table read failed",
                 }
+
+        async def get_address(oids):
+            try:
+                return await get(oids)
+            except WalkError:
+                # An agent can reject an unsupported address table instead of returning
+                # noSuchInstance. Keep the independent legacy IPv4 lookup available.
+                return {}
+
         collected_at = datetime.now(timezone.utc).isoformat()
-        try:
-            management_ip = await collect_polled_address(get, self.request.device_ip)
-        except WalkError:
-            # Some older agents reject an unsupported table instead of returning noSuchInstance.
-            management_ip = None
+        management_ip = await collect_polled_address(get_address, self.request.device_ip)
         self.result["discovery"] = {
             **facts,
             "collected_at": collected_at,

@@ -683,6 +683,8 @@ def test_cisco_platform_uses_the_os_family_reported_by_snmp(description, platfor
     ("address", "table", "cidr"),
     [
         ("192.0.2.15", "legacy", "192.0.2.15/24"),
+        ("192.0.2.15", "arista-legacy", "192.0.2.15/24"),
+        ("192.0.2.15", "nexus-legacy", "192.0.2.15/24"),
         ("2001:db8::15", "modern", "2001:db8::15/64"),
         ("2001:db8::15", "no-prefix", None),
     ],
@@ -704,9 +706,18 @@ def test_discovery_reads_polled_ip_interface_and_prefix(
         SYS_NAME: rfc1902.OctetString("IM7248-2-DAC"),
         SYS_OBJECT_ID: rfc1902.ObjectName("1.3.6.1.4.1.25049.1.61"),
         SYS_DESCR: rfc1902.OctetString("Opengear IM7248-2-DAC, OpenGear/IM72xx Version 5.5.3"),
-        f"{IF_NAME}.2": rfc1902.OctetString("eth0"),
     }
-    if table == "legacy":
+    interface = "eth0"
+    if table == "arista-legacy":
+        interface = "Management1"
+        values[SYS_OBJECT_ID] = rfc1902.ObjectName("1.3.6.1.4.1.30065.1.1")
+        values[SYS_DESCR] = rfc1902.OctetString("Arista DCS-7050, EOS version 4.34.2F")
+    elif table == "nexus-legacy":
+        interface = "mgmt0"
+        values[SYS_OBJECT_ID] = rfc1902.ObjectName("1.3.6.1.4.1.9.12.3.1.3")
+        values[SYS_DESCR] = rfc1902.OctetString("Cisco Nexus Operating System (NX-OS), Version 10.5(1)")
+    values[f"{IF_NAME}.2"] = rfc1902.OctetString(interface)
+    if table.endswith("legacy"):
         values[f"{IPV4_ENTRY}.2.{address}"] = rfc1902.Integer32(2)
         values[f"{IPV4_ENTRY}.3.{address}"] = rfc1902.IpAddress("255.255.255.0")
     else:
@@ -718,11 +729,18 @@ def test_discovery_reads_polled_ip_interface_and_prefix(
             values[f"{IP_ADDRESS_ENTRY}.5.{suffix}"] = rfc1902.ObjectName(
                 f"{IP_PREFIX_ENTRY}5.2.2.16.{network}.64"
             )
-    FakeAgent(monkeypatch, values)
+
+    class AddressAgent(FakeAgent):
+        def answer(self, kind, oids, repetitions):
+            if table in {"arista-legacy", "nexus-legacy"} and str(oids[0]).startswith(IP_ADDRESS_ENTRY + "."):
+                return None, 5, 1, ()  # genErr for the modern table; the legacy table works.
+            return super().answer(kind, oids, repetitions)
+
+    AddressAgent(monkeypatch, values)
     monkeypatch.setattr(snmp, "sync_device", lambda *_: ("created", 42))
     process(settings, store, store.claim("worker"), "worker")
     job = store.get(response.json()["id"])
-    expected = {"interface": "eth0", "address": cidr, "dhcp": table == "modern"} if cidr else None
+    expected = {"interface": interface, "address": cidr, "dhcp": table == "modern"} if cidr else None
     assert job["result"]["discovery"]["management_ip"] == expected
 
 
