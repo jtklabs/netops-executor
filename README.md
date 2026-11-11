@@ -2367,17 +2367,22 @@ that can be approved in **Lifecycle → Software Standards**. A standard can
 approve multiple versions for a device type or platform. See the result on the
 device or in **Lifecycle → Compliance Report**. The executor token needs add
 and change permissions on Lifecycle's Device Software model for this step.
-For F5 BIG-IP Virtual Edition, discovery
-uses the last seven characters of the base registration key as the serial.
-This happens in the same discovery job, not a separate one: configure one `f5`
-device with the polled IP as its `host`, working SSH credentials, and a trusted
-host key, and the executor runs the read-only `show /sys license` command over
-SSH and retains only the serial suffix. When SSH is not available, discovery
-falls back to the chassis serial SNMP reports. `result.discovery.serial_source`
-is `license` or `snmp`, and `result.discovery.license_lookup` gives the lookup's
-`status` and, unless it succeeded, the `reason`: `skipped` when no single `f5`
-inventory device has the polled IP (no SSH is attempted), or `failed` when SSH or
-the license read failed, which also completes the job with warnings. The SNMP
+For F5 BIG-IP Virtual Edition, discovery uses the last seven characters of the
+base registration key as the serial. The same discovery job runs the read-only
+`show /sys license` command over SSH. An `f5` entry with the polled IP as its
+`host` supplies its configured SSH connection settings. When that entry is absent,
+including when `devices.json` is empty, discovery uses enabled saved `ssh`
+credential profiles eligible for the polled IP. A profile with empty `targets`
+is eligible for all SSH targets. A restricted profile must include the polled IP.
+The existing known-hosts or host-key pinning policy applies to this connection.
+
+When SSH is unavailable, discovery falls back to the chassis serial SNMP reports.
+`result.discovery.serial_source` is `license` or `snmp`.
+`result.discovery.license_lookup` reports its `status`, connection `source`
+(`inventory` or `discovery`), and a `reason` when the lookup is skipped or fails.
+A skipped lookup reports missing eligible SSH profiles or ambiguous inventory
+entries. Credential-store, SSH, or license-read failures complete the job with
+warnings. The SNMP
 serial fills an empty NetBox serial but never replaces one NetBox already has, so
 a recorded license serial is not swapped for the chassis serial when SSH is
 unavailable; a license serial does replace an earlier SNMP serial. Discovery fills an unset NetBox platform

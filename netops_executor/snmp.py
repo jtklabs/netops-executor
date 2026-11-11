@@ -12,6 +12,7 @@ from paramiko import SSHException
 from pysnmp.hlapi.v3arch import asyncio as snmp
 from pysnmp.proto import rfc1902, rfc1905
 
+from .config import Device
 from .credentials import AuthenticationRejected, Selector, Vault
 from .f5_operations import license_serial
 from .netbox_discovery import SyncError, sync_device
@@ -21,7 +22,7 @@ from .snmp_models import SnmpWalkRequest
 from .snmp_stack import StackInventoryError, collect_stack
 from .snmp_wireless import AccessPointInventoryError, collect_access_points
 from .ssh import SSH, DeviceError
-from .store import CancelRequested, LostOwnership
+from .store import CancelRequested, Conflict, LostOwnership
 
 MAX_RESULT_BYTES = 16 * 1024 * 1024
 # Exact-instance GETs per request; a tooBig response splits the batch.
@@ -439,23 +440,45 @@ class SnmpRunner:
 
     def read_f5_license_serial(self, checkpoint):
         """Return the VE license serial (or "") and why, without device output."""
-        # SNMP jobs may target arbitrary IPs. Only send SSH credentials to an
-        # unambiguous F5 endpoint configured by the executor administrator.
-        targets = [
-            d
-            for d in self.settings.devices.values()
-            if d.host == str(self.request.device_ip) and d.device_type == "f5"
-        ]
-        if len(targets) != 1:
-            reason = "no f5 inventory device has" if not targets else "several f5 inventory devices have"
-            return "", {"status": "skipped", "reason": reason + " this IP as their host"}
+        address = str(self.request.device_ip)
+        targets = [d for d in self.settings.devices.values() if d.host == address and d.device_type == "f5"]
+        if len(targets) > 1:
+            return "", {
+                "status": "skipped",
+                "reason": "several f5 inventory devices have this IP as their host",
+            }
+        if targets:
+            target = targets[0]
+        else:
+            # SNMP has already identified a BIG-IP VE. Dynamic discovery uses only
+            # saved SSH profiles eligible for this IP, with the usual host-key policy.
+            try:
+                candidates = Vault(self.store, self.settings.credential_key_file).candidates(
+                    "ssh", targets=(address,)
+                )
+            except Conflict:
+                return "", {
+                    "status": "failed",
+                    "reason": "SSH credential store is unavailable; check NETOPS_CREDENTIAL_KEY_FILE",
+                }
+            if not candidates:
+                return "", {
+                    "status": "skipped",
+                    "reason": "no enabled SSH credential profile is eligible for this IP",
+                }
+            target = Device(
+                id=address,
+                host=address,
+                device_type="f5",
+                credential_profiles=[candidate["id"] for candidate in candidates],
+            )
         ssh = SSH(
             self.settings,
-            targets[0],
+            target,
             guard=checkpoint,
             audit=lambda data: self.store.credential_event(self.job["id"], self.worker, data),
         )
-        lookup = {"device": targets[0].id}
+        lookup = {"device": target.id, "source": "inventory" if targets else "discovery"}
         try:
             return license_serial(ssh), {**lookup, "status": "succeeded"}
         except DeviceError as error:

@@ -631,6 +631,76 @@ def test_f5_discovery_uses_license_suffix_for_ve_and_falls_back_to_snmp(
     assert seen == (["read", "close"] if output is not None else [])
 
 
+@pytest.mark.parametrize(
+    ("targets", "enabled", "key_available", "lookup_status"),
+    [
+        (["192.0.2.15"], True, True, "succeeded"),
+        ([], True, True, "succeeded"),
+        (["192.0.2.99"], True, True, "skipped"),
+        (["192.0.2.15"], False, True, "skipped"),
+        (["192.0.2.15"], True, False, "failed"),
+    ],
+)
+def test_f5_discovery_uses_saved_ssh_profiles_with_empty_inventory(
+    client, settings, store, monkeypatch, targets, enabled, key_available, lookup_status
+):
+    from test_controls_credentials import vault_for
+
+    from netops_executor.credentials import Credential
+    from netops_executor.snmp_identity import SYS_NAME, SYS_OBJECT_ID
+
+    settings.devices = {}
+    vault_for(settings, store).put(
+        "bigip-ssh",
+        Credential(
+            kind="ssh", username="root", password="saved-ssh-password", targets=targets, enabled=enabled
+        ),
+    )
+    if not key_available:
+        settings.credential_key_file = None
+    seen = []
+
+    class LicenseSSH:
+        def __init__(self, current_settings, device, guard, audit):
+            assert device.host == device.id == "192.0.2.15"
+            assert device.device_type == "f5"
+            assert device.credential_profiles == ["bigip-ssh"]
+            assert current_settings.ssh_host_keys == "known_hosts"
+            guard()
+            seen.append("connect")
+
+        def tmsh(self, command, timeout):
+            assert command == "show /sys license"
+            return "Registration key    ABCDE-FGHIJ-KLMNO-PQRST-UVW1234"
+
+        def close(self):
+            seen.append("close")
+
+    monkeypatch.setattr(snmp, "SSH", LicenseSSH)
+    job, _ = discover(
+        client,
+        settings,
+        store,
+        monkeypatch,
+        {
+            SYS_NAME: rfc1902.OctetString("bigip"),
+            SYS_OBJECT_ID: rfc1902.ObjectName("1.3.6.1.4.1.3375.2.1.3.2"),
+            "1.3.6.1.4.1.3375.2.1.3.5.2.0": rfc1902.OctetString("BIG-IP Virtual Edition"),
+            "1.3.6.1.4.1.3375.2.1.3.3.3.0": rfc1902.OctetString("SNMP-SERIAL"),
+            "1.3.6.1.4.1.3375.2.1.4.2.0": rfc1902.OctetString("17.5.1"),
+        },
+    )
+    facts = job["result"]["discovery"]
+    assert facts["license_lookup"]["status"] == lookup_status
+    assert facts["serial"] == ("UVW1234" if lookup_status == "succeeded" else "SNMP-SERIAL")
+    assert seen == (["connect", "close"] if lookup_status == "succeeded" else [])
+    assert "saved-ssh-password" not in json.dumps(job)
+    if lookup_status == "succeeded":
+        assert facts["license_lookup"]["source"] == "discovery"
+    else:
+        assert facts["license_lookup"]["reason"]
+
+
 @pytest.mark.parametrize(("suffix", "version_scalar"), [("", True), (".0", True), ("", False)])
 def test_opengear_discovery_reads_serial_and_appliance_firmware(
     client, settings, store, monkeypatch, suffix, version_scalar
