@@ -146,6 +146,26 @@ def ip_row(id_, interface=None, device=None, tags=()):
                 ("PATCH", "dcim/devices/6", {"primary_ip4": 50}),
             ],
         ),
+        # VM interface IDs occupy another object namespace and may equal a physical interface ID.
+        (
+            [
+                {
+                    **ip_row(2, interface=147),
+                    "assigned_object_type": "virtualization.vminterface",
+                    "assigned_object": {"id": 147, "virtual_machine": {"id": 99}},
+                }
+            ],
+            None,
+            201,
+            [
+                (
+                    "POST",
+                    "ipam/ip-addresses",
+                    {**ASSIGN, "address": "192.0.2.15/24", "vrf": 10, "status": "active", "tags": [7]},
+                ),
+                ("PATCH", "dcim/devices/6", {"primary_ip4": 50}),
+            ],
+        ),
         # This device's record on a renamed interface moves instead of being duplicated.
         (
             [ip_row(2, interface=140, device=6, tags=[7]), ip_row(3, interface=207, device=99)],
@@ -736,3 +756,140 @@ def test_device_is_found_by_poller_and_address_not_by_name(ours):
         assert action == "updated" and calls == [("PATCH", "dcim/devices/20", {"serial": "FOC1"})]
     else:
         assert action == "created" and [(m, p) for m, p, _ in calls] == [("POST", "dcim/devices")]
+
+
+@pytest.mark.parametrize(
+    ("existing_cidr", "observed_cidr", "prefix_source", "expected_address_write"),
+    [
+        (None, "192.0.2.15/32", "host", "192.0.2.15/32"),
+        ("192.0.2.15/24", "192.0.2.15/32", "host", None),
+        ("192.0.2.15/32", "192.0.2.15/24", "snmp", "192.0.2.15/24"),
+    ],
+)
+def test_primary_ip_uses_host_fallback_and_preserves_known_subnet(
+    existing_cidr, observed_cidr, prefix_source, expected_address_write
+):
+    writes = []
+
+    def handle(request):
+        path = request.url.path.removeprefix("/api/").strip("/")
+        if request.method == "GET":
+            if path == "dcim/interfaces":
+                rows = [{"id": 147, "name": "Management1", "vrf": {"id": 10}}]
+            else:
+                assert path == "ipam/ip-addresses"
+                rows = (
+                    [{**ip_row(2, interface=147, device=6, tags=[7]), "address": existing_cidr}]
+                    if existing_cidr
+                    else []
+                )
+            return httpx.Response(200, json={"results": rows, "next": None})
+        body = json.loads(request.content)
+        writes.append((request.method, path, body))
+        if request.method == "POST":
+            return httpx.Response(
+                201, json={**ip_row(50, interface=147, device=6, tags=[7]), "address": observed_cidr}
+            )
+        return httpx.Response(200, json={})
+
+    with httpx.Client(
+        base_url="https://netbox.example/api/", transport=httpx.MockTransport(handle)
+    ) as client:
+        NetBoxDiscovery(client, lambda: None).assign_primary_ip(
+            {"id": 6, "primary_ip4": {"id": 2} if existing_cidr else None},
+            {
+                "interface": "Management1",
+                "address": observed_cidr,
+                "dhcp": False,
+                "prefix_source": prefix_source,
+            },
+            POLLER,
+        )
+    address_writes = [
+        body["address"] for _, path, body in writes if path.startswith("ipam/") and "address" in body
+    ]
+    assert address_writes == ([expected_address_write] if expected_address_write else [])
+    if existing_cidr is None:
+        assert writes[-1] == ("PATCH", "dcim/devices/6", {"primary_ip4": 50})
+
+
+def test_placeholder_interface_is_idempotent_and_moves_ip_when_real_interface_is_found():
+    device = {"id": 6, "primary_ip4": None}
+    interfaces = {}
+    addresses = {}
+    writes = []
+
+    def assigned(row):
+        interface = interfaces[row["assigned_object_id"]]
+        return {
+            **row,
+            "assigned_object": {"id": interface["id"], "name": interface["name"], "device": {"id": 6}},
+        }
+
+    def handle(request):
+        path = request.url.path.removeprefix("/api/").strip("/")
+        if request.method == "GET":
+            if path == "ipam/ip-addresses":
+                rows = [assigned(row) for row in addresses.values()]
+            elif path == "dcim/interfaces":
+                rows = [row for row in interfaces.values() if row["name"] == request.url.params["name__ie"]]
+            else:
+                assert path.startswith("dcim/interfaces/")
+                return httpx.Response(200, json=interfaces[int(path.rsplit("/", 1)[1])])
+            return httpx.Response(200, json={"results": rows, "next": None})
+        body = json.loads(request.content)
+        writes.append((request.method, path, body))
+        if request.method == "POST" and path == "dcim/interfaces":
+            interface = {"id": 147 + len(interfaces), "vrf": None, **body}
+            interfaces[interface["id"]] = interface
+            return httpx.Response(201, json=interface)
+        if request.method == "POST" and path == "ipam/ip-addresses":
+            addresses[50] = {"id": 50, **body, "tags": [{"id": tag} for tag in body["tags"]]}
+            return httpx.Response(201, json=assigned(addresses[50]))
+        if path == "ipam/ip-addresses/50":
+            addresses[50].update(body)
+            return httpx.Response(200, json=assigned(addresses[50]))
+        assert path == "dcim/devices/6"
+        device.update(body)
+        # NetBox's device representation nests its primary IP.
+        device["primary_ip4"] = {"id": device["primary_ip4"]}
+        return httpx.Response(200, json=device)
+
+    def placeholder():
+        return {
+            "interface": "discovery-management",
+            "address": "192.0.2.15/32",
+            "dhcp": False,
+            "prefix_source": "host",
+            "interface_source": "placeholder",
+        }
+
+    with httpx.Client(
+        base_url="https://netbox.example/api/", transport=httpx.MockTransport(handle)
+    ) as client:
+        discovery = NetBoxDiscovery(client, lambda: None)
+        assert discovery.assign_primary_ip(device, placeholder(), POLLER)
+        assert interfaces[147]["type"] == "other"
+        assert "placeholder" in interfaces[147]["description"]
+        assert addresses[50]["address"] == "192.0.2.15/32"
+        assert addresses[50]["assigned_object_id"] == 147
+        assert device["primary_ip4"] == {"id": 50}
+
+        writes.clear()
+        assert not discovery.assign_primary_ip(device, placeholder(), POLLER)
+        assert not writes
+        assert discovery.assign_primary_ip(
+            device, {"interface": "Management1", "address": "192.0.2.15/24", "dhcp": False}, POLLER
+        )
+        assert addresses[50]["assigned_object_id"] == 148
+        assert addresses[50]["address"] == "192.0.2.15/24"
+        assert len(addresses) == 1
+
+        writes.clear()
+        unknown = placeholder()
+        assert not discovery.assign_primary_ip(device, unknown, POLLER)
+        assert not writes
+        assert addresses[50]["assigned_object_id"] == 148
+        assert addresses[50]["address"] == "192.0.2.15/24"
+        assert unknown["interface_source"] == "netbox"
+        assert unknown["interface"] == "Management1"

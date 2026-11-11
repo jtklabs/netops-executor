@@ -2375,6 +2375,11 @@ including when `devices.json` is empty, discovery uses enabled saved `ssh`
 credential profiles eligible for the polled IP. A profile with empty `targets`
 is eligible for all SSH targets. A restricted profile must include the polled IP.
 The existing known-hosts or host-key pinning policy applies to this connection.
+Before reading the license, the executor probes the authenticated connection to
+identify native TMSH or bash. It sends `show /sys license` to native TMSH and
+`tmsh -q -c 'show /sys license'` to bash. Detection is cached for that connection
+and cleared on reconnect. A successful lookup includes `license_lookup.shell`.
+Unrecognized shells report redacted probe diagnostics.
 
 When SSH is unavailable, discovery falls back to the chassis serial SNMP reports.
 `result.discovery.serial_source` is `license` or `snmp`.
@@ -2392,8 +2397,12 @@ a recorded license serial is not swapped for the chassis serial when SSH is
 unavailable; a license serial does replace an earlier SNMP serial. Discovery fills an unset NetBox platform
 when it identifies the OS family, such as Cisco IOS, Cisco IOS-XE, or Cisco NX-OS.
 It preserves an existing platform assignment. When SNMP identifies the interface
-and prefix for the polled address, discovery assigns the IP to that interface
-and sets it as the device's primary IPv4 or IPv6. It reuses a matching interface
+for a polled IPv4 address, discovery assigns the IP to that interface and sets it
+as primary. It uses the reported subnet prefix when available and falls back to
+/32 when the prefix is unavailable. The fallback is marked with
+`management_ip.prefix_source: "host"` and preserves a subnet already recorded
+on the matching NetBox IP. A later successful subnet lookup updates a newly
+created /32 address. IPv6 assignment requires the interface and reported prefix. It reuses a matching interface
 or creates it with type Other, in the interface's NetBox VRF. It reuses the IP
 record already assigned to this device (moving it from another of the device's
 interfaces after a rename), or claims an unassigned record that carries the poller
@@ -2401,11 +2410,16 @@ tag or is the address's only record. A record assigned to another device belongs
 that device's poller and is never moved: discovery creates this device's own record,
 tagged with the poller. If NetBox enforces unique IPs in that VRF and refuses the
 duplicate, the job reports it; give each poller's network its own VRF.
-When the interface or prefix cannot be confirmed, the job reports
-`result.discovery.management_ip` as null and keeps the address in the discovery
-custom field. The `result.discovery.management_ip_lookup` object reports the
+When the IPv4 interface cannot be identified, discovery reuses this device's
+existing assignment for the polled IP. If no assignment exists, it creates
+`discovery-management` with type Other and a description identifying it as a
+discovery placeholder, assigns the polled IP as /32, and sets it as primary.
+The result marks this with `management_ip.interface_source: "placeholder"`.
+A later scan that identifies the real interface moves the same IP record to it.
+The result uses `interface_source: "netbox"` when it reuses an existing assignment.
+ The `result.discovery.management_ip_lookup` object reports the
 SNMP context and each address/interface query, including returned values and query
-errors. Its status is `warning` when the interface and subnet cannot be resolved.
+errors. Its status is `warning` when no usable interface address can be resolved.
 If a combined query fails, discovery reads its objects individually so an
 unsupported optional object cannot discard a valid interface name or address row.
 NetBox requires unique device names within each site and tenant, so a device with the same name in that
