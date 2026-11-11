@@ -2410,9 +2410,14 @@ tag or is the address's only record. A record assigned to another device belongs
 that device's poller and is never moved: discovery creates this device's own record,
 tagged with the poller. If NetBox enforces unique IPs in that VRF and refuses the
 duplicate, the job reports it; give each poller's network its own VRF.
-When the interface cannot be identified, the job reports
-`result.discovery.management_ip` as null and keeps the address in the discovery
-custom field. The `result.discovery.management_ip_lookup` object reports the
+When the IPv4 interface cannot be identified, discovery reuses this device's
+existing assignment for the polled IP. If no assignment exists, it creates
+`discovery-management` with type Other and a description identifying it as a
+discovery placeholder, assigns the polled IP as /32, and sets it as primary.
+The result marks this with `management_ip.interface_source: "placeholder"`.
+A later scan that identifies the real interface moves the same IP record to it.
+The result uses `interface_source: "netbox"` when it reuses an existing assignment.
+ The `result.discovery.management_ip_lookup` object reports the
 SNMP context and each address/interface query, including returned values and query
 errors. Its status is `warning` when no usable interface address can be resolved.
 If a combined query fails, discovery reads its objects individually so an

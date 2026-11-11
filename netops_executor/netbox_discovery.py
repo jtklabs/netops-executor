@@ -730,6 +730,33 @@ class NetBoxDiscovery:
         cidr = ip_interface(management_ip["address"])
         device_id = device["id"]
 
+        def assigned_device(row):
+            if row.get("assigned_object_type") != "dcim.interface" or row.get("assigned_object_id") is None:
+                return None
+            return ((row.get("assigned_object") or {}).get("device") or {}).get("id")
+
+        address_rows = [
+            row
+            for row in self.records(address_path, address=str(cidr.ip))
+            if ip_interface(row["address"]).ip == cidr.ip
+        ]
+        interface = None
+        interface_data = {"device": device_id, "name": name, "type": "other"}
+        if management_ip.get("interface_source") == "placeholder":
+            attached = [row for row in address_rows if assigned_device(row) == device_id]
+            primary_id = (device.get(f"primary_ip{cidr.version}") or {}).get("id")
+            attached = [row for row in attached if row["id"] == primary_id] or attached
+            if len(attached) > 1:
+                raise SyncError(
+                    "Multiple device IP records match the polled address without an interface mapping"
+                )
+            if attached:
+                interface = self.request("GET", f"{interface_path}{attached[0]['assigned_object_id']}/")
+                management_ip.update(interface=interface["name"], interface_source="netbox")
+            interface_data["description"] = (
+                "Discovery placeholder for the polled management IP; SNMP interface mapping unavailable."
+            )
+
         def find_interface():
             matches = [
                 row
@@ -740,22 +767,12 @@ class NetBoxDiscovery:
                 raise SyncError("Multiple NetBox interfaces match the interface reported by SNMP")
             return matches[0] if matches else None
 
-        interface = self.ensure(
-            interface_path, find_interface, {"device": device_id, "name": name, "type": "other"}
-        )
+        if interface is None:
+            interface = self.ensure(interface_path, find_interface, interface_data)
         vrf_id = (interface.get("vrf") or {}).get("id")
         assignment = {"assigned_object_type": "dcim.interface", "assigned_object_id": interface["id"]}
 
-        rows = [
-            row
-            for row in self.records(address_path, address=str(cidr.ip))
-            if (row.get("vrf") or {}).get("id") == vrf_id and ip_interface(row["address"]).ip == cidr.ip
-        ]
-
-        def assigned_device(row):
-            if row.get("assigned_object_type") != "dcim.interface" or row.get("assigned_object_id") is None:
-                return None
-            return ((row.get("assigned_object") or {}).get("device") or {}).get("id")
+        rows = [row for row in address_rows if (row.get("vrf") or {}).get("id") == vrf_id]
 
         def tagged(row):
             return any(tag["id"] == poller_tag["id"] for tag in row.get("tags") or [])
@@ -763,9 +780,12 @@ class NetBoxDiscovery:
         # The same address can be recorded for devices behind other pollers: records assigned
         # to other devices are theirs and stay untouched. This device's own record is reused,
         # even from another of its interfaces after a rename.
-        own = [row for row in rows if row["assigned_object_id"] == interface["id"]] or [
-            row for row in rows if assigned_device(row) == device_id
-        ]
+        own = [
+            row
+            for row in rows
+            if row.get("assigned_object_type") == "dcim.interface"
+            and row["assigned_object_id"] == interface["id"]
+        ] or [row for row in rows if assigned_device(row) == device_id]
         # An unassigned record is claimed when it is this poller's, or the address's only record.
         free = [row for row in rows if row["assigned_object_id"] is None and (tagged(row) or len(rows) == 1)]
         candidates = own or free

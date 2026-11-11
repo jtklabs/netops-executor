@@ -822,8 +822,8 @@ def test_cisco_platform_uses_the_os_family_reported_by_snmp(description, platfor
         ("192.0.2.15", "nexus-legacy", "192.0.2.15/24"),
         ("192.0.2.15", "arista-no-mask-legacy", "192.0.2.15/32"),
         ("192.0.2.15", "arista-modern-no-prefix", "192.0.2.15/32"),
-        ("192.0.2.15", "no-interface", None),
-        ("192.0.2.15", "conflicting-interface-legacy", None),
+        ("192.0.2.15", "no-interface", "192.0.2.15/32"),
+        ("192.0.2.15", "conflicting-interface-legacy", "192.0.2.15/32"),
         ("2001:db8::15", "modern", "2001:db8::15/64"),
         ("2001:db8::15", "modern-origin-error", "2001:db8::15/64"),
         ("2001:db8::15", "no-prefix", None),
@@ -895,12 +895,16 @@ def test_discovery_reads_polled_ip_interface_and_prefix(
     process(settings, store, store.claim("worker"), "worker")
     job = store.get(response.json()["id"])
     expected = {"interface": interface, "address": cidr, "dhcp": table == "modern"} if cidr else None
+    placeholder = table in {"no-interface", "conflicting-interface-legacy"}
+    if placeholder:
+        expected["interface"] = "discovery-management"
+        expected["interface_source"] = "placeholder"
     if cidr and cidr.endswith("/32"):
         expected["prefix_source"] = "host"
     facts = job["result"]["discovery"]
     assert facts["management_ip"] == expected
     lookup = facts["management_ip_lookup"]
-    assert lookup["status"] == ("succeeded" if cidr else "warning")
+    assert lookup["status"] == ("succeeded" if cidr and not placeholder else "warning")
     assert lookup["context_name"] == ""
     assert lookup["queries"]
     if cidr is None:

@@ -357,6 +357,14 @@ class SnmpRunner:
 
         collected_at = datetime.now(timezone.utc).isoformat()
         management_ip = await collect_polled_address(get_address, self.request.device_ip)
+        if management_ip is None and self.request.device_ip.version == 4:
+            management_ip = {
+                "interface": "discovery-management",
+                "address": f"{self.request.device_ip}/32",
+                "dhcp": False,
+                "prefix_source": "host",
+                "interface_source": "placeholder",
+            }
         address_lookup = {
             "status": "succeeded" if management_ip else "warning",
             "context_name": context,
@@ -366,6 +374,15 @@ class SnmpRunner:
             address_lookup["reason"] = (
                 "SNMP could not resolve the polled IP to a usable interface address. "
                 "Check the address tables, SNMP view, and VRF context shown in the queries."
+            )
+        elif management_ip.get("interface_source") == "placeholder":
+            address_lookup.update(
+                status="warning",
+                prefix_source="host",
+                reason=(
+                    "SNMP did not identify the interface. Reuse an existing NetBox assignment or create "
+                    "a discovery-management interface of type Other for the polled IPv4 /32."
+                ),
             )
         elif management_ip.get("prefix_source") == "host":
             address_lookup.update(
