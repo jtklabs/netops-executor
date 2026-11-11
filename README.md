@@ -2394,8 +2394,12 @@ tagged with the poller. If NetBox enforces unique IPs in that VRF and refuses th
 duplicate, the job reports it; give each poller's network its own VRF.
 When the interface or prefix cannot be confirmed, the job reports
 `result.discovery.management_ip` as null and keeps the address in the discovery
-custom field. NetBox requires unique
-device names within each site and tenant, so a device with the same name in that
+custom field. The `result.discovery.management_ip_lookup` object reports the
+SNMP context and each address/interface query, including returned values and query
+errors. Its status is `warning` when the interface and subnet cannot be resolved.
+If a combined query fails, discovery reads its objects individually so an
+unsupported optional object cannot discard a valid interface name or address row.
+NetBox requires unique device names within each site and tenant, so a device with the same name in that
 scope from another poller or address reports a conflict.
 
 Cisco StackWise discovery joins present switch rows to their ENTITY-MIB chassis

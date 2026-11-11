@@ -337,16 +337,35 @@ class SnmpRunner:
                     "error": "Aruba access point table read failed",
                 }
 
+        address_queries = []
+
         async def get_address(oids):
             try:
-                return await get(oids)
-            except WalkError:
-                # An agent can reject an unsupported address table instead of returning
-                # noSuchInstance. Keep the independent legacy IPv4 lookup available.
-                return {}
+                values = await get(oids)
+            except WalkError as error:
+                address_queries.append({"oids": oids, "error": str(error)})
+                # One unsupported optional object can reject an otherwise usable batch.
+                # Read each object independently before discarding its companion values.
+                values = {}
+                if len(oids) > 1:
+                    for oid in oids:
+                        values.update(await get_address([oid]))
+                return values
+            address_queries.append({"oids": oids, "values": values})
+            return values
 
         collected_at = datetime.now(timezone.utc).isoformat()
         management_ip = await collect_polled_address(get_address, self.request.device_ip)
+        address_lookup = {
+            "status": "succeeded" if management_ip else "warning",
+            "context_name": context,
+            "queries": address_queries,
+        }
+        if management_ip is None:
+            address_lookup["reason"] = (
+                "SNMP did not provide a usable interface and subnet prefix for the polled IP. "
+                "Check the address tables, SNMP view, and VRF context shown in the queries."
+            )
         self.result["discovery"] = {
             **facts,
             "collected_at": collected_at,
@@ -354,6 +373,7 @@ class SnmpRunner:
             "site": self.request.site,
             "poller_instance": self.request.poller_instance,
             "management_ip": management_ip,
+            "management_ip_lookup": address_lookup,
         }
 
     def sync_inventory(self):

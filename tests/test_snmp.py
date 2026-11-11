@@ -684,8 +684,10 @@ def test_cisco_platform_uses_the_os_family_reported_by_snmp(description, platfor
     [
         ("192.0.2.15", "legacy", "192.0.2.15/24"),
         ("192.0.2.15", "arista-legacy", "192.0.2.15/24"),
+        ("192.0.2.15", "arista-name-only-legacy", "192.0.2.15/24"),
         ("192.0.2.15", "nexus-legacy", "192.0.2.15/24"),
         ("2001:db8::15", "modern", "2001:db8::15/64"),
+        ("2001:db8::15", "modern-origin-error", "2001:db8::15/64"),
         ("2001:db8::15", "no-prefix", None),
     ],
 )
@@ -694,7 +696,7 @@ def test_discovery_reads_polled_ip_interface_and_prefix(
 ):
     from ipaddress import ip_address
 
-    from netops_executor.snmp_address import IF_NAME, IP_ADDRESS_ENTRY, IP_PREFIX_ENTRY, IPV4_ENTRY
+    from netops_executor.snmp_address import IF_DESCR, IF_NAME, IP_ADDRESS_ENTRY, IP_PREFIX_ENTRY, IPV4_ENTRY
     from netops_executor.snmp_identity import SYS_DESCR, SYS_NAME, SYS_OBJECT_ID
 
     settings.netbox_url = "https://netbox.example"
@@ -708,7 +710,7 @@ def test_discovery_reads_polled_ip_interface_and_prefix(
         SYS_DESCR: rfc1902.OctetString("Opengear IM7248-2-DAC, OpenGear/IM72xx Version 5.5.3"),
     }
     interface = "eth0"
-    if table == "arista-legacy":
+    if table.startswith("arista"):
         interface = "Management1"
         values[SYS_OBJECT_ID] = rfc1902.ObjectName("1.3.6.1.4.1.30065.1.1")
         values[SYS_DESCR] = rfc1902.OctetString("Arista DCS-7050, EOS version 4.34.2F")
@@ -724,7 +726,7 @@ def test_discovery_reads_polled_ip_interface_and_prefix(
         suffix = ".".join(map(str, (2, 16, *ip_address(address).packed)))
         values[f"{IP_ADDRESS_ENTRY}.3.{suffix}"] = rfc1902.Integer32(2)
         values[f"{IP_ADDRESS_ENTRY}.6.{suffix}"] = rfc1902.Integer32(4)
-        if table == "modern":
+        if table.startswith("modern"):
             network = ".".join(map(str, ip_address("2001:db8::").packed))
             values[f"{IP_ADDRESS_ENTRY}.5.{suffix}"] = rfc1902.ObjectName(
                 f"{IP_PREFIX_ENTRY}5.2.2.16.{network}.64"
@@ -732,6 +734,14 @@ def test_discovery_reads_polled_ip_interface_and_prefix(
 
     class AddressAgent(FakeAgent):
         def answer(self, kind, oids, repetitions):
+            if table == "modern-origin-error" and any(
+                str(oid).startswith(IP_ADDRESS_ENTRY + ".6.") for oid in oids
+            ):
+                return None, 5, 1, ()
+            if table == "arista-name-only-legacy" and any(
+                str(oid).startswith(IF_DESCR + ".") for oid in oids
+            ):
+                return None, 5, 1, ()
             if table in {"arista-legacy", "nexus-legacy"} and str(oids[0]).startswith(IP_ADDRESS_ENTRY + "."):
                 return None, 5, 1, ()  # genErr for the modern table; the legacy table works.
             return super().answer(kind, oids, repetitions)
@@ -741,7 +751,19 @@ def test_discovery_reads_polled_ip_interface_and_prefix(
     process(settings, store, store.claim("worker"), "worker")
     job = store.get(response.json()["id"])
     expected = {"interface": interface, "address": cidr, "dhcp": table == "modern"} if cidr else None
-    assert job["result"]["discovery"]["management_ip"] == expected
+    facts = job["result"]["discovery"]
+    assert facts["management_ip"] == expected
+    lookup = facts["management_ip_lookup"]
+    assert lookup["status"] == ("succeeded" if cidr else "warning")
+    assert lookup["context_name"] == ""
+    assert lookup["queries"]
+    if cidr is None:
+        assert "subnet prefix" in lookup["reason"]
+    if table == "arista-name-only-legacy":
+        assert any(query.get("error") for query in lookup["queries"])
+        assert any(
+            query.get("values", {}).get(f"{IF_NAME}.2") == "Management1" for query in lookup["queries"]
+        )
 
 
 def test_cisco_stack_discovery_joins_member_chassis_and_excludes_provisioned_slots(
