@@ -18,7 +18,7 @@ from .discovery_overrides import apply_manual_fallback, apply_rules, load_rules
 from .f5_operations import license_details
 from .inventory_enrichment import collect_enrichment
 from .netbox_discovery import SyncError, sync_device, sync_licenses
-from .netbox_operations import preferred_image, report_observation, sync_observed_licenses
+from .netbox_operations import preferred_image, report_failed_poll, report_observation, sync_observed_licenses
 from .snmp_address import collect_polled_address
 from .snmp_identity import ENTITY_CLASS, collect_identity, text
 from .snmp_models import SnmpWalkRequest
@@ -149,6 +149,14 @@ class SnmpRunner:
                 ):
                     synchronized = self.sync_inventory()
                     status = synchronized if success else "failed"
+                if not success and not self.result.get("discovery", {}).get("collection_report"):
+                    self.result["collection_report"] = report_failed_poll(
+                        self.settings,
+                        self.job["id"],
+                        self.request.poller_instance,
+                        str(self.request.device_ip),
+                        lambda: self.store.checkpoint(self.job["id"], self.worker),
+                    )
             self.record("snmp_finished")
             self.store.finish(self.job["id"], self.worker, status)
         except LostOwnership:

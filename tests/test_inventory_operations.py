@@ -187,3 +187,50 @@ def test_observation_publishes_manual_and_inferred_provenance_without_license_ke
     assert sent[0]["executor_version"]
     assert "SENSITIVE-KEY" not in json.dumps(sent)
     assert netbox_client  # Keep the production writer independently testable.
+
+
+@pytest.mark.parametrize("matched", [True, False])
+def test_failed_poll_updates_existing_health_without_creating_or_changing_inventory(
+    settings, monkeypatch, matched
+):
+    settings.netbox_url, settings.netbox_token = "https://netbox.example", "x" * 40
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        if request.url.path.endswith("/extras/tags/"):
+            return httpx.Response(
+                200, json={"results": [{"id": 7, "name": "checkmk-us", "slug": "checkmk-us"}], "next": None}
+            )
+        if request.url.path.endswith("/dcim/devices/"):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"id": 58, "custom_fields": {"snmp_discovery_ip": "192.0.2.58"}, "tags": [{"id": 7}]}
+                    ]
+                    if matched
+                    else [],
+                    "next": None,
+                },
+            )
+        assert request.method == "POST" and request.url.path.endswith("/observations/report/")
+        body = json.loads(request.content)
+        assert body["facts"] == {} and body["readiness"] == {}
+        assert body["device"] == 58 and body["components"]["identity"]["status"] == "failed"
+        assert "relationships" not in body
+        return httpx.Response(201, json={"id": 1, "status": "failed", "changes": []})
+
+    monkeypatch.setattr(
+        netbox_operations,
+        "netbox_client",
+        lambda s: httpx.Client(base_url=s.netbox_url + "/api/", transport=httpx.MockTransport(handle)),
+    )
+    result = netbox_operations.report_failed_poll(
+        settings, "failed-job", "checkmk-us", "192.0.2.58", lambda: None
+    )
+    assert result["status"] == ("success" if matched else "skipped")
+    if matched:
+        assert result["collection_status"] == "failed"
+    assert sum(r.method == "POST" for r in calls) == int(matched)
+    assert not any(r.method in ("PUT", "PATCH", "DELETE") for r in calls)

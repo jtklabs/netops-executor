@@ -162,3 +162,60 @@ def report_observation(settings, job_id, device_id, discovery, enrichment, check
         }
     except (httpx.RequestError, ValueError, KeyError, TypeError):
         return {"status": "failed", "reason": "Could not publish collection evidence to Lifecycle"}
+
+
+def report_failed_poll(settings, job_id, poller, address, checkpoint):
+    """Update health for an unambiguous existing discovery record; never create inventory."""
+    try:
+        with netbox_client(settings) as http:
+            writer = NetBoxDiscovery(http, checkpoint)
+            tag = writer.named("extras/tags/", poller)
+            if not tag:
+                return {"status": "skipped", "reason": "No existing inventory for this poller"}
+            from .netbox_discovery import DISCOVERY_IP
+
+            devices = [
+                row
+                for row in writer.records("dcim/devices/", tag=poller, **{f"cf_{DISCOVERY_IP}": address})
+                if row.get("custom_fields", {}).get(DISCOVERY_IP) == address
+                and any(t["id"] == tag["id"] for t in row.get("tags", []))
+            ]
+            if len(devices) != 1:
+                return {
+                    "status": "skipped",
+                    "reason": "No unique existing device for this poller and address",
+                }
+            device_id = devices[0]["id"]
+            data = writer.request(
+                "POST",
+                "plugins/refresh/observations/report/",
+                json={
+                    "device": device_id,
+                    "job_id": job_id,
+                    "poller": poller,
+                    "executor_version": __version__,
+                    "observed_at": datetime.now(timezone.utc).isoformat(),
+                    "components": {
+                        "identity": {
+                            "status": "failed",
+                            "reason": "SNMP poll failed; last known inventory retained",
+                        }
+                    },
+                    "facts": {},
+                    "field_sources": {},
+                    "readiness": {},
+                },
+            )
+            return {
+                **data,
+                "device_id": device_id,
+                "collection_status": data.get("status"),
+                "status": "success",
+            }
+    except httpx.HTTPStatusError as error:
+        return {
+            "status": "unavailable" if error.response.status_code == 404 else "failed",
+            "reason": f"Failed-poll collection report returned HTTP {error.response.status_code}",
+        }
+    except (httpx.RequestError, OSError, ValueError, KeyError, TypeError):
+        return {"status": "failed", "reason": "Could not report failed poll to Lifecycle"}

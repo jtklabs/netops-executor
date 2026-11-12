@@ -2898,3 +2898,8 @@ for the fleet report, preferred downloads, checks and reasons. A manually entere
 airgapped device can have a preferred version without a successful poll. The readiness
 report stays unknown until fresh evidence is available. The platform upgrade workflow
 still performs its own live validation before changes.
+
+A complete SNMP failure also updates collection health for a unique existing
+poller/address record. This path retains last-known inventory and relationships,
+clears current readiness evidence, and never creates or retags a device. The job
+still fails. An unknown or ambiguous target is explicitly skipped.
