@@ -35,6 +35,8 @@
     # Other NETOPS_* settings for service.env, which every run rewrites, for example
     # {NETOPS_STAGING_ADDRESS: 192.0.2.5, NETOPS_SSH_HOST_KEYS: pin}.
     executor_environment: {}
+    # Optional path on the Ansible controller; validated before deployment.
+    executor_discovery_overrides_src: ""
     executor_python: "{{ 'python3.11' if ansible_facts.os_family == 'RedHat' else 'python3' }}"
   pre_tasks:
     - name: Validate supported OS and required secret
@@ -166,6 +168,15 @@
         owner: netopsexecutor
         group: netopsexecutor
         mode: "0600"
+    - name: Deploy discovery identity rules
+      ansible.builtin.copy:
+        src: "{{ executor_discovery_overrides_src }}"
+        dest: /etc/netops-executor/discovery-overrides.yaml
+        owner: netopsexecutor
+        group: netopsexecutor
+        mode: "0640"
+        validate: /opt/netops-executor/.venv/bin/netops-executor check-discovery-overrides %s
+      when: executor_discovery_overrides_src | length > 0
     - name: Configure service environment
       ansible.builtin.copy:
         dest: /etc/netops-executor/service.env
@@ -181,6 +192,9 @@
           NETOPS_DEVICES_FILE=/etc/netops-executor/devices.json
           NETOPS_HTTP_TARGETS_FILE=/etc/netops-executor/http-targets.json
           NETOPS_KNOWN_HOSTS=/etc/netops-executor/known_hosts
+          {% if executor_discovery_overrides_src | length > 0 %}
+          NETOPS_DISCOVERY_OVERRIDES_FILE=/etc/netops-executor/discovery-overrides.yaml
+          {% endif %}
           NETOPS_ROOT_PATH={{ executor_root_path }}
           {% if executor_webhook_url %}
           NETOPS_WEBHOOK_URL={{ executor_webhook_url }}

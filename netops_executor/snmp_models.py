@@ -4,6 +4,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, IPvAnyAddress, field_validator, model_validator
 
+from .discovery_overrides import IdentityRule, ManualFallback
 from .models import Model, Name, ScheduledRequest
 
 EnvName = Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$", max_length=128)]
@@ -77,6 +78,15 @@ class SnmpWalkRequest(ScheduledRequest):
     )
     profile: Name | None = None
     credential_profiles: list[Name] | None = Field(default=None, min_length=1, max_length=10)
+    manual_fallback: ManualFallback = Field(
+        default_factory=ManualFallback,
+        description="Values used only for blank identity fields. Can seed NetBox after a failed poll; no discovered tag is added.",
+    )
+    identity_rules: list[IdentityRule] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Per-job OID/regex identity rules, applied after the deployed YAML rules.",
+    )
     port: int = Field(default=161, ge=1, le=65535)
     timeout: float = Field(default=2, ge=0.1, le=30)
     retries: int = Field(default=1, ge=0, le=5)
@@ -95,6 +105,8 @@ class SnmpWalkRequest(ScheduledRequest):
 
     @model_validator(mode="after")
     def select_profiles(self):
+        if (self.manual_fallback.model_dump(exclude_none=True) or self.identity_rules) and not self.site:
+            raise ValueError("manual_fallback and identity_rules require a discovery site")
         if self.profile and self.credential_profiles:
             raise ValueError("use profile or credential_profiles, not both")
         if self.poller_instance and not self.site:

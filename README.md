@@ -2781,3 +2781,70 @@ rebuild/start with the same project name. New installations may set
 can retain old storage paths through environment variables; update all unit
 paths together if moving them. Reinstall into a clean virtual environment so
 obsolete Python package entry points cannot select old code.
+
+### Discovery identity rules and manual fallback
+
+An SNMP discovery request can supply `manual_fallback` with `name`, `manufacturer`,
+`model`, `platform`, `serial`, and `software_version`. Each value fills only a blank
+reading. It never replaces a value returned by discovery. For example:
+
+```json
+{
+  "device_ip": "192.0.2.58",
+  "site": "Lab",
+  "poller_instance": "checkmk-us",
+  "manual_fallback": {
+    "name": "lab-srx5800",
+    "manufacturer": "Juniper",
+    "model": "SRX5800",
+    "platform": "Junos"
+  }
+}
+```
+
+Even if the SNMP poll fails, a complete manual name/manufacturer/model can seed
+NetBox. The **job remains failed**. A newly seeded device has status Planned,
+the poller tag, a primary host address on an Other interface, and **no discovered
+tag**. A later successful scan updates the same record and adds `discovered`.
+Previously discovered devices keep their historical discovered tag through a
+failed poll. Manual serial/model/software values do not replace existing NetBox
+values. Partial identity uses warnings. No manual-data tag is added; the JSON
+custom field `inventory_field_sources` records each value's origin and
+`inventory_poll_status` distinguishes polled/unpolled. They are also in the job's
+discovery result. Running software supplied manually is reported with source
+`manual`, not `snmp`.
+
+For recurring vendor quirks, copy `discovery-overrides.example.yaml` beside the
+executor configuration and set `NETOPS_DISCOVERY_OVERRIDES_FILE` to its path.
+Mount it under `/config` for Docker, or deploy it under `/etc/netops-executor` for
+systemd. Validate before rollout:
+
+```sh
+netops-executor check-discovery-overrides /etc/netops-executor/discovery-overrides.yaml
+```
+
+The file is reloaded for every job, so changing a rule requires no code release
+or restart. Rules are evaluated in file order, then request `identity_rules`,
+then `manual_fallback`. All match conditions in a rule must hold. Matches support
+`sys_object_id_prefix` (OID arc boundaries), `manufacturer`, `platform`, `network`,
+`sys_descr_regex`, and `hostname_regex`. A rule must have at least one condition.
+`fields` accepts the same six identity fields. Each reader specifies exactly one
+of `value` (manual provenance), `source` (`sysDescr`, `sysName`, `sysObjectID`), or
+numeric `oid`. An OID uses GET by default; `walk: true` searches at most 256 rows.
+An optional regex extracts `group` (number or name, default 1). Regex evaluation
+has a time limit and input/output limits. `mode: fallback` fills blanks;
+`mode: replace` explicitly replaces a reading. A missed regex or failed optional
+read preserves the previous value and records a diagnostic. An invalid reloaded
+file is reported as a warning; built-in discovery and manual fallback still run.
+The job records applied rule IDs and the YAML SHA-256 for troubleshooting.
+
+Your caller can send the same rule structure as `identity_rules` (up to 20 rules)
+when it already knows an alternate OID and parser. These are independent reads,
+so an OID does not also need to be listed in `oids`. A subtree OID in `oids` alone
+continues to be raw walk output and does not imply which identity field to fill.
+The SRX5800 example illustrates the schema; use the OID and regex verified from
+your device rather than assuming every SRX5800 exposes the same layout.
+
+For Ansible, set `executor_discovery_overrides_src` to the controller's YAML path.
+The playbook validates it with the installed CLI, copies it to
+`/etc/netops-executor/discovery-overrides.yaml`, and writes the environment setting.
