@@ -1,0 +1,27 @@
+version: 1
+rules:
+  # Illustrative parser: choose the OID and expression from an actual SRX5800 walk.
+  # This matches Juniper devices in a site-specific network and extracts a model
+  # from sysDescr only when normal discovery did not report a model.
+  - id: juniper-srx-from-description
+    match:
+      sys_object_id_prefix: '1.3.6.1.4.1.2636'
+      sys_descr_regex: '(?i)\bSRX5800\b'
+    mode: fallback
+    fields:
+      model:
+        source: sysDescr
+        regex: '(?i)\b(SRX5800)\b'
+        group: 1
+
+  # To extract a model from a vendor subtree instead, use this shape:
+  # - id: custom-model-location
+  #   match:
+  #     network: '192.0.2.0/24'
+  #     manufacturer: Juniper
+  #   fields:
+  #     model:
+  #       oid: '1.3.6.1.2.1.47.1.1.1.1.2'
+  #       walk: true
+  #       regex: '(?i)\b(SRX5800)\b'
+  #       group: 1

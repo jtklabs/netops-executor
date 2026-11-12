@@ -153,8 +153,14 @@ def extract(pattern, description):
     return next((value.rstrip(",.") for value in match.groups() if value), "") if match else ""
 
 
-async def collect_identity(get, chassis_index, first_value):
+async def collect_identity(get, chassis_index, first_value, system_values=None):
     system = await get([SYS_NAME, SYS_DESCR, SYS_OBJECT_ID])
+    if system_values is not None:
+        system_values.update(
+            sysDescr=system.get(SYS_DESCR, ""),
+            sysName=system.get(SYS_NAME, ""),
+            sysObjectID=system.get(SYS_OBJECT_ID, ""),
+        )
     description = system.get(SYS_DESCR, "")
     enterprise = system.get(SYS_OBJECT_ID, "").removeprefix(ENTERPRISE).split(".", 1)[0]
     vendor = (

@@ -28,6 +28,8 @@ def parser():
         "--queue", help="Exact comma-separated claim order (default: priority,upgrade,scheduled)"
     )
     worker.add_argument("--instance", help="systemd instance name: <pool>-<n>, or a number for no pool")
+    overrides = commands.add_parser("check-discovery-overrides")
+    overrides.add_argument("path", type=Path)
     commands.add_parser("devices")
     commands.add_parser("jobs")
     commands.add_parser("credentials")
@@ -134,6 +136,15 @@ def parser():
 
 def main():
     args = parser().parse_args()
+    if args.command == "check-discovery-overrides":
+        from .discovery_overrides import load_rules
+
+        try:
+            rules, digest = load_rules(args.path)
+        except ValueError as error:
+            parser().error(str(error))
+        print(json.dumps({"valid": True, "rules": len(rules), "sha256": digest}))
+        return
     os.environ["NETOPS_ENV_FILE"] = args.env_file
     load_dotenv(args.env_file)
     args.url = args.url or env("NETOPS_API_URL", "http://127.0.0.1:8080")

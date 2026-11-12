@@ -15,6 +15,8 @@ SOFTWARE_REPORT = "plugins/refresh/device-software/report/"
 DISCOVERED_TAG = "discovered"
 LEGACY_DISCOVERY_ROLE = "snmp-discovered"
 WIRELESS_CONTROLLER = "wireless_controller"
+FIELD_SOURCES = "inventory_field_sources"
+POLL_STATUS = "inventory_poll_status"
 ACCESS_POINT_ROLE = "Wireless AP"
 
 # Platforms that only ever run one kind of appliance.
@@ -180,7 +182,7 @@ class NetBoxDiscovery:
             or "dcim.device" not in field["object_types"]
             or (kind == "object" and field.get("related_object_type") != "dcim.device")
         ):
-            noun = "device object" if kind == "object" else "device text"
+            noun = f"device {kind}"
             raise SyncError(f"NetBox custom field {name} must be a {noun} field")
 
     def device_type(self, manufacturer, model):
@@ -279,7 +281,14 @@ class NetBoxDiscovery:
                 }
             except (httpx.RequestError, OSError, ValueError, TypeError, KeyError):
                 facts["stack_inventory"] = {"status": "failed", "error": "Could not sync the NetBox stack"}
-        if facts["software_version"] and (device.get("platform") or facts.get("platform")):
+        if (
+            facts["software_version"]
+            and (device.get("platform") or facts.get("platform"))
+            and (
+                facts.get("field_sources", {}).get("software_version") not in {"manual", "netbox-existing"}
+                or action == "created"
+            )
+        ):
             facts["software_inventory"] = self.report_software(device["id"], facts)
         if facts.get("access_points") is not None:
             try:
@@ -816,7 +825,13 @@ class NetBoxDiscovery:
         }
 
     def report_software(self, device_id, facts):
-        data = {"device": device_id, "version": facts["software_version"], "source": "snmp"}
+        data = {
+            "device": device_id,
+            "version": facts["software_version"],
+            "source": "manual"
+            if facts.get("field_sources", {}).get("software_version") == "manual"
+            else "snmp",
+        }
         if collected_at := facts.get("collected_at"):
             data["collected_at"] = collected_at
         try:
@@ -951,6 +966,22 @@ class NetBoxDiscovery:
         path = "dcim/devices/"
         name = facts["name"]
         current = self.device(name, address, tag, discovered)
+        sources = dict(facts.get("field_sources", {}))
+        preserve_model = bool(current and sources.get("model") == "manual")
+        previous_sources = (current or {}).get("custom_fields", {}).get(FIELD_SOURCES) or {}
+        if current:
+            if sources.get("serial") == "manual" and current.get("serial"):
+                facts["serial"] = current["serial"]
+                sources["serial"] = previous_sources.get("serial", "netbox-existing")
+            if sources.get("model") == "manual":
+                sources["model"] = previous_sources.get("model", "netbox-existing")
+            if sources.get("software_version") == "manual" and current.get("custom_fields", {}).get(
+                SOFTWARE_VERSION
+            ):
+                facts["software_version"] = current["custom_fields"][SOFTWARE_VERSION]
+                sources["software_version"] = previous_sources.get("software_version", "netbox-existing")
+        if "field_sources" in facts:
+            facts["field_sources"] = sources
         members = facts.get("stack_members")
         existing_stack = current and current.get("virtual_chassis") and facts["manufacturer"] == "Cisco"
         if members:
@@ -966,7 +997,9 @@ class NetBoxDiscovery:
             facts["serial"] = anchor["serial"]
             if anchor["role"] != "active":
                 facts["software_version"] = anchor["software_version"]
-        if existing_stack and not members:
+        if preserve_model:
+            device_type = current["device_type"]
+        elif existing_stack and not members:
             # Without StackWise membership, the first ENTITY-MIB chassis might
             # be another switch. Keep the established hardware identity.
             device_type = current["device_type"]
@@ -974,6 +1007,21 @@ class NetBoxDiscovery:
             manufacturer = self.named_object("dcim/manufacturers/", facts["manufacturer"])
             device_type = self.device_type(manufacturer, facts["model"])
         fields = {DISCOVERY_IP: address}
+        if "field_sources" in facts:
+            self.custom_field(
+                FIELD_SOURCES,
+                "Inventory field sources",
+                "Origin of the most recent value for each inventory field.",
+                "json",
+            )
+            self.custom_field(
+                POLL_STATUS,
+                "Inventory poll status",
+                "polled or unpolled; manual fallback does not imply a successful poll.",
+            )
+            previous_sources = (current or {}).get("custom_fields", {}).get(FIELD_SOURCES) or {}
+            fields[FIELD_SOURCES] = {**previous_sources, **facts["field_sources"]}
+            fields[POLL_STATUS] = "polled" if facts.get("polled", True) else "unpolled"
         data = {"device_type": device_type["id"], "site": site["id"]}
         if facts["serial"] and (not existing_stack or members):
             data["serial"] = facts["serial"]
@@ -991,8 +1039,8 @@ class NetBoxDiscovery:
                         **data,
                         "name": name,
                         "role": role["id"],
-                        "status": "active",
-                        "tags": [tag["id"], discovered["id"]],
+                        "status": "active" if facts.get("polled", True) else "planned",
+                        "tags": [tag["id"]] + ([discovered["id"]] if facts.get("polled", True) else []),
                         "custom_fields": fields,
                     },
                 )
@@ -1024,7 +1072,11 @@ class NetBoxDiscovery:
         if any(current["custom_fields"].get(key) != value for key, value in fields.items()):
             data["custom_fields"] = fields
         tag_ids = [tag["id"]]
-        if current["role"]["slug"] == LEGACY_DISCOVERY_ROLE:
+        if current.get("custom_fields", {}).get(POLL_STATUS) == "unpolled" and facts.get("polled", True):
+            tag_ids.append(discovered["id"])
+            if (current.get("status") or {}).get("value") == "planned":
+                data["status"] = "active"
+        if current["role"]["slug"] == LEGACY_DISCOVERY_ROLE and facts.get("polled", True):
             data["role"] = self.named_object("dcim/device-roles/", discovery_role(facts))["id"]
             tag_ids.append(self.named_object("extras/tags/", DISCOVERED_TAG)["id"])
         existing_tags = {existing["id"] for existing in current["tags"]}

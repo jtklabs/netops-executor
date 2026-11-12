@@ -14,6 +14,7 @@ from pysnmp.proto import rfc1902, rfc1905
 
 from .config import Device
 from .credentials import AuthenticationRejected, Selector, Vault
+from .discovery_overrides import apply_manual_fallback, apply_rules, load_rules
 from .f5_operations import license_details
 from .netbox_discovery import SyncError, sync_device, sync_licenses
 from .snmp_address import collect_polled_address
@@ -137,8 +138,14 @@ class SnmpRunner:
             asyncio.run(self.walk())
             success = not self.result.get("error") and self.reads_succeeded()
             status = "succeeded" if success else "failed"
-            if self.request.site and success:
-                status = self.sync_inventory()
+            if self.request.site:
+                if not success and self.request.manual_fallback.model_dump(exclude_none=True):
+                    self.seed_manual_inventory()
+                if "discovery" in self.result and (
+                    success or self.request.manual_fallback.model_dump(exclude_none=True)
+                ):
+                    synchronized = self.sync_inventory()
+                    status = synchronized if success else "failed"
             self.record("snmp_finished")
             self.store.finish(self.job["id"], self.worker, status)
         except LostOwnership:
@@ -312,7 +319,8 @@ class SnmpRunner:
         async def chassis_index():
             return await first_value(ENTITY_CLASS, expected="3")
 
-        facts = await collect_identity(get, chassis_index, first_value)
+        system_values = {}
+        facts = await collect_identity(get, chassis_index, first_value, system_values)
         if facts["manufacturer"] == "Cisco":
             try:
                 members = await collect_stack(get, walk_column)
@@ -338,6 +346,34 @@ class SnmpRunner:
                     "status": "failed",
                     "error": "Aruba access point table read failed",
                 }
+
+        self.result["discovery"] = {
+            **facts,
+            "site": self.request.site,
+            "poller_instance": self.request.poller_instance,
+            "address": str(self.request.device_ip),
+            "polled": self.responded,
+        }
+        try:
+            rules, digest = load_rules(self.settings.discovery_overrides_file)
+        except ValueError:
+            facts["identity_rules_config"] = {
+                "status": "failed",
+                "reason": "Invalid discovery overrides file; validate it before the next scan",
+            }
+            rules, digest = [], None
+        await apply_rules(
+            facts,
+            system_values,
+            str(self.request.device_ip),
+            get,
+            walk_column,
+            [*rules, *self.request.identity_rules],
+        )
+        if digest:
+            facts["identity_rules_sha256"] = digest
+        apply_manual_fallback(facts, self.request.manual_fallback)
+        facts["polled"] = True
 
         address_queries = []
 
@@ -400,13 +436,37 @@ class SnmpRunner:
             "management_ip_lookup": address_lookup,
         }
 
+    def seed_manual_inventory(self):
+        # Keep poll failure truthful while allowing a complete manual identity to seed inventory.
+        facts = {
+            key: "" for key in ("name", "manufacturer", "model", "platform", "serial", "software_version")
+        }
+        facts.update(self.result.get("discovery", {}))
+        apply_manual_fallback(facts, self.request.manual_fallback)
+        facts.update(
+            polled=False,
+            collected_at=datetime.now(timezone.utc).isoformat(),
+            address=str(self.request.device_ip),
+            site=self.request.site,
+            poller_instance=self.request.poller_instance,
+        )
+        facts["management_ip"] = {
+            "interface": "discovery-management",
+            "address": f"{self.request.device_ip}/{32 if self.request.device_ip.version == 4 else 128}",
+            "dhcp": False,
+            "prefix_source": "host",
+            "interface_source": "placeholder",
+        }
+        facts["poll_status"] = "failed"
+        self.result["discovery"] = facts
+
     def sync_inventory(self):
         discovery = self.result["discovery"]
 
         def checkpoint():
             self.store.checkpoint(self.job["id"], self.worker)
 
-        if discovery["manufacturer"] == "F5":
+        if discovery["manufacturer"] == "F5" and discovery.get("polled", True):
             serial, discovery["license_lookup"] = self.read_f5_license_serial(checkpoint)
             virtual_edition = re.search(r"\bBIG-IP\s+(?:Virtual Edition|VE)\b", discovery["model"], re.I)
             if serial and virtual_edition:
@@ -462,7 +522,16 @@ class SnmpRunner:
                     "license_inventory",
                 )
             )
-            return "completed_with_warnings" if missing or optional_failure else "succeeded"
+            manual = [key for key, source in discovery.get("field_sources", {}).items() if source == "manual"]
+            discovery["manual_fields"] = manual
+            rule_failure = discovery.get("identity_rules_config", {}).get("status") == "failed" or any(
+                row["status"] in {"failed", "missing"} for row in discovery.get("identity_rules", [])
+            )
+            return (
+                "completed_with_warnings"
+                if missing or optional_failure or manual or rule_failure
+                else "succeeded"
+            )
         return "failed"
 
     def read_f5_license_serial(self, checkpoint):

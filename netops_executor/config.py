@@ -115,6 +115,7 @@ class Settings:
     netbox_token: str | None = field(default=None, repr=False)
     netbox_ca_file: Path | None = None
     poller_instance: str | None = None
+    discovery_overrides_file: Path | None = None
 
     def device(self, identifier):
         if identifier in self.devices:
@@ -151,6 +152,11 @@ class Settings:
             if len({p.id for p in profiles}) != len(profiles):
                 raise ValueError("duplicate SNMP profile IDs")
             result.snmp_profiles = {p.id: p for p in profiles}
+        if env("NETOPS_DISCOVERY_OVERRIDES_FILE"):
+            from .discovery_overrides import load_rules
+
+            result.discovery_overrides_file = Path(env("NETOPS_DISCOVERY_OVERRIDES_FILE"))
+            load_rules(result.discovery_overrides_file)
         result.netbox_url = env("NETOPS_NETBOX_URL") or None
         result.netbox_token = env("NETOPS_NETBOX_TOKEN") or None
         if result.netbox_url:
