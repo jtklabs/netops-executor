@@ -1,0 +1,629 @@
+{
+  "uid": "netops-executor-jobs",
+  "title": "NetOps Executor jobs",
+  "tags": [
+    "netops",
+    "executor"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "refresh": 1
+      },
+      {
+        "name": "poller",
+        "label": "Poller",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "$datasource"
+        },
+        "query": {
+          "query": "label_values(netops_executor_build_info, poller)",
+          "refId": "poller"
+        },
+        "definition": "label_values(netops_executor_build_info, poller)",
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "$datasource"
+        },
+        "query": {
+          "query": "label_values(netops_executor_build_info{poller=~\"$poller\"}, instance)",
+          "refId": "instance"
+        },
+        "definition": "label_values(netops_executor_build_info{poller=~\"$poller\"}, instance)",
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "queue",
+        "label": "Queue",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "$datasource"
+        },
+        "query": {
+          "query": "label_values(netops_queue_jobs{poller=~\"$poller\",instance=~\"$instance\"}, queue)",
+          "refId": "queue"
+        },
+        "definition": "label_values(netops_queue_jobs{poller=~\"$poller\",instance=~\"$instance\"}, queue)",
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "job_type",
+        "label": "Job Type",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "$datasource"
+        },
+        "query": {
+          "query": "label_values(netops_jobs_submitted_total{poller=~\"$poller\",instance=~\"$instance\"}, job_type)",
+          "refId": "job_type"
+        },
+        "definition": "label_values(netops_jobs_submitted_total{poller=~\"$poller\",instance=~\"$instance\"}, job_type)",
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "result",
+        "label": "Result",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "$datasource"
+        },
+        "query": {
+          "query": "label_values(netops_jobs_completed_total{poller=~\"$poller\",instance=~\"$instance\"}, result)",
+          "refId": "result"
+        },
+        "definition": "label_values(netops_jobs_completed_total{poller=~\"$poller\",instance=~\"$instance\"}, result)",
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Completed jobs in selected range",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(netops_jobs_completed_total{poller=~\"$poller\",instance=~\"$instance\",queue=~\"$queue\",job_type=~\"$job_type\",result=~\"$result\"}[$__range])) or vector(0)",
+          "legendFormat": "{{queue}} {{job_type}}",
+          "range": true,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "\u2014"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "title": "Successful completions",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(netops_jobs_completed_total{poller=~\"$poller\",instance=~\"$instance\",queue=~\"$queue\",job_type=~\"$job_type\",result=~\"pass|warning\"}[$__range])) / sum(increase(netops_jobs_completed_total{poller=~\"$poller\",instance=~\"$instance\",queue=~\"$queue\",job_type=~\"$job_type\",result=~\"pass|warning|fail\"}[$__range]))",
+          "legendFormat": "{{queue}} {{job_type}}",
+          "range": true,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "\u2014"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "title": "Running jobs",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(netops_jobs_current{poller=~\"$poller\",instance=~\"$instance\",queue=~\"$queue\",job_type=~\"$job_type\",status=\"running\"}) or vector(0)",
+          "legendFormat": "{{queue}} {{job_type}}",
+          "range": true,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "\u2014"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Online workers",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(netops_workers_online{poller=~\"$poller\",instance=~\"$instance\",queue=~\"$queue\"}) or vector(0)",
+          "legendFormat": "{{queue}} {{job_type}}",
+          "range": true,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "\u2014"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "title": "Completions per minute by result",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "60 * sum by (result) (rate(netops_jobs_completed_total{poller=~\"$poller\",instance=~\"$instance\",queue=~\"$queue\",job_type=~\"$job_type\",result=~\"$result\"}[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "\u2014"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Completions per minute by queue and type",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "60 * sum by (queue,job_type) (rate(netops_jobs_completed_total{poller=~\"$poller\",instance=~\"$instance\",queue=~\"$queue\",job_type=~\"$job_type\",result=~\"$result\"}[$__rate_interval]))",
+          "legendFormat": "{{queue}} {{job_type}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "\u2014"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Queue backlog",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (queue,state) (netops_queue_jobs{poller=~\"$poller\",instance=~\"$instance\",queue=~\"$queue\"})",
+          "legendFormat": "{{queue}} {{state}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "\u2014"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Oldest due queue wait",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 13,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (queue) (netops_queue_oldest_due_wait_seconds{poller=~\"$poller\",instance=~\"$instance\",queue=~\"$queue\"})",
+          "legendFormat": "{{queue}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "\u2014"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "95th percentile job duration",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (queue,le) (rate(netops_job_duration_seconds_bucket{poller=~\"$poller\",instance=~\"$instance\",queue=~\"$queue\",job_type=~\"$job_type\"}[$__rate_interval])))",
+          "legendFormat": "{{queue}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "\u2014"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "95th percentile queue wait",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (queue,le) (rate(netops_job_queue_wait_seconds_bucket{poller=~\"$poller\",instance=~\"$instance\",queue=~\"$queue\",job_type=~\"$job_type\"}[$__rate_interval])))",
+          "legendFormat": "{{queue}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "\u2014"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "Workers online by pool and release",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (queue,version) (netops_workers_online{poller=~\"$poller\",instance=~\"$instance\",queue=~\"$queue\"})",
+          "legendFormat": "{{queue}} {{version}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "\u2014"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "title": "Longest running job",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 29,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (queue,job_type) (netops_running_job_age_seconds{poller=~\"$poller\",instance=~\"$instance\",queue=~\"$queue\",job_type=~\"$job_type\"})",
+          "legendFormat": "{{queue}} {{job_type}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "\u2014"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    }
+  ]
+}

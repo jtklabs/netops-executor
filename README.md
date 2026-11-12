@@ -2505,6 +2505,69 @@ any existing value. A failed NetBox sync leaves the SNMP results available. `res
 reports the Lifecycle write separately. A missing Lifecycle endpoint is optional.
 Other reporting failures finish with warnings after the device inventory sync.
 
+## Prometheus and Grafana job metrics
+
+The authenticated `GET /metrics` endpoint exposes Prometheus metrics. Use the
+executor's bearer API token when scraping it. Set `NETOPS_POLLER_INSTANCE` to the
+collecting instance name, such as `checkmk-us`. Prometheus also supplies its
+normal `instance` target label.
+
+Import `deploy/grafana/netops-executor.json` into Grafana and select a Prometheus
+data source. It includes filters for poller, instance, queue, job type, and result,
+with charts for completion rates, backlog, queue wait, runtime, running-job age,
+and worker availability by release. Duration and queue-wait charts use the poller,
+instance, queue, and job-type filters.
+
+Use `deploy/prometheus/netops-executor.yml` as a scrape example. Replace the
+target hostname and point `credentials_file` at the executor token file on the
+Prometheus server. If the executor is published under a prefix, set
+`metrics_path` to that prefix followed by `/metrics`, such as
+`/netops-executor/metrics`. Historical charts become available as Prometheus
+collects samples.
+
+| Metric | Meaning |
+|---|---|
+| `netops_jobs_submitted_total` | Unique submitted jobs, labelled by their original queue and job type |
+| `netops_jobs_completed_total` | Unique jobs reaching their first terminal result, labelled by completion queue, job type, status and result |
+| `netops_jobs_current` | Current queued, running, review and recovery counts |
+| `netops_job_duration_seconds` | Histogram from admitted start to first completion, including review time |
+| `netops_job_queue_wait_seconds` | Histogram of wait before admitted start, excluding a future scheduled start |
+| `netops_queue_jobs` | Due and future-scheduled backlog |
+| `netops_queue_oldest_due_wait_seconds` | Longest due queue wait |
+| `netops_running_job_age_seconds` | Longest running job age per queue and type |
+| `netops_workers_online`, `netops_workers_busy` | Online and busy workers by primary pool and running release |
+| `netops_executor_build_info` | API release and configured poller identity |
+
+Results distinguish `pass`, `warning`, `fail`, `cancelled`, `expired`,
+`manual`, and `resolved`. A job entering recovery is counted as a failure at
+that time. Its later operator resolution keeps that original completion result.
+A manually waived completion is counted as manual. Jobs cancelled or expired
+before starting have completion counts and no runtime observation.
+
+The observations live in the existing SQLite database, so counters survive API
+and worker restarts and remain stable across repeated scrapes. They also retain
+counts when an old job record is removed. Existing jobs are backfilled once from
+their recorded queue, status, start and update timestamps. For those older jobs,
+the completion timestamp is the recorded latest update and status at installation.
+The export contains aggregate labels and values.
+
+Example queries for Grafana use PromQL.
+
+```promql
+sum by (queue, job_type, result) (
+  increase(netops_jobs_completed_total[$__range])
+)
+
+sum by (queue, state) (netops_queue_jobs)
+
+histogram_quantile(
+  0.95,
+  sum by (queue, le) (
+    rate(netops_job_duration_seconds_bucket[$__rate_interval])
+  )
+)
+```
+
 ## Deployment and CLI
 
 Production remotes are native installs on **Ubuntu 24.04** or **RHEL 9**, run by

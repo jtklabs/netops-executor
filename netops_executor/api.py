@@ -8,7 +8,7 @@ from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from httpx import HTTPError
@@ -24,6 +24,7 @@ from .fortigate_models import FortigateBatch, FortigateUpgradeRequest
 from .ios_models import IosBatch, IosUpgradeRequest
 from .iosxe_config import compare as compare_configs
 from .iosxe_models import ConfigComparison, IosxeBatch, IosxeUpgradeRequest
+from .metrics import render_metrics
 from .models import Email, JobRequest, Model, Name, Queue, RecoveryResolution, RollbackRequest
 from .notify import EmailSender, Permanent
 from .opengear_models import OpengearBatch, OpengearUpgradeRequest
@@ -400,6 +401,15 @@ def create_app(settings=None):
     @app.get("/healthz")
     def healthz():
         return {"status": "ok", "api_version": "v1", "version": __version__}
+
+    @app.get("/metrics", dependencies=authenticated, tags=["Metrics"], response_class=Response)
+    def metrics():
+        from prometheus_client import CONTENT_TYPE_LATEST
+
+        return Response(
+            render_metrics(store, settings),
+            headers={"Content-Type": CONTENT_TYPE_LATEST, "Cache-Control": "no-store"},
+        )
 
     @app.get("/api/v1/devices", dependencies=authenticated)
     def devices() -> list[dict]:
