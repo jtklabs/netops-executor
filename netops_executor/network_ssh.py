@@ -38,11 +38,21 @@ class GuardedChannel(SSHChannel):
         self.owner.output_bytes += len(value.encode())
         if self.owner.output_bytes > 32 * 1024 * 1024:
             raise DeviceError("network CLI output exceeds limit")
+        if self.owner.read_only_session:
+            tail = self.owner.pager_tail + value
+            tail = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", tail).rstrip(" \r\n\b")
+            if tail.endswith(("--More--", "-- More --")):
+                self.owner.driver.write_channel(" ")
+                self.owner.pager_tail = ""
+            else:
+                self.owner.pager_tail = tail[-64:]
         return value
 
 
 class NetworkSSH(SSH):
-    def __init__(self, *args, device_type, **kwargs):
+    def __init__(self, *args, device_type, read_only_session=False, **kwargs):
+        self.read_only_session = read_only_session
+        self.pager_tail = ""
         self.driver = None
         self.device_type = device_type
         self.operation_deadline = None
@@ -91,6 +101,7 @@ class NetworkSSH(SSH):
                 return write(value)
 
             driver.read_channel, driver.write_channel = guarded_read, guarded_write
+            self.prepare_driver(driver)
             driver.session_preparation()
             return driver
         except Exception:
@@ -99,9 +110,24 @@ class NetworkSSH(SSH):
         finally:
             self.operation_deadline = None
 
+    def prepare_driver(self, driver):
+        if not self.read_only_session:
+            return
+        if self.device_type == "fortinet":
+            # FortiOS paging is a persistent console setting. Read-only discovery
+            # advances the pager instead of changing and later restoring that setting.
+            driver.disable_paging = lambda *args, **kwargs: ""
+            driver.cleanup = lambda *args, **kwargs: None
+        if self.device_type == "terminal_server":
+            # Generic drivers have no configuration-mode model. Do not send their
+            # default exit command to an appliance's operational CLI.
+            driver.exit_config_mode = lambda *args, **kwargs: ""
+            driver.session_preparation = lambda: driver.set_base_prompt()
+
     def execute(self, command, timeout=120, *, mode="exec", enable=False):
         driver = self.connect()
         self.output_bytes = 0
+        self.pager_tail = ""
         self.operation_deadline = time.monotonic() + timeout
         try:
             self.check()
@@ -118,7 +144,9 @@ class NetworkSSH(SSH):
                 output = driver.send_command(command, read_timeout=timeout, cmd_verify=True)
             self.check()
             return {
-                "stdout": self.selector.redact(output),
+                "stdout": self.selector.redact(re.sub(r"-- ?More ?--", "", output))
+                if self.read_only_session
+                else self.selector.redact(output),
                 "stderr": "",
                 "exit_code": None,
                 "cli_error": bool(CLI_ERROR.search(output)),

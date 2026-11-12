@@ -234,3 +234,64 @@ def test_failed_poll_updates_existing_health_without_creating_or_changing_invent
         assert result["collection_status"] == "failed"
     assert sum(r.method == "POST" for r in calls) == int(matched)
     assert not any(r.method in ("PUT", "PATCH", "DELETE") for r in calls)
+
+
+def test_read_only_fortinet_preparation_never_changes_console_settings(settings):
+    from types import SimpleNamespace
+
+    from netops_executor.config import Device
+    from netops_executor.network_ssh import NetworkSSH
+
+    commands = []
+    driver = SimpleNamespace(
+        disable_paging=lambda: commands.append("set output standard"),
+        cleanup=lambda: commands.append("set output more"),
+    )
+    ssh = NetworkSSH(
+        settings, Device(id="forti", host="192.0.2.1"), device_type="fortinet", read_only_session=True
+    )
+    ssh.prepare_driver(driver)
+    driver.disable_paging()
+    driver.cleanup()
+    assert commands == []
+
+
+def test_read_only_pager_advances_split_prompt_without_configuration_commands():
+    from types import SimpleNamespace
+
+    from netops_executor.network_ssh import GuardedChannel
+
+    writes = []
+    chunks = iter([b"license row\r\n--Mo", b"re--"])
+    connection = SimpleNamespace(recv_ready=lambda: True, recv=lambda count: next(chunks))
+    owner = SimpleNamespace(
+        check=lambda: None,
+        output_bytes=0,
+        read_only_session=True,
+        pager_tail="",
+        driver=SimpleNamespace(write_channel=writes.append),
+    )
+    channel = GuardedChannel(owner, conn=connection, encoding="utf-8")
+    channel.read_buffer()
+    assert writes == []
+    channel.read_buffer()
+    assert writes == [" "]
+
+
+def test_read_only_generic_appliance_does_not_exit_the_login_cli(settings):
+    from types import SimpleNamespace
+
+    from netops_executor.config import Device
+    from netops_executor.network_ssh import NetworkSSH
+
+    commands = []
+    driver = SimpleNamespace(
+        exit_config_mode=lambda: commands.append("exit"), set_base_prompt=lambda: commands.append("prompt")
+    )
+    ssh = NetworkSSH(
+        settings, Device(id="nios", host="192.0.2.1"), device_type="terminal_server", read_only_session=True
+    )
+    ssh.prepare_driver(driver)
+    driver.session_preparation()
+    driver.exit_config_mode()
+    assert commands == ["prompt"]

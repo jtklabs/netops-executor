@@ -158,7 +158,9 @@ def collect_enrichment(
         ssh = (
             SSH(settings, target, guard=checkpoint, audit=audit)
             if vendor == "F5"
-            else NetworkSSH(settings, target, guard=checkpoint, audit=audit, device_type=driver)
+            else NetworkSSH(
+                settings, target, guard=checkpoint, audit=audit, device_type=driver, read_only_session=True
+            )
         )
 
         def read(command):
