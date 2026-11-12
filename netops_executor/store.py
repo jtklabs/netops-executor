@@ -174,6 +174,9 @@ class Store:
             for column in ("queues", "version"):
                 if column not in worker_columns:
                     db.execute(f"ALTER TABLE workers ADD COLUMN {column} TEXT")
+            from .metrics import initialize_metrics
+
+            initialize_metrics(db)
             if "digest" not in {row["name"] for row in db.execute("PRAGMA table_info(job_secrets)")}:
                 db.execute("ALTER TABLE job_secrets ADD COLUMN digest TEXT")
             # A job password is needed only while the job can run or resume after a review gate.
@@ -645,14 +648,12 @@ class Store:
     def finish(self, job, worker, status, retain_lock=False):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            control = db.execute("SELECT waive FROM controls WHERE job=?", (job,)).fetchone()
+            final_status = "manually_completed" if control and control[0] else status
             changed = db.execute(
                 "UPDATE jobs SET status=?,updated=? WHERE id=? AND worker=? AND status='running'",
-                (status, time.time(), job, worker),
+                (final_status, time.time(), job, worker),
             ).rowcount
-            if changed:
-                control = db.execute("SELECT waive FROM controls WHERE job=?", (job,)).fetchone()
-                if control and control[0]:
-                    db.execute("UPDATE jobs SET status='manually_completed' WHERE id=?", (job,))
             if changed and status not in ("recovery_required", "needs_review") and not retain_lock:
                 db.execute("DELETE FROM locks WHERE job=?", (job,))
                 db.execute("DELETE FROM resources WHERE job=?", (job,))
