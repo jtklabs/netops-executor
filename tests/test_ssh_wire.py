@@ -217,6 +217,7 @@ def test_other_tmsh_commands_keep_remote_output_out_of_errors(settings, monkeypa
         "execute",
         lambda *args: {"exit_code": 1, "stdout": "sensitive configuration", "stderr": "denied"},
     )
+    monkeypatch.setattr(ssh, "detect_f5_shell", lambda timeout: "bash")
     with pytest.raises(DeviceError) as raised:
         ssh.tmsh("list /auth user admin", secret=secret)
     assert raised.value.diagnostics is None

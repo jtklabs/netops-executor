@@ -17,6 +17,19 @@ ROOT = "1.3.6.1.2.1.1"
 OTHER = "1.3.6.1.2.1.2"
 
 
+@pytest.fixture(autouse=True)
+def lifecycle_operations_backend(monkeypatch):
+    from netops_executor import snmp
+
+    monkeypatch.setattr(snmp, "preferred_image", lambda *args: None)
+    monkeypatch.setattr(snmp, "report_observation", lambda *args: {"status": "success"})
+    monkeypatch.setattr(
+        snmp,
+        "collect_enrichment",
+        lambda *args, **kwargs: {"components": {}, "readiness": {}, "relationships": []},
+    )
+
+
 @pytest.fixture
 def client(settings):
     settings.snmp_profiles = {

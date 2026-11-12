@@ -19,6 +19,19 @@ Active Modules
 """
 
 
+@pytest.fixture(autouse=True)
+def lifecycle_operations_backend(monkeypatch):
+    from netops_executor import snmp
+
+    monkeypatch.setattr(snmp, "preferred_image", lambda *args: None)
+    monkeypatch.setattr(snmp, "report_observation", lambda *args: {"status": "success"})
+    monkeypatch.setattr(
+        snmp,
+        "collect_enrichment",
+        lambda *args, **kwargs: {"components": {}, "readiness": {}, "relationships": []},
+    )
+
+
 def observation(output=OUTPUT):
     class Device:
         def tmsh(self, command, timeout):

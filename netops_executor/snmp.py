@@ -16,10 +16,13 @@ from .config import Device
 from .credentials import AuthenticationRejected, Selector, Vault
 from .discovery_overrides import apply_manual_fallback, apply_rules, load_rules
 from .f5_operations import license_details
+from .inventory_enrichment import collect_enrichment
 from .netbox_discovery import SyncError, sync_device, sync_licenses
+from .netbox_operations import preferred_image, report_observation, sync_observed_licenses
 from .snmp_address import collect_polled_address
 from .snmp_identity import ENTITY_CLASS, collect_identity, text
 from .snmp_models import SnmpWalkRequest
+from .snmp_neighbors import collect_neighbors
 from .snmp_stack import StackInventoryError, collect_stack
 from .snmp_wireless import AccessPointInventoryError, collect_access_points
 from .ssh import SSH, DeviceError
@@ -374,6 +377,19 @@ class SnmpRunner:
             facts["identity_rules_sha256"] = digest
         apply_manual_fallback(facts, self.request.manual_fallback)
         facts["polled"] = True
+        if self.request.collect_neighbors:
+            try:
+                facts["neighbors"] = await collect_neighbors(
+                    walk_column, cisco=facts["manufacturer"] == "Cisco"
+                )
+                facts["neighbor_inventory"] = {"status": "success"}
+            except WalkError:
+                facts["neighbor_inventory"] = {
+                    "status": "failed",
+                    "reason": "Neighbor tables unavailable or exceeded limit",
+                }
+        else:
+            facts["neighbor_inventory"] = {"status": "skipped", "reason": "Neighbor collection disabled"}
 
         address_queries = []
 
@@ -512,14 +528,58 @@ class SnmpRunner:
                 discovery["license_inventory"] = sync_licenses(
                     self.settings, device_id, discovery["poller_instance"], self._f5_license, checkpoint
                 )
-            optional_failure = any(
-                discovery.get(field, {}).get("status") in {"failed", "warning"}
-                for field in (
-                    "software_inventory",
-                    "stack_inventory",
-                    "access_point_inventory",
-                    "license_lookup",
-                    "license_inventory",
+            enrichment = {
+                "components": {
+                    name: {"status": "skipped", "reason": "SSH enrichment disabled"}
+                    for name in ("ha", "readiness", "licenses")
+                }
+            }
+            if self.request.enrich_ssh and discovery.get("polled", True):
+                enrichment = collect_enrichment(
+                    self.settings,
+                    self.store,
+                    discovery["address"],
+                    discovery,
+                    self.job["id"],
+                    checkpoint,
+                    lambda data: self.store.credential_event(self.job["id"], self.worker, data),
+                    backup=self.request.backup_config,
+                    target_image=preferred_image(self.settings, device_id, checkpoint),
+                )
+                if enrichment.get("licenses"):
+                    discovery["license_inventory"] = sync_observed_licenses(
+                        self.settings,
+                        device_id,
+                        discovery["poller_instance"],
+                        discovery["manufacturer"],
+                        enrichment["licenses"],
+                        checkpoint,
+                    )
+            if self._f5_license is not None:
+                enrichment["license_products"] = [
+                    item[:200] for item in self._f5_license["installed_modules"]
+                ][:100]
+                if self._f5_license.get("reported_expiration"):
+                    enrichment["license_expiration"] = self._f5_license["reported_expiration"]
+            discovery["collection_report"] = report_observation(
+                self.settings, self.job["id"], device_id, discovery, enrichment, checkpoint
+            )
+            discovery["enrichment"] = {k: v for k, v in enrichment.items() if k != "licenses"}
+            optional_failure = (
+                discovery["collection_report"]["status"] in {"failed", "unavailable"}
+                or any(
+                    row["status"] in {"failed", "partial"}
+                    for row in enrichment.get("components", {}).values()
+                )
+                or any(
+                    discovery.get(field, {}).get("status") in {"failed", "warning"}
+                    for field in (
+                        "software_inventory",
+                        "stack_inventory",
+                        "access_point_inventory",
+                        "license_lookup",
+                        "license_inventory",
+                    )
                 )
             )
             manual = [key for key, source in discovery.get("field_sources", {}).items() if source == "manual"]

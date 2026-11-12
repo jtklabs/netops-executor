@@ -733,10 +733,10 @@ class NetBoxDiscovery:
             )
         return result
 
-    def sync_f5_license(self, device_id, poller, info):
+    def sync_f5_license(self, device_id, poller, info, manufacturer_name="F5"):
         entitlement_path = "plugins/refresh/license-entitlements/"
         assignment_path = "plugins/refresh/license-assignments/"
-        manufacturer = self.named_object("dcim/manufacturers/", "F5")
+        manufacturer = self.named_object("dcim/manufacturers/", manufacturer_name)
         tags = [
             self.named_object("extras/tags/", poller, poller)["id"],
             self.named_object("extras/tags/", DISCOVERED_TAG)["id"],
@@ -974,7 +974,12 @@ class NetBoxDiscovery:
                 facts["serial"] = current["serial"]
                 sources["serial"] = previous_sources.get("serial", "netbox-existing")
             if sources.get("model") == "manual":
+                facts["model"] = current["device_type"].get("model", facts["model"])
                 sources["model"] = previous_sources.get("model", "netbox-existing")
+                if sources.get("manufacturer") == "manual":
+                    manufacturer = current["device_type"].get("manufacturer") or {}
+                    facts["manufacturer"] = manufacturer.get("name", facts["manufacturer"])
+                    sources["manufacturer"] = previous_sources.get("manufacturer", "netbox-existing")
             if sources.get("software_version") == "manual" and current.get("custom_fields", {}).get(
                 SOFTWARE_VERSION
             ):

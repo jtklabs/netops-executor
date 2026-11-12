@@ -2848,3 +2848,53 @@ your device rather than assuming every SRX5800 exposes the same layout.
 For Ansible, set `executor_discovery_overrides_src` to the controller's YAML path.
 The playbook validates it with the installed CLI, copies it to
 `/etc/netops-executor/discovery-overrides.yaml`, and writes the environment setting.
+
+### Collection evidence, topology and upgrade readiness
+
+Executor 0.26.0 sends safe collection observations to Lifecycle plugin 0.5.0 after
+creating/updating a discovered device. Deploy the plugin first. The report tracks
+per-component outcomes, actual poller and worker version, observed/manual/inferred
+field provenance, readiness and neighbors. The plugin records changes between
+observations; the resulting safe change list appears in `discovery.collection_report`
+and the existing completion webhook. No license activation key enters observations,
+metrics or the generic enrichment job summary.
+
+Discovery requests now accept `collect_neighbors` (default true), `enrich_ssh`
+(default true), and `backup_config` (default false), alongside normal queue and
+schedule fields. LLDP uses the advertised local port ID rather than assuming its
+port number equals ifIndex; Cisco CDP uses ifIndex mappings. Reported relationships
+remain inventory evidence and do not create physical cables. Reciprocal matching
+links are marked confirmed. An unsuccessful collection preserves prior relationships.
+
+SSH enrichment uses the existing strict/pinned host keys, encrypted credentials,
+eligibility and audit rules. A matching inventory entry is used when available;
+otherwise eligible saved profiles can authenticate the discovered IP. Missing
+profiles are explicitly skipped. CLI command rejection or an unrecognized format
+produces a component gap and never fabricates an entitlement or a healthy HA state.
+Failed SNMP polls seeded with manual identity do not trigger SSH enrichment.
+
+Device-observed license readers cover F5, Cisco Smart Licensing/classic IOS/NX-OS
+usage, Arista license features, Junos license usage, PAN-OS subscriptions, FortiGate
+service contract dates/VM status, ArubaOS controller summaries and NIOS license
+types. Output varies by release, and only recognized formats are stored. Other
+platforms explicitly report unsupported collection. Cisco license usage does not
+prove a purchased contract; absence of a CLI expiration date stays unknown. Synthetic
+`observed-device-…` references identify per-device product observations, not vendor
+activation keys. F5 continues to store its full registration key as the entitlement
+Reference. Existing license APIs and permissions are reused.
+
+Read-only HA enrichment supports F5 device groups/failover/sync, Arista MLAG,
+FortiGate FGCP peers and PAN-OS peers. Unsupported topology/precheck formats remain
+unknown. Readiness checks record successful SSH credentials and host-key verification,
+HA health when recognized, comparable free storage versus twice the preferred image
+size, and optional private configuration backup. Backups are stored with mode 0600
+under `NETOPS_BACKUP_ROOT/discovery/`, keyed by target and job; configurations are
+not put in job results. F5 uses its existing recoverable backup workflow instead of
+creating a new UCS during discovery. Unknown storage/backup/HA evidence does not
+make a device ready.
+
+Use Lifecycle's `/api/plugins/refresh/readiness/` endpoint or Upgrade Readiness menu
+for the fleet report, preferred downloads, checks and reasons. A manually entered,
+airgapped device can have a preferred version without a successful poll. The readiness
+report stays unknown until fresh evidence is available. The platform upgrade workflow
+still performs its own live validation before changes.
