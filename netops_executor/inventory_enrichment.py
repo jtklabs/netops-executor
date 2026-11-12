@@ -220,7 +220,7 @@ def collect_enrichment(
                         "peer_name": m["name"].rsplit("/", 1)[-1],
                         "peer_address": m["host"],
                         "group": ",".join(data["groups"])[:200],
-                        "role": data["role"],
+                        # topology() reports the local role, not the peer's role.
                         "state": data["sync"],
                     }
                     for m in data["members"]

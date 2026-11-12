@@ -295,3 +295,44 @@ def test_read_only_generic_appliance_does_not_exit_the_login_cli(settings):
     driver.session_preparation()
     driver.exit_config_mode()
     assert commands == ["prompt"]
+
+
+def test_f5_ha_does_not_assign_the_local_role_to_the_peer(settings, store, monkeypatch):
+    from netops_executor import inventory_enrichment as module
+    from netops_executor.config import Device
+
+    monkeypatch.setattr(
+        module, "target_for", lambda *args: Device(id="f5", host="192.0.2.1", device_type="f5")
+    )
+
+    class FakeSSH:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def connect(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(module, "SSH", FakeSSH)
+    monkeypatch.setattr(
+        module,
+        "topology",
+        lambda device: {
+            "self": "/Common/a",
+            "members": [
+                {"name": "/Common/a", "host": "192.0.2.1"},
+                {"name": "/Common/b", "host": "192.0.2.2"},
+            ],
+            "groups": ["pair"],
+            "role": "active",
+            "sync": "in sync",
+        },
+    )
+    result = collect_enrichment(
+        settings, store, "192.0.2.1", {"manufacturer": "F5"}, "f5-read", lambda: None, lambda data: None
+    )
+    assert result["relationships"][0]["peer_name"] == "b"
+    assert not result["relationships"][0].get("role")
+    assert result["readiness"]["ha"]["status"] == "passed"
