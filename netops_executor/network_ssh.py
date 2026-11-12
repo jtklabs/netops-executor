@@ -38,7 +38,7 @@ class GuardedChannel(SSHChannel):
         self.owner.output_bytes += len(value.encode())
         if self.owner.output_bytes > 32 * 1024 * 1024:
             raise DeviceError("network CLI output exceeds limit")
-        if self.owner.read_only_session:
+        if getattr(self.owner, "read_only_session", False):
             tail = self.owner.pager_tail + value
             tail = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", tail).rstrip(" \r\n\b")
             if tail.endswith(("--More--", "-- More --")):
