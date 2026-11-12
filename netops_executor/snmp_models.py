@@ -87,6 +87,15 @@ class SnmpWalkRequest(ScheduledRequest):
         max_length=20,
         description="Per-job OID/regex identity rules, applied after the deployed YAML rules.",
     )
+    collect_neighbors: bool = Field(
+        default=True, description="Collect bounded LLDP/CDP neighbor tables during discovery."
+    )
+    enrich_ssh: bool = Field(
+        default=True, description="Read licenses, HA and readiness with eligible saved SSH profiles."
+    )
+    backup_config: bool = Field(
+        default=False, description="Save a private read-only configuration backup during SSH enrichment."
+    )
     port: int = Field(default=161, ge=1, le=65535)
     timeout: float = Field(default=2, ge=0.1, le=30)
     retries: int = Field(default=1, ge=0, le=5)

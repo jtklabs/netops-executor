@@ -247,7 +247,9 @@ class SSH:
             # Keep the UCS passphrase off process argument lists and never persist the command/output.
             return self.shell("tmsh -q", timeout, command + "\nquit\n")
         diagnostics = command == "show /sys license"
-        if diagnostics and self.detect_f5_shell(timeout) == "tmsh":
+        if (diagnostics or command.startswith(("show ", "list "))) and self.detect_f5_shell(
+            timeout
+        ) == "tmsh":
             return self.shell(command, timeout, diagnostics=True)
         return self.shell("tmsh -q -c " + shlex.quote(command), timeout, diagnostics=diagnostics)
 
