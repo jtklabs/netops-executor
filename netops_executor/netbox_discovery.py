@@ -226,38 +226,47 @@ class NetBoxDiscovery:
             {"manufacturer": manufacturer["id"], "model": model, "slug": slug},
         )
 
-    def device(self, name, address, poller_tag, discovered_tag):
+    def device(self, name, address, poller_tag, discovered_tag, polled=True):
         """The device this poller discovered at this address.
 
         A polled IP is unique per poller, but pollers in other networks can reach other
         devices at the same IP, so NetBox can hold the address more than once. The poller
         tag and discovery IP identify the device, whatever its name.
+
+        A device no poller has collected yet (created by hand, or seeded from manual data for
+        a broad region) moves to the poller that first polls it successfully. A collected
+        device stays with the poller that collected it.
         """
         path = "dcim/devices/"
 
         def tagged(device, tag):
             return any(existing["id"] == tag["id"] for existing in device["tags"])
 
+        mine = poller_tag["name"]
         matches = [
             device
             for device in self.records(path, tag=poller_tag["slug"], **{f"cf_{DISCOVERY_IP}": address})
-            if device["custom_fields"].get(DISCOVERY_IP) == address and tagged(device, poller_tag)
+            if device["custom_fields"].get(DISCOVERY_IP) == address
+            and tagged(device, poller_tag)
+            # A tag left on a device another poller took over does not make it this poller's.
+            and device["custom_fields"].get(OWNER) in (None, "", mine)
         ]
         if len(matches) > 1:
             raise SyncError("Multiple NetBox devices from this poller share the polled address")
         if matches:
             return matches[0]
-        # A device recorded outside discovery, by name and address. A device a poller created,
-        # seeded from manual data or adopted is owned by that poller and never taken over:
-        # it carries the discovered tag, its owner, or (before owners were recorded) a poll status.
+        # Otherwise find the device by name and address. A device some poller has polled
+        # successfully (discovered tag, or poll status polled) belongs to it. A device holding
+        # only manual data can be taken by another poller, but only through a successful poll,
+        # so two pollers that cannot reach it never trade its manual record back and forth.
         for device in self.records(path, name__ie=name):
             fields = device["custom_fields"]
             owner = fields.get(OWNER)
+            collected = tagged(device, discovered_tag) or fields.get(POLL_STATUS) == "polled"
             if (
                 (device["name"] or "").casefold() != name.casefold()
-                or tagged(device, discovered_tag)
-                or (owner and owner != poller_tag["name"])
-                or (not owner and fields.get(POLL_STATUS))
+                or (collected and owner != mine)
+                or (owner and owner != mine and not polled)
             ):
                 continue
             primary = device.get("primary_ip6" if ":" in address else "primary_ip4")
@@ -985,7 +994,11 @@ class NetBoxDiscovery:
         discovered = self.named_object("extras/tags/", DISCOVERED_TAG)
         path = "dcim/devices/"
         name = facts["name"]
-        current = self.device(name, address, tag, discovered)
+        current = self.device(name, address, tag, discovered, facts.get("polled", True))
+        previous_owner = ((current or {}).get("custom_fields") or {}).get(OWNER)
+        if current and previous_owner and previous_owner != poller:
+            # A manual device moves to the poller that collected it: record the handover.
+            facts["netbox_takeover"] = {"device_id": current["id"], "previous_poller": previous_owner}
         sources = dict(facts.get("field_sources", {}))
         preserve_model = bool(current and sources.get("model") == "manual")
         previous_sources = (current or {}).get("custom_fields", {}).get(FIELD_SOURCES) or {}
@@ -1073,7 +1086,7 @@ class NetBoxDiscovery:
             except httpx.HTTPStatusError as error:
                 if error.response.status_code not in (400, 409):
                     raise
-                current = self.device(name, address, tag, discovered)
+                current = self.device(name, address, tag, discovered, facts.get("polled", True))
                 if current is None:
                     if any(
                         (row["name"] or "").casefold() == name.casefold() and row["tenant"] is None
@@ -1107,6 +1120,11 @@ class NetBoxDiscovery:
         existing_tags = {existing["id"] for existing in current["tags"]}
         if missing_tags := [tag_id for tag_id in tag_ids if tag_id not in existing_tags]:
             data["add_tags"] = missing_tags
+        if takeover := facts.get("netbox_takeover"):
+            # The previous poller stops matching the device once its tag is gone.
+            old = self.named("extras/tags/", takeover["previous_poller"])
+            if old and old["id"] in existing_tags:
+                data["remove_tags"] = [old["id"]]
         if data:
             current = self.request("PATCH", f"{path}{current['id']}/", json=data)
         return ("updated" if data else "unchanged"), current

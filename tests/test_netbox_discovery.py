@@ -899,26 +899,37 @@ def test_placeholder_interface_is_idempotent_and_moves_ip_when_real_interface_is
         assert unknown["interface"] == "Management1"
 
 
-@pytest.mark.parametrize("owner_recorded", [True, False])
-def test_device_seeded_by_another_poller_is_never_taken_over(owner_recorded):
+@pytest.mark.parametrize(
+    ("collected", "polled", "taken"),
+    [
+        # Seeded from manual data for a broad region: the poller that collects it takes it over.
+        (None, True, True),
+        # Only a successful poll moves it; another poller's manual seed does not.
+        (None, False, False),
+        # A device the regional poller has collected stays with it.
+        ("discovered", True, False),
+        ("polled", True, False),
+    ],
+)
+def test_only_a_manual_device_moves_to_the_poller_that_collects_it(collected, polled, taken):
     calls = []
-    seeded = {
+    custom = {
+        "snmp_discovery_ip": "192.0.2.1",
+        "inventory_poll_status": "polled" if collected == "polled" else "unpolled",
+        "discovery_poller": "north-america",
+    }
+    regional = {
         "id": 21,
         "name": "Switch",
-        "serial": "US-SERIAL",
+        "serial": "",
         "tenant": None,
         "site": {"id": 2},
         "device_type": {"id": 4},
         "role": {"slug": "switch"},
         "platform": {"id": 9},
         "status": {"value": "planned"},
-        # Seeded from manual data by poller checkmk-us: its tag, no discovered tag.
-        "custom_fields": {
-            "snmp_discovery_ip": "192.0.2.1",
-            "inventory_poll_status": "unpolled",
-            **({"discovery_poller": "checkmk-us"} if owner_recorded else {}),
-        },
-        "tags": [{"id": 30}],
+        "custom_fields": custom,
+        "tags": [{"id": 30}] + ([{"id": 8}] if collected == "discovered" else []),
     }
     rows = {
         "extras/custom-fields": [
@@ -927,19 +938,25 @@ def test_device_seeded_by_another_poller_is_never_taken_over(owner_recorded):
         ],
         "dcim/sites": [{"id": 1, "name": "Lab", "slug": "lab"}],
         "extras/tags": [
-            {"id": 7, "name": "checkmk-au", "slug": "checkmk-au"},
+            {"id": 7, "name": "us-east", "slug": "us-east"},
             {"id": 8, "name": "discovered", "slug": "discovered"},
+            {"id": 30, "name": "north-america", "slug": "north-america"},
         ],
         "dcim/manufacturers": [{"id": 3, "name": "Cisco", "slug": "cisco"}],
         "dcim/device-types": [{"id": 4, "model": "Catalyst 9300-48P", "part_number": "C9300-48P"}],
         "dcim/device-roles": [{"id": 5, "name": "Switch", "slug": "switch"}],
         "dcim/platforms": [{"id": 9, "name": "Cisco IOS-XE", "slug": "cisco-ios-xe"}],
-        "dcim/devices": [seeded],
+        "dcim/devices": [regional],
     }
 
     def handle(request):
         path = request.url.path.removeprefix("/api/").strip("/")
         if request.method == "GET":
+            if path == "extras/tags" and "name" in request.url.params:
+                wanted = request.url.params["name"]
+                return httpx.Response(
+                    200, json={"results": [t for t in rows[path] if t["name"] == wanted], "next": None}
+                )
             return httpx.Response(200, json={"results": rows[path], "next": None})
         calls.append((request.method, path, json.loads(request.content)))
         return httpx.Response(200, json={"id": 40})
@@ -949,16 +966,22 @@ def test_device_seeded_by_another_poller_is_never_taken_over(owner_recorded):
         "manufacturer": "Cisco",
         "model": "C9300-48P",
         "platform": "Cisco IOS-XE",
-        "serial": "AU-SERIAL",
+        "serial": "FOC-US-EAST",
         "software_version": "",
+        "polled": polled,
     }
     with httpx.Client(
         base_url="https://netbox.example/api/", transport=httpx.MockTransport(handle)
     ) as client:
-        # Poller checkmk-au polls a different switch with the same name at the same IP.
-        action, _ = NetBoxDiscovery(client, lambda: None).sync_inventory(
-            "Lab", "checkmk-au", "192.0.2.1", facts
-        )
-    assert action == "created"
-    assert [(method, path) for method, path, _ in calls] == [("POST", "dcim/devices")]
-    assert calls[0][2]["custom_fields"]["discovery_poller"] == "checkmk-au"
+        action, _ = NetBoxDiscovery(client, lambda: None).sync_inventory("Lab", "us-east", "192.0.2.1", facts)
+    if taken:
+        assert action == "updated"
+        ((method, path, data),) = calls
+        assert (method, path) == ("PATCH", "dcim/devices/21")
+        assert data["custom_fields"]["discovery_poller"] == "us-east"
+        assert data["add_tags"] == [7, 8] and data["remove_tags"] == [30]  # north-america stops matching it
+        assert data["status"] == "active" and data["serial"] == "FOC-US-EAST"
+        assert facts["netbox_takeover"] == {"device_id": 21, "previous_poller": "north-america"}
+    else:
+        assert action == "created" and [(m, p) for m, p, _ in calls] == [("POST", "dcim/devices")]
+        assert "netbox_takeover" not in facts

@@ -2370,12 +2370,19 @@ other devices at the same IP, so NetBox can hold the same address more than once
 Discovery therefore finds the device by its poller tag and `snmp_discovery_ip`
 custom field, whatever its name, so a renamed device keeps its record. Every device
 a poller creates, seeds from manual data or adopts records that poller in the
-`discovery_poller` custom field. A device recorded outside discovery (no
-`discovered` tag, no `discovery_poller`, no `inventory_poll_status`) is adopted
-when its name and polled IP match, using `snmp_discovery_ip` or its primary IP.
-A device another poller owns is never taken over, even with the same name and
-IP; the polling poller creates its own record instead. A successful poll by the
-owning poller replaces manually seeded values. The
+`discovery_poller` custom field.
+
+Otherwise discovery looks for a device with the same name and polled IP (its
+`snmp_discovery_ip` or primary IP). A device that holds only manual data, created
+by hand in NetBox or seeded from manual data (for example for a whole region before
+the right poller is known), moves to the first poller that **successfully** polls
+it. The device gets that poller's tag and `discovery_poller`, loses the previous
+owner's tag so the regional poller stops matching it, and the job reports
+`result.discovery.netbox_takeover` with the previous poller. Another poller's
+failed run that only seeds manual data does not take it. A device any poller has
+successfully polled (`discovered` tag or `inventory_poll_status` polled) stays with
+that poller; another poller with the same name and IP gets its own record. A
+successful poll replaces manually seeded values. The
 executor creates missing sites and poller tags, reuses a matching manufacturer
 and model or part number from the device type catalog, and creates a basic
 device type when no match exists. It tags new devices `discovered` and sets a
