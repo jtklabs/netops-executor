@@ -14,7 +14,7 @@ from pathlib import Path
 import paramiko
 from scp import SCPClient, SCPException
 
-from .opengear_sudo import run_as_root
+from .opengear_sudo import login_password, run_as_root
 from .ssh import SSH, DeviceError, digest
 
 MODEL = re.compile(r"\b(IM72(?:08|16|32|48)(?:-[A-Za-z0-9]+)*)(?=\s|$)", re.I)
@@ -45,14 +45,7 @@ class Opengear:
 
     def sudo_password(self):
         """Use only the credential that authenticated this connection."""
-        self.ssh.connect()
-        selector = self.ssh.selector
-        if selector.last and not selector.last.startswith("legacy:"):
-            candidates = selector.vault.candidates(
-                "ssh", [selector.last], (self.ssh.device.host, self.ssh.device.id)
-            )
-            return candidates[0].get("password") if candidates else None
-        return os.environ.get(self.ssh.device.password_env or "")
+        return login_password(self.ssh)
 
     def uid(self):
         """The login account's UID: the connection's own identity, before any sudo."""

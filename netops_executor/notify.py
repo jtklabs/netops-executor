@@ -54,6 +54,7 @@ KINDS = {
     "fortigate_upgrade": "FortiGate upgrade",
     "opengear_upgrade": "Opengear upgrade",
     "password_rotation": "Password rotation",
+    "panorama_password_rotation": "Panorama password rotation",
     "ssh": "SSH job",
     "http": "HTTP job",
     "cipher_scan": "Cipher scan",

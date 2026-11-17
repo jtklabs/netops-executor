@@ -7,13 +7,23 @@ from pydantic import Field, SecretStr, field_serializer, model_validator
 
 from .models import Model, Name, ScheduledRequest
 from .panos_models import Serial
-from .platforms import DeviceType
+from .platforms import DEVICE_TYPES
+
+# SSH device types plus platforms whose administrators are managed through an HTTPS API.
+API_PLATFORMS = ("clearpass", "infoblox")
+RotationPlatform = Literal[(*DEVICE_TYPES, *API_PLATFORMS)]
+# Built from vendor documentation without a lab device: each request must opt in.
+PREVIEW_PLATFORMS = {"juniper_junos", "aruba_os", "checkpoint_gaia", *API_PLATFORMS}
+LOCAL_HASH_PLATFORMS = ("linux", "f5", "opengear", "paloalto_panos", "juniper_junos", "checkpoint_gaia")
 
 Username = Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")]
+# ClearPass privilege levels have spaces ("Super Administrator"); no other platform allows them,
+# because elsewhere the role is a CLI argument.
+Role = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$")]
 
 
 class AccountCreation(Model):
-    role: Name | None = None
+    role: Role | None = None
     privilege: int | None = Field(default=None, ge=0, le=15)
     groups: list[Name] | None = Field(default=None, max_length=20)
     shell: Literal["/bin/bash", "/bin/sh", "bash", "tmsh", "none"] | None = None
@@ -35,6 +45,11 @@ class AccountCreation(Model):
                 "arista_eos": {"role": "network-admin", "privilege": 15},
                 "fortinet": {"role": "super_admin", "vdom": "root"},
                 "paloalto_panos": {"role": "superuser"},
+                "juniper_junos": {"role": "super-user"},
+                "aruba_os": {"role": "root"},
+                "checkpoint_gaia": {"role": "adminRole"},
+                "clearpass": {"role": "Super Administrator"},
+                "infoblox": {"groups": ["admin-group"]},
             }[platform]
         )
 
@@ -48,12 +63,19 @@ class AccountCreation(Model):
             "arista_eos": {"role", "privilege"},
             "fortinet": {"role", "vdom"},
             "paloalto_panos": {"role"},
+            "juniper_junos": {"role"},
+            "aruba_os": {"role"},
+            "checkpoint_gaia": {"role"},
+            "clearpass": {"role"},
+            "infoblox": {"groups"},
         }[platform]
+        if platform != "clearpass" and self.role and " " in self.role:
+            raise ValueError("new_account role cannot contain spaces for " + platform)
         if self.model_fields_set - allowed:
             raise ValueError("new_account contains options for a different device_type")
         required = (
             "groups"
-            if platform in ("linux", "opengear")
+            if platform in ("linux", "opengear", "infoblox")
             else "privilege"
             if platform == "cisco_ios"
             else "role"
@@ -87,7 +109,7 @@ class RotationValidation(Model):
 
 class PasswordRotationOptions(ScheduledRequest):
     device: str = Field(min_length=1, max_length=253)
-    device_type: DeviceType | None = None
+    device_type: RotationPlatform | None = None
     username: Username
     credential_profiles: list[Name] | None = Field(default=None, min_length=1, max_length=10)
     panorama: Name | None = Field(
@@ -101,16 +123,24 @@ class PasswordRotationOptions(ScheduledRequest):
         default=None,
         min_length=1,
         max_length=10,
-        description="Panorama HTTP credentials; omitted selects eligible configured profiles automatically",
+        description="Panorama, ClearPass or Infoblox HTTP credentials; omitted selects eligible profiles",
+    )
+    http_target: Name | None = Field(
+        default=None, description="ClearPass and Infoblox only: the configured HTTP target of the API"
+    )
+    allow_preview: bool = Field(
+        default=False,
+        description="Required for platforms built from vendor documentation without a lab device: "
+        "juniper_junos, aruba_os, checkpoint_gaia, clearpass and infoblox",
     )
     create_if_missing: bool = True
     new_account: AccountCreation | None = Field(
         default=None,
         description="Creation privileges for a missing account. Omitted/null defaults to full administrator access for the platform; existing accounts keep their privileges. Linux defaults use sudo on Ubuntu/Debian or wheel on RHEL-family systems, with full sudo access checked after creation.",
     )
-    verification: Literal["ssh_login", "local_hash"] = Field(
+    verification: Literal["ssh_login", "local_hash", "api_login"] = Field(
         default="ssh_login",
-        description="Fresh password-only SSH authentication, or local hash comparison on Linux/F5/Opengear/Palo Alto. Panorama defaults to local_hash and needs no direct firewall connection.",
+        description="Fresh password-only SSH authentication, local hash comparison (Linux/F5/Opengear/Palo Alto/Junos), or an API login with the new password (ClearPass/Infoblox, their default). Panorama defaults to local_hash and needs no direct firewall connection.",
     )
     ios_algorithm: Literal["scrypt", "sha256", "legacy"] = Field(
         default="scrypt",
@@ -129,7 +159,28 @@ class PasswordRotationOptions(ScheduledRequest):
         return value.model_dump(exclude_unset=True) if value is not None else None
 
     def for_platform(self, platform):
-        if platform != "paloalto_panos" and (self.panorama or self.serial or self.http_credential_profiles):
+        if platform in PREVIEW_PLATFORMS and not self.allow_preview:
+            raise ValueError(
+                platform + " rotation has not been validated on a lab device; set allow_preview: true "
+                "after testing it on a non-production device"
+            )
+        api = platform in API_PLATFORMS
+        if api != bool(self.http_target):
+            raise ValueError("http_target is required for clearpass and infoblox, and only for them")
+        if api:
+            if self.panorama or self.serial or self.credential_profiles is not None:
+                raise ValueError("clearpass and infoblox use http_target and http_credential_profiles")
+            if "verification" not in self.model_fields_set:
+                self.verification = "api_login"
+            if self.verification != "api_login":
+                raise ValueError("clearpass and infoblox verify with api_login")
+        elif self.verification == "api_login":
+            raise ValueError("api_login verification is for clearpass and infoblox")
+        if (
+            platform != "paloalto_panos"
+            and not api
+            and (self.panorama or self.serial or self.http_credential_profiles)
+        ):
             raise ValueError("panorama, serial and http_credential_profiles require paloalto_panos")
         if self.panorama:
             if not self.serial:
@@ -138,19 +189,12 @@ class PasswordRotationOptions(ScheduledRequest):
                 raise ValueError("use http_credential_profiles for Panorama password rotation")
             if "verification" not in self.model_fields_set:
                 self.verification = "local_hash"
-        elif self.http_credential_profiles is not None:
-            raise ValueError("http_credential_profiles requires panorama")
+        elif self.http_credential_profiles is not None and not api:
+            raise ValueError("http_credential_profiles requires panorama, clearpass or infoblox")
         if self.new_account:
             self.new_account.for_platform(platform)
-        if self.verification == "local_hash" and platform not in (
-            "linux",
-            "f5",
-            "opengear",
-            "paloalto_panos",
-        ):
-            raise ValueError(
-                "local_hash verification is supported on linux, f5, opengear and paloalto_panos only"
-            )
+        if self.verification == "local_hash" and platform not in LOCAL_HASH_PLATFORMS:
+            raise ValueError("local_hash verification is supported on " + ", ".join(LOCAL_HASH_PLATFORMS))
 
 
 class PasswordRotationRequest(PasswordRotationOptions):
@@ -198,3 +242,51 @@ class PasswordRotationRequest(PasswordRotationOptions):
         ):
             raise ValueError("password must contain 1–256 bytes without control characters")
         return self
+
+
+class PanoramaRotationOptions(ScheduledRequest):
+    """One administrator everywhere a Panorama manages it: templates, then firewall-local copies."""
+
+    panorama: Name = Field(description="Configured Panorama HTTP target")
+    username: Username
+    http_credential_profiles: list[Name] | None = Field(default=None, min_length=1, max_length=10)
+    templates: bool = Field(
+        default=True,
+        description="Change the password in every template and template stack that defines the "
+        "account, then commit on Panorama only. Nothing is pushed: the result lists the firewalls "
+        "that need a push.",
+    )
+    firewalls: bool = Field(
+        default=True,
+        description="Rotate the account on every connected firewall that has it configured locally",
+    )
+    serials: list[Serial] | None = Field(
+        default=None, min_length=1, max_length=1000, description="Limit the firewall phase to these"
+    )
+    allow_preview: bool = Field(
+        default=False,
+        description="Required: Panorama template rotation has not been validated on a lab Panorama",
+    )
+    command_timeout: int = Field(default=60, ge=10, le=300)
+    commit_timeout: int = Field(default=600, ge=30, le=1800)
+
+    @model_validator(mode="after")
+    def scope(self):
+        if not (self.templates or self.firewalls):
+            raise ValueError("enable templates, firewalls or both")
+        if not self.allow_preview:
+            raise ValueError(
+                "Panorama fleet rotation has not been validated on a lab Panorama; set allow_preview: "
+                "true after testing it on a non-production Panorama"
+            )
+        return self
+
+
+class PanoramaRotationRequest(PanoramaRotationOptions):
+    password: SecretStr = Field(
+        exclude=True, description="Desired password; encrypted separately from public job metadata"
+    )
+
+    @model_validator(mode="after")
+    def safe_password(self):
+        return PasswordRotationRequest.safe_password(self)

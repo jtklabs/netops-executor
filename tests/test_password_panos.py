@@ -75,6 +75,16 @@ class Backend:
         self.calls.append("commit")
         self.running = copy.deepcopy(self.candidate)
 
+    def revert(self):
+        self.calls.append("revert")
+        self.candidate = copy.deepcopy(self.running)
+
+    def unlock(self):
+        self.calls.append("unlock")
+
+    def template_users(self):
+        return set()
+
     def close(self):
         pass
 
@@ -101,7 +111,7 @@ def test_panos_create_and_update_preserve_role_and_commit_then_verify(existing):
     device.verify()
     role = account(backend.running, "automation").find("permissions/role-based")
     assert [child.tag for child in role] == ["superreader" if existing else "superuser"]
-    assert backend.calls == ["prepare", "lock", "set_password", "commit"]
+    assert backend.calls == ["prepare", "lock", "set_password", "commit", "unlock"]
 
 
 @pytest.mark.parametrize("phase", ["preflight", "apply", "save"])
@@ -305,6 +315,7 @@ def test_panorama_rotation_uses_serial_proxy_and_http_fallback_without_ssh(
         "right", Credential(kind="http", scheme="header", header="X-PAN-KEY", token="right", priority=2)
     )
     backend, calls, markers = Backend(existing), [], {}
+    initial = copy.deepcopy(backend.running)
     desired = PASSWORD + '<&>"'
 
     def handle(req):
@@ -372,8 +383,14 @@ def test_panorama_rotation_uses_serial_proxy_and_http_fallback_without_ssh(
                         ("result", "FAIL" if failure == "commit_failure" else "OK"),
                     ):
                         ET.SubElement(job, k).text = v
+                elif cmd.tag == "load":
+                    assert cmd.findtext("config/from") == "running-config.xml"
+                    backend.candidate = copy.deepcopy(backend.running)
                 else:
                     for kind in ("config", "commit"):
+                        if cmd.find(kind + "-lock/remove") is not None:
+                            markers.setdefault("removed", []).append(kind)
+                            continue
                         if cmd.find(kind + "-lock") is not None:
                             if failure == "lock_denied":
                                 return httpx.Response(
@@ -413,8 +430,17 @@ def test_panorama_rotation_uses_serial_proxy_and_http_fallback_without_ssh(
         assert job["status"] == "succeeded", job["result"]
         assert job["result"]["verified"] and job["result"]["saved"]
     else:
-        assert job["status"] == ("failed" if failure in ("wrong_ip", "wrong_serial") else "recovery_required")
+        # Proven unchanged (nothing staged, or a refused commit reverted) ends cleanly.
+        clean = ("wrong_ip", "wrong_serial", "wrong_hash", "lock_denied", "commit_failure")
+        assert job["status"] == ("failed" if failure in clean else "recovery_required"), job["result"]
         assert not job["result"]["verified"]
+        if failure in ("wrong_hash", "lock_denied", "commit_failure"):
+            assert job["result"]["change_accepted"] is False and not job["result"]["mutations"]
+            assert canonical(backend.candidate) == canonical(backend.running) == canonical(initial)
+        if failure == "commit_failure":
+            assert "reverted" in job["result"]["error"] and sorted(markers["removed"]) == ["commit", "config"]
+        if failure == "lock_denied":
+            assert "removed" not in markers  # never remove a lock this job does not hold
     assert [entry["outcome"] for entry in job["credential_usage"]] == ["rejected", "authenticated"]
     assert sum(form["type"] == "commit" for form in calls) == (
         1 if failure in (None, "commit_failure", "lost_commit", "lost_poll") else 0

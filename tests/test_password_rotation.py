@@ -332,7 +332,10 @@ def device(platform, shell, **options):
         {k: v for k, v in body(platform, **options).items() if k != "password"}
     )
     request.for_platform(platform)
-    return AccountDevice(None, None, request, PASSWORD, lambda: None, None, ssh=shell)
+    client = AccountDevice(None, None, request, PASSWORD, lambda: None, None, ssh=shell)
+    # A root login unless a test says otherwise; sudo has its own tests.
+    client.uid = "0"
+    return client
 
 
 @pytest.mark.parametrize("platform", list(CREATION))
@@ -344,6 +347,7 @@ def test_native_account_commands_create_or_preserve_access(platform, existing, m
     client.before = before
     client.read = lambda: before if len(shell.calls) == 0 else ["after"]
     client.access = lambda record: "unchanged"
+    client.fingerprint = lambda: None
     client.index, client.total = 2, 1
     monkeypatch.setattr(
         "netops_executor.password_devices.password_prompt",

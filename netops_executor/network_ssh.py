@@ -141,7 +141,11 @@ class NetworkSSH(SSH):
                 )
             else:
                 driver.exit_config_mode()
-                output = driver.send_command(command, read_timeout=timeout, cmd_verify=True)
+                options = {}
+                if self.device_type == "aruba_os":
+                    # The prompt can gain or lose its pending-change marker during the command.
+                    options["expect_string"] = self.prompt_pattern(driver.find_prompt().strip())
+                output = driver.send_command(command, read_timeout=timeout, cmd_verify=True, **options)
             self.check()
             return {
                 "stdout": self.selector.redact(re.sub(r"-- ?More ?--", "", output))
@@ -219,7 +223,7 @@ class NetworkSSH(SSH):
                     answer_count += 1
                 elif QUESTION.search(tail):
                     raise DeviceError("unrecognized prompt during " + command.split()[0])
-                elif re.search(r"\n" + re.escape(prompt) + r"\s*$", output):
+                elif re.search(r"\n" + self.prompt_pattern(prompt) + r"\s*$", output):
                     break
                 elif not chunk:
                     time.sleep(0.5)
@@ -231,6 +235,14 @@ class NetworkSSH(SSH):
         if disconnected:
             self.close()
         return self.selector.redact(output), disconnected
+
+    def prompt_pattern(self, prompt):
+        """A regex for the prompt. ArubaOS 8 marks uncommitted changes in it, as in
+        `(host) ^[mynode] (config) #`, and drops the marker after `write memory`."""
+        if getattr(self, "device_type", None) != "aruba_os":
+            return re.escape(prompt)
+        bare = re.sub(r"[\^*](?=\[)", "", prompt)
+        return re.escape(bare).replace(r"\[", r"[\^*]?\[", 1)
 
     def alive(self):
         transport = self.client.get_transport() if self.client else None

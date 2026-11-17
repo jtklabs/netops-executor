@@ -17,6 +17,7 @@ from .models import POOLS, QUEUES
 from .opengear_engine import OpengearRunner
 from .panos_engine import PanosRunner
 from .password_engine import PasswordRotationRunner
+from .password_fleet import PanoramaRotationRunner
 from .snmp import SnmpRunner
 from .store import Store
 
@@ -73,6 +74,8 @@ def process(settings, store, job, worker):
             if job["kind"] == "opengear_upgrade"
             else PasswordRotationRunner
             if job["kind"] == "password_rotation"
+            else PanoramaRotationRunner
+            if job["kind"] == "panorama_password_rotation"
             else Runner
         )
         runner(settings, store, job, worker).run()

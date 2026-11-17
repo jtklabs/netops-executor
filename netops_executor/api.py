@@ -30,7 +30,13 @@ from .notify import EmailSender, Permanent
 from .opengear_models import OpengearBatch, OpengearUpgradeRequest
 from .panos_models import PanosBatch, PanosUpgradeRequest
 from .password_devices import check_password_syntax
-from .password_models import PasswordRotationOptions, PasswordRotationRequest
+from .password_models import (
+    API_PLATFORMS,
+    PanoramaRotationOptions,
+    PanoramaRotationRequest,
+    PasswordRotationOptions,
+    PasswordRotationRequest,
+)
 from .platforms import DEVICE_TYPES, NETWORK_TYPES, validate_commands
 from .snmp_models import SnmpResults, SnmpWalkRequest
 from .store import Conflict, Store
@@ -56,6 +62,7 @@ class JobResponse(Model):
         "fortigate_upgrade",
         "opengear_upgrade",
         "password_rotation",
+        "panorama_password_rotation",
     ]
     queue: Queue
     parent: str | None
@@ -188,6 +195,12 @@ class EosPlanResponse(Model):
 
 class PasswordRotationPlanResponse(Model):
     request: PasswordRotationOptions
+    steps: list[str]
+    lock_key: str
+
+
+class PanoramaRotationPlanResponse(Model):
+    request: PanoramaRotationOptions
     steps: list[str]
     lock_key: str
 
@@ -720,9 +733,15 @@ def create_app(settings=None):
 
     def password_planned(request):
         try:
-            device = settings.device(request.device)
-            request.device_type = request.device_type or device.device_type
-            request.for_platform(request.device_type)
+            if request.device_type in API_PLATFORMS:
+                # ClearPass and Infoblox are reached through their HTTP target, not the inventory.
+                request.for_platform(request.device_type)
+                if request.http_target not in settings.http_targets:
+                    raise ValueError("unknown HTTP target")
+            else:
+                device = settings.device(request.device)
+                request.device_type = request.device_type or device.device_type
+                request.for_platform(request.device_type)
             if request.panorama and request.panorama not in settings.http_targets:
                 raise ValueError("unknown Panorama HTTP target")
             check_password_syntax(request.device_type, request.password.get_secret_value())
@@ -737,7 +756,78 @@ def create_app(settings=None):
                 "save_configuration",
                 "verify_account",
             ],
-            lock_key=lock_key(request.device),
+            lock_key=(
+                "http:" + request.http_target
+                if request.device_type in API_PLATFORMS
+                else lock_key(request.device)
+            ),
+        )
+
+    def submit_secret(request, plan, idempotency_key, kind):
+        cipher = vault.cipher()
+        secret = request.password.get_secret_value().encode()
+
+        def matches(saved):
+            if saved["digest"]:
+                return digest_matches(saved["digest"], secret)
+            # Jobs submitted before digests existed still hold their encrypted secret until they
+            # finish; once purged, a replay of such a job's key conflicts rather than guessing.
+            return bool(saved["secret"]) and hmac.compare_digest(
+                vault.decrypt(cipher, saved["secret"]), secret
+            )
+
+        return store.submit(
+            plan.request.model_dump(mode="json"),
+            plan.lock_key,
+            idempotency_key,
+            kind=kind,
+            secret=cipher.encrypt(secret),
+            secret_digest=secret_digest(secret),
+            secret_matches=matches,
+        )
+
+    def panorama_planned(request):
+        if request.panorama not in settings.http_targets:
+            raise HTTPException(422, "unknown Panorama HTTP target")
+        return PanoramaRotationPlanResponse(
+            request=PanoramaRotationOptions.model_validate(request.model_dump()),
+            steps=[
+                "discover_templates_and_firewalls",
+                *(["rotate_templates_and_commit_on_panorama"] if request.templates else []),
+                *(["rotate_firewall_local_accounts"] if request.firewalls else []),
+            ],
+            lock_key="panorama:" + request.panorama,
+        )
+
+    @app.post(
+        "/api/v1/password-rotation/panorama/plan",
+        dependencies=authenticated,
+        response_model=PanoramaRotationPlanResponse,
+        tags=["Password rotation"],
+        summary="Validate a Panorama-wide administrator rotation without device access",
+    )
+    def panorama_rotation_plan(request: PanoramaRotationRequest):
+        return panorama_planned(request)
+
+    @app.post(
+        "/api/v1/password-rotation/panorama/jobs",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=JobResponse,
+        tags=["Password rotation"],
+        summary="Rotate an administrator in Panorama templates and on every firewall that has it locally",
+        description="Templates and template stacks that define the account get the new password and "
+        "Panorama commits (nothing is pushed; result.push_required lists the firewalls that need a "
+        "push). Every connected firewall with a local copy of the account is then rotated through "
+        "Panorama, one at a time, each proven by its committed hash. result.templates and "
+        "result.firewalls report each one's outcome.",
+    )
+    def panorama_rotation_job(
+        request: PanoramaRotationRequest,
+        idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
+    ):
+        return submit_secret(
+            request, panorama_planned(request), idempotency_key, "panorama_password_rotation"
         )
 
     @app.post(
@@ -763,28 +853,7 @@ def create_app(settings=None):
         request: PasswordRotationRequest,
         idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
     ):
-        plan = password_planned(request)
-        cipher = vault.cipher()
-        secret = request.password.get_secret_value().encode()
-
-        def matches(saved):
-            if saved["digest"]:
-                return digest_matches(saved["digest"], secret)
-            # Jobs submitted before digests existed still hold their encrypted secret until they
-            # finish; once purged, a replay of such a job's key conflicts rather than guessing.
-            return bool(saved["secret"]) and hmac.compare_digest(
-                vault.decrypt(cipher, saved["secret"]), secret
-            )
-
-        return store.submit(
-            plan.request.model_dump(mode="json"),
-            plan.lock_key,
-            idempotency_key,
-            kind="password_rotation",
-            secret=cipher.encrypt(secret),
-            secret_digest=secret_digest(secret),
-            secret_matches=matches,
-        )
+        return submit_secret(request, password_planned(request), idempotency_key, "password_rotation")
 
     @app.post("/api/v1/ssh/jobs", dependencies=authenticated, status_code=202, response_model=JobResponse)
     def ssh_job(

@@ -3,9 +3,28 @@
 from typing import Literal, get_args
 
 DeviceType = Literal[
-    "linux", "f5", "cisco_ios", "cisco_nxos", "arista_eos", "fortinet", "opengear", "paloalto_panos"
+    "linux",
+    "f5",
+    "cisco_ios",
+    "cisco_nxos",
+    "arista_eos",
+    "fortinet",
+    "opengear",
+    "paloalto_panos",
+    "juniper_junos",
+    "aruba_os",
+    "checkpoint_gaia",
 ]
-NETWORK_TYPES = {"cisco_ios", "cisco_nxos", "arista_eos", "fortinet", "paloalto_panos"}
+NETWORK_TYPES = {
+    "cisco_ios",
+    "cisco_nxos",
+    "arista_eos",
+    "fortinet",
+    "paloalto_panos",
+    "juniper_junos",
+    "aruba_os",
+    "checkpoint_gaia",
+}
 DEVICE_TYPES = get_args(DeviceType)
 
 

@@ -392,6 +392,15 @@ const examples = {
     password: "REPLACE_WITH_DESIRED_PASSWORD",
     verification: "ssh_login",
   },
+  "password-rotation/panorama/jobs": {
+    queue: "priority",
+    panorama: "panorama",
+    username: "automation",
+    password: "REPLACE_WITH_DESIRED_PASSWORD",
+    templates: true,
+    firewalls: true,
+    allow_preview: true,
+  },
   "opengear/jobs": {
     queue: "upgrade",
     device: "192.0.2.72",
@@ -571,7 +580,7 @@ $("json-submit").onsubmit = async (e) => {
     $("json-result").textContent = JSON.stringify(result, null, 2);
     jsonPending = "";
     jsonKey = "";
-    if (path === "password-rotation/jobs") $("json-body").value = "";
+    if (path.startsWith("password-rotation/")) $("json-body").value = "";
     if (!path.endsWith("upgrade-batches")) selected = result.id;
     message("Queued: " + result.id);
     await refresh();
