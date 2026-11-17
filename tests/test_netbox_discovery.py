@@ -12,7 +12,7 @@ def test_discovery_marks_new_and_legacy_devices_but_preserves_manual_provenance(
     rows = {
         "extras/custom-fields": [
             {"name": field, "object_types": ["dcim.device"], "type": {"value": "text"}}
-            for field in ("software_version", "snmp_discovery_ip")
+            for field in ("software_version", "snmp_discovery_ip", "discovery_poller")
         ],
         "dcim/sites": [{"id": 1, "name": "Lab", "slug": "lab"}],
         "extras/tags": [
@@ -71,10 +71,12 @@ def test_discovery_marks_new_and_legacy_devices_but_preserves_manual_provenance(
         assert not calls
     else:
         assert result == ("updated", 11)
+        # Adoption records the owning poller, so no other poller can take the device over.
+        owner = {"custom_fields": {"snmp_discovery_ip": "192.0.2.1", "discovery_poller": "checkmk-au"}}
         expected = (
-            {"role": 5, "platform": 9, "add_tags": [7, 8]}
+            {"role": 5, "platform": 9, "add_tags": [7, 8], **owner}
             if previous_role == "snmp-discovered"
-            else {"add_tags": [7]}
+            else {"add_tags": [7], **owner}
         )
         assert calls == [("PATCH", "dcim/devices/11", expected)]
 
@@ -647,7 +649,7 @@ def test_f5_ve_snmp_serial_fallback_never_replaces_a_recorded_serial(existing, s
     rows = {
         "extras/custom-fields": [
             {"name": field, "object_types": ["dcim.device"], "type": {"value": "text"}}
-            for field in ("software_version", "snmp_discovery_ip")
+            for field in ("software_version", "snmp_discovery_ip", "discovery_poller")
         ],
         "dcim/sites": [{"id": 1, "name": "Lab", "slug": "lab"}],
         "extras/tags": [{"id": 7, "name": "checkmk-au", "slug": "checkmk-au"}],
@@ -715,7 +717,7 @@ def test_device_is_found_by_poller_and_address_not_by_name(ours):
     rows = {
         "extras/custom-fields": [
             {"name": field, "object_types": ["dcim.device"], "type": {"value": "text"}}
-            for field in ("software_version", "snmp_discovery_ip")
+            for field in ("software_version", "snmp_discovery_ip", "discovery_poller")
         ],
         "dcim/sites": [{"id": 1, "name": "Lab", "slug": "lab"}],
         "extras/tags": [
@@ -753,7 +755,9 @@ def test_device_is_found_by_poller_and_address_not_by_name(ours):
         )
     assert all(path != "dcim/devices/21" for _, path, _ in calls)
     if ours:
-        assert action == "updated" and calls == [("PATCH", "dcim/devices/20", {"serial": "FOC1"})]
+        owner = {"snmp_discovery_ip": "192.0.2.1", "discovery_poller": "checkmk-au"}
+        assert action == "updated"
+        assert calls == [("PATCH", "dcim/devices/20", {"serial": "FOC1", "custom_fields": owner})]
     else:
         assert action == "created" and [(m, p) for m, p, _ in calls] == [("POST", "dcim/devices")]
 
@@ -893,3 +897,68 @@ def test_placeholder_interface_is_idempotent_and_moves_ip_when_real_interface_is
         assert addresses[50]["address"] == "192.0.2.15/24"
         assert unknown["interface_source"] == "netbox"
         assert unknown["interface"] == "Management1"
+
+
+@pytest.mark.parametrize("owner_recorded", [True, False])
+def test_device_seeded_by_another_poller_is_never_taken_over(owner_recorded):
+    calls = []
+    seeded = {
+        "id": 21,
+        "name": "Switch",
+        "serial": "US-SERIAL",
+        "tenant": None,
+        "site": {"id": 2},
+        "device_type": {"id": 4},
+        "role": {"slug": "switch"},
+        "platform": {"id": 9},
+        "status": {"value": "planned"},
+        # Seeded from manual data by poller checkmk-us: its tag, no discovered tag.
+        "custom_fields": {
+            "snmp_discovery_ip": "192.0.2.1",
+            "inventory_poll_status": "unpolled",
+            **({"discovery_poller": "checkmk-us"} if owner_recorded else {}),
+        },
+        "tags": [{"id": 30}],
+    }
+    rows = {
+        "extras/custom-fields": [
+            {"name": field, "object_types": ["dcim.device"], "type": {"value": "text"}}
+            for field in ("software_version", "snmp_discovery_ip", "discovery_poller")
+        ],
+        "dcim/sites": [{"id": 1, "name": "Lab", "slug": "lab"}],
+        "extras/tags": [
+            {"id": 7, "name": "checkmk-au", "slug": "checkmk-au"},
+            {"id": 8, "name": "discovered", "slug": "discovered"},
+        ],
+        "dcim/manufacturers": [{"id": 3, "name": "Cisco", "slug": "cisco"}],
+        "dcim/device-types": [{"id": 4, "model": "Catalyst 9300-48P", "part_number": "C9300-48P"}],
+        "dcim/device-roles": [{"id": 5, "name": "Switch", "slug": "switch"}],
+        "dcim/platforms": [{"id": 9, "name": "Cisco IOS-XE", "slug": "cisco-ios-xe"}],
+        "dcim/devices": [seeded],
+    }
+
+    def handle(request):
+        path = request.url.path.removeprefix("/api/").strip("/")
+        if request.method == "GET":
+            return httpx.Response(200, json={"results": rows[path], "next": None})
+        calls.append((request.method, path, json.loads(request.content)))
+        return httpx.Response(200, json={"id": 40})
+
+    facts = {
+        "name": "Switch",
+        "manufacturer": "Cisco",
+        "model": "C9300-48P",
+        "platform": "Cisco IOS-XE",
+        "serial": "AU-SERIAL",
+        "software_version": "",
+    }
+    with httpx.Client(
+        base_url="https://netbox.example/api/", transport=httpx.MockTransport(handle)
+    ) as client:
+        # Poller checkmk-au polls a different switch with the same name at the same IP.
+        action, _ = NetBoxDiscovery(client, lambda: None).sync_inventory(
+            "Lab", "checkmk-au", "192.0.2.1", facts
+        )
+    assert action == "created"
+    assert [(method, path) for method, path, _ in calls] == [("POST", "dcim/devices")]
+    assert calls[0][2]["custom_fields"]["discovery_poller"] == "checkmk-au"

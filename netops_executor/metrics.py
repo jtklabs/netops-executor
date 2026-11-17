@@ -45,18 +45,67 @@ def initialize_metrics(db):
             CASE WHEN status IN ({terminal}) THEN queue END,started_at,
             CASE WHEN status IN ({terminal}) THEN updated END,
             CASE WHEN status IN ({terminal}) THEN status END FROM jobs""")
-    db.execute("""CREATE TRIGGER IF NOT EXISTS jobs_metrics_submitted AFTER INSERT ON jobs
+    # Finished jobs are folded into these totals, so a scrape reads only unfinished and newly
+    # finished jobs instead of the whole history. Totals only grow: counters stay monotonic.
+    db.execute("""CREATE TABLE IF NOT EXISTS job_metrics_submitted_rollup (
+        queue TEXT NOT NULL, kind TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(queue,kind))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS job_metrics_finished_rollup (
+        queue TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, count INTEGER NOT NULL,
+        last_finished REAL, PRIMARY KEY(queue,kind,status))""")
+    buckets = ",".join(f"bucket_{index} INTEGER NOT NULL DEFAULT 0" for index in range(len(BUCKETS)))
+    db.execute(f"""CREATE TABLE IF NOT EXISTS job_metrics_duration_rollup (
+        metric TEXT NOT NULL, queue TEXT NOT NULL, kind TEXT NOT NULL, count INTEGER NOT NULL,
+        total REAL NOT NULL, {buckets}, PRIMARY KEY(metric,queue,kind))""")
+    db.execute("""CREATE INDEX IF NOT EXISTS job_metrics_finished_at
+        ON job_metrics(finished_at) WHERE finished_at IS NOT NULL""")
+    # Recreated on every start, like the store's other triggers, so fixes reach existing databases.
+    db.execute("DROP TRIGGER IF EXISTS jobs_metrics_submitted")
+    db.execute("DROP TRIGGER IF EXISTS jobs_metrics_finished")
+    db.execute("""CREATE TRIGGER jobs_metrics_submitted AFTER INSERT ON jobs
         BEGIN
             INSERT OR IGNORE INTO job_metrics(job_id,kind,submitted_queue,created_at,eligible_at)
             VALUES(NEW.id,NEW.kind,NEW.queue,NEW.created,max(NEW.created,coalesce(NEW.start_at,NEW.created)));
         END""")
-    db.execute(f"""CREATE TRIGGER IF NOT EXISTS jobs_metrics_finished AFTER UPDATE OF status ON jobs
+    db.execute(f"""CREATE TRIGGER jobs_metrics_finished AFTER UPDATE OF status ON jobs
         WHEN NEW.status IS NOT OLD.status AND NEW.status IN ({terminal})
         BEGIN
             UPDATE job_metrics SET finished_queue=NEW.queue,started_at=NEW.started_at,
                 finished_at=NEW.updated,finished_status=NEW.status
             WHERE job_id=NEW.id AND finished_at IS NULL;
         END""")
+
+
+DURATIONS = {"duration": "max(0,finished_at-started_at)", "wait": "max(0,started_at-eligible_at)"}
+
+
+def rollup_metrics(db):
+    """Fold finished observations into the rollup totals and drop their rows (one transaction)."""
+    db.execute("BEGIN IMMEDIATE")
+    db.execute("""INSERT INTO job_metrics_submitted_rollup(queue,kind,count)
+        SELECT submitted_queue,kind,count(*) FROM job_metrics WHERE finished_at IS NOT NULL
+        GROUP BY submitted_queue,kind
+        ON CONFLICT(queue,kind) DO UPDATE SET count=count+excluded.count""")
+    db.execute("""INSERT INTO job_metrics_finished_rollup(queue,kind,status,count,last_finished)
+        SELECT finished_queue,kind,finished_status,count(*),max(finished_at) FROM job_metrics
+        WHERE finished_at IS NOT NULL GROUP BY finished_queue,kind,finished_status
+        ON CONFLICT(queue,kind,status) DO UPDATE SET count=count+excluded.count,
+        last_finished=max(coalesce(last_finished,0),excluded.last_finished)""")
+    columns = ",".join(f"bucket_{index}" for index in range(len(BUCKETS)))
+    updates = ",".join(
+        f"bucket_{index}=bucket_{index}+excluded.bucket_{index}" for index in range(len(BUCKETS))
+    )
+    for metric, expression in DURATIONS.items():
+        sums = ",".join(f"sum(({expression})<={limit})" for limit in BUCKETS)
+        db.execute(
+            f"""INSERT INTO job_metrics_duration_rollup(metric,queue,kind,count,total,{columns})
+            SELECT ?,finished_queue,kind,count(*),sum({expression}),{sums} FROM job_metrics
+            WHERE finished_at IS NOT NULL AND started_at IS NOT NULL GROUP BY finished_queue,kind
+            ON CONFLICT(metric,queue,kind) DO UPDATE SET count=count+excluded.count,
+            total=total+excluded.total,{updates}""",
+            (metric,),
+        )
+    db.execute("DELETE FROM job_metrics WHERE finished_at IS NOT NULL")
+    db.execute("COMMIT")
 
 
 def duration_rows(db, expression):
@@ -72,21 +121,51 @@ def duration_rows(db, expression):
     }
 
 
+def add_rows(target, rows, keys):
+    for row in rows:
+        key = tuple(row[k] for k in keys)
+        current = target.get(key)
+        if current is None:
+            target[key] = dict(row)
+            continue
+        for name, value in dict(row).items():
+            if name in keys or value is None:
+                continue
+            if name == "last_finished":
+                current[name] = max(current.get(name) or 0, value)
+            else:
+                current[name] = (current.get(name) or 0) + value
+
+
 def snapshot(store, stale_seconds):
     now = time.time()
     with store.connect() as db:
+        rollup_metrics(db)
         db.execute("BEGIN")
-        submitted = {
-            (row["queue"], row["kind"]): row["count"]
-            for row in db.execute("""SELECT submitted_queue AS queue,kind,count(*) AS count
-                FROM job_metrics GROUP BY submitted_queue,kind""")
-        }
-        completed = {
-            (row["queue"], row["kind"], row["status"]): dict(row)
-            for row in db.execute("""SELECT finished_queue AS queue,kind,finished_status AS status,
+        counts = {}
+        add_rows(
+            counts,
+            db.execute("""SELECT submitted_queue AS queue,kind,count(*) AS count
+                FROM job_metrics GROUP BY submitted_queue,kind"""),
+            ("queue", "kind"),
+        )
+        add_rows(
+            counts, db.execute("SELECT queue,kind,count FROM job_metrics_submitted_rollup"), ("queue", "kind")
+        )
+        submitted = {key: row["count"] for key, row in counts.items()}
+        completed = {}
+        add_rows(
+            completed,
+            db.execute("""SELECT finished_queue AS queue,kind,finished_status AS status,
                 count(*) AS count,max(finished_at) AS last_finished
-                FROM job_metrics WHERE finished_at IS NOT NULL GROUP BY finished_queue,kind,finished_status""")
-        }
+                FROM job_metrics WHERE finished_at IS NOT NULL GROUP BY finished_queue,kind,finished_status"""),
+            ("queue", "kind", "status"),
+        )
+        add_rows(
+            completed,
+            db.execute("SELECT queue,kind,status,count,last_finished FROM job_metrics_finished_rollup"),
+            ("queue", "kind", "status"),
+        )
         current = {
             (row["queue"], row["kind"], row["status"]): row["count"]
             for row in db.execute("""SELECT queue,kind,status,count(*) AS count FROM jobs
@@ -100,14 +179,25 @@ def snapshot(store, stale_seconds):
                 (now,),
             )
         }
+        # A job is due once its start window opened and no earlier batch wave holds it. A job
+        # resumed after a review gate (already started) has waited only since the decision.
         queues = {
             row["queue"]: dict(row)
             for row in db.execute(
-                """SELECT queue,count(*) AS queued,
-                sum(start_at IS NULL OR start_at<=?) AS due,
-                min(CASE WHEN start_at IS NULL OR start_at<=? THEN max(created,coalesce(start_at,created)) END) AS oldest
-                FROM jobs WHERE status='queued' GROUP BY queue""",
-                (now, now),
+                """SELECT queue,count(*) AS queued,sum(due) AS due,
+                min(CASE WHEN due THEN eligible END) AS oldest FROM (
+                    SELECT queue,
+                    (start_at IS NULL OR start_at<=?) AND NOT EXISTS(
+                        SELECT 1 FROM batch_members m JOIN batch_members p
+                            ON p.batch=m.batch AND p.wave<m.wave JOIN jobs pj ON pj.id=p.job
+                        WHERE m.job=jobs.id
+                        AND pj.status NOT IN ('succeeded','completed_with_warnings','manually_completed')
+                    ) AS due,
+                    CASE WHEN started_at IS NOT NULL THEN updated
+                        ELSE max(created,coalesce(start_at,created)) END AS eligible
+                    FROM jobs WHERE status='queued'
+                ) GROUP BY queue""",
+                (now,),
             )
         }
         workers = defaultdict(lambda: [0, 0])
@@ -120,8 +210,19 @@ def snapshot(store, stale_seconds):
             counts = workers[(pool, row["version"] or "unknown")]
             counts[0] += 1
             counts[1] += row["state"] == "busy"
-        duration = duration_rows(db, "max(0,finished_at-started_at)")
-        wait = duration_rows(db, "max(0,started_at-eligible_at)")
+        duration = duration_rows(db, DURATIONS["duration"])
+        wait = duration_rows(db, DURATIONS["wait"])
+        for metric, target in (("duration", duration), ("wait", wait)):
+            add_rows(
+                target,
+                db.execute(
+                    "SELECT queue,kind,count,total,"
+                    + ",".join(f"bucket_{index}" for index in range(len(BUCKETS)))
+                    + " FROM job_metrics_duration_rollup WHERE metric=?",
+                    (metric,),
+                ),
+                ("queue", "kind"),
+            )
     return {
         "submitted": submitted,
         "completed": completed,

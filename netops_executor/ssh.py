@@ -9,7 +9,7 @@ from pathlib import Path
 import paramiko
 
 from .credentials import AuthenticationRejected, Selector, Vault
-from .pins import PinnedHostKeys
+from .pins import HostKeyChanged, PinnedHostKeys, ssh_fingerprint
 from .store import Store
 
 
@@ -21,12 +21,20 @@ class DeviceError(Exception):
         self.diagnostics = diagnostics
 
 
+class HostKeyChangedError(DeviceError):
+    """A device presented an untrusted, changed host key; the connection stopped before login."""
+
+
 class SSH:
-    def __init__(self, settings, device, guard=lambda: None, credential_profiles=None, audit=None):
+    def __init__(
+        self, settings, device, guard=lambda: None, credential_profiles=None, audit=None, max_attempts=None
+    ):
         self.settings, self.device, self.guard = settings, device, guard
         self.client = None
         self.f5_shell_type = None
         self.enable_password = None
+        # How the host key was trusted on the last connection: known_hosts, pinned or pinned_now.
+        self.host_key_status = None
         self.transfer_guard = guard
         self.progress = lambda done, total: None
         self.selector = Selector(
@@ -35,6 +43,7 @@ class SSH:
             device.host,
             credential_profiles if credential_profiles is not None else device.credential_profiles,
             audit,
+            max_attempts=max_attempts,
         )
 
     def connect(self):
@@ -48,11 +57,12 @@ class SSH:
         # Verified known_hosts entries always win; pinning only covers hosts missing from the file.
         if not pinning or Path(self.settings.known_hosts).is_file():
             client.load_host_keys(str(self.settings.known_hosts))
-        client.set_missing_host_key_policy(
+        policy = (
             PinnedHostKeys(Store(self.settings.data_dir / "jobs.sqlite3"), f"ssh:{d.host}:{d.port}")
             if pinning
             else paramiko.RejectPolicy()
         )
+        client.set_missing_host_key_policy(policy)
         base = dict(
             hostname=d.host,
             port=d.port,
@@ -126,9 +136,39 @@ class SSH:
             client.close()
             if isinstance(exc, DeviceError):
                 raise
+            if changed := self.host_key_changed(exc):
+                raise changed from None
             raise DeviceError("SSH authentication or connection failed; see credential attempts") from None
         self.client = client
+        self.host_key_status = getattr(policy, "outcome", None) or "known_hosts"
+        presented = client.get_transport().get_remote_server_key()
+        Store(self.settings.data_dir / "jobs.sqlite3").resolve_host_key_alerts(
+            f"ssh:{d.host}:{d.port}", ssh_fingerprint(presented), "trusted key presented again"
+        )
         return client
+
+    def host_key_changed(self, exc):
+        """Record a changed host key (one alert and email per new key) and explain the failure."""
+        d = self.device
+        if isinstance(exc, HostKeyChanged):
+            presented, expected = exc.presented, exc.expected
+        elif isinstance(exc, paramiko.BadHostKeyException):
+            presented, expected = ssh_fingerprint(exc.key), ssh_fingerprint(exc.expected_key)
+        else:
+            return None
+        Store(self.settings.data_dir / "jobs.sqlite3").host_key_alert(
+            f"ssh:{d.host}:{d.port}",
+            d.id,
+            presented,
+            expected,
+            self.settings.ssh_host_keys,
+            self.settings.poller_instance,
+            notify=bool(self.settings.alert_email),
+        )
+        return HostKeyChangedError(
+            f"SSH host key for {d.host}:{d.port} changed and is not trusted; no credentials were sent. "
+            "Review GET /api/v1/host-keys/alerts and trust the new key if the change is expected"
+        )
 
     def close(self):
         if self.client:
@@ -243,14 +283,22 @@ class SSH:
         raise DeviceError("Could not detect the F5 login shell", diagnostics={"shell_detection": attempts})
 
     def tmsh(self, command, timeout=120, secret=False):
+        diagnostics = command == "show /sys license"
+        read = diagnostics or command.startswith(("show ", "list "))
+        # Reads detect the login shell; later commands on the connection reuse what was found.
+        shell_type = self.detect_f5_shell(timeout) if read and not secret else self.f5_shell_type
+        if shell_type == "tmsh":
+            if secret:
+                # Without bash, the secret would be on the device's tmsh command line.
+                raise DeviceError(
+                    "This F5 operation needs an account whose login shell is bash (Advanced Shell); "
+                    "the selected account logs in to tmsh"
+                )
+            # A tmsh login shell runs the command itself, as `tmsh -q -c` does from bash.
+            return self.shell(command, timeout, diagnostics=read)
         if secret:
             # Keep the UCS passphrase off process argument lists and never persist the command/output.
             return self.shell("tmsh -q", timeout, command + "\nquit\n")
-        diagnostics = command == "show /sys license"
-        if (diagnostics or command.startswith(("show ", "list "))) and self.detect_f5_shell(
-            timeout
-        ) == "tmsh":
-            return self.shell(command, timeout, diagnostics=True)
         return self.shell("tmsh -q -c " + shlex.quote(command), timeout, diagnostics=diagnostics)
 
     def put(self, local, remote):

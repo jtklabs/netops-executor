@@ -57,6 +57,9 @@ class Credential(Model):
     enabled: bool = True
     # Empty means usable for any target of this protocol; use exact addresses/IDs to restrict.
     targets: list[str] = Field(default_factory=list, max_length=1000)
+    # SNMP discovery can reach hosts that are not in the inventory and that identified their own
+    # vendor. Only profiles opted in here (or naming the address in targets) are sent to them.
+    discovery: bool = False
 
     @model_validator(mode="after")
     def valid(self):
@@ -170,7 +173,9 @@ class Vault:
         with self.store.connect() as db:
             return [self.metadata(r) for r in db.execute("SELECT * FROM credentials ORDER BY priority,id")]
 
-    def candidates(self, kind, names=None, targets=()):
+    def candidates(self, kind, names=None, targets=(), discovery=False):
+        """Enabled profiles for these targets. With discovery, an unrestricted profile must also
+        be opted in for discovered hosts; a profile listing the address is always eligible."""
         with self.store.connect() as db:
             rows = db.execute(
                 "SELECT * FROM credentials WHERE kind=? AND enabled=1 ORDER BY priority,id", (kind,)
@@ -186,7 +191,11 @@ class Vault:
         result = []
         for row in rows:
             payload = json.loads(self.decrypt(cipher, row["secret"]))
-            if not payload["targets"] or set(payload["targets"]) & set(targets):
+            if payload["targets"]:
+                eligible = bool(set(payload["targets"]) & set(targets))
+            else:
+                eligible = not discovery or payload.get("discovery", False)
+            if eligible:
                 result.append({**payload, "id": row["id"], "revision": row["revision"]})
         return result
 

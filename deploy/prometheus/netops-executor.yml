@@ -5,7 +5,8 @@ scrape_configs:
     metrics_path: /metrics
     authorization:
       type: Bearer
-      credentials_file: /etc/prometheus/secrets/netops-executor-token
+      # NETOPS_METRICS_TOKEN: opens /metrics only, never the job or credential API.
+      credentials_file: /etc/prometheus/secrets/netops-executor-metrics-token
     static_configs:
       - targets:
           - netops-executor.example.net

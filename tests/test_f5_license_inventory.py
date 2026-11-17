@@ -197,7 +197,7 @@ def test_discovery_distinguishes_license_read_and_plugin_write(settings, store, 
     settings.devices["bigip"] = Device(id="bigip", host="192.0.2.15", device_type="f5")
 
     class LicenseSSH:
-        def __init__(self, settings, device, guard, audit):
+        def __init__(self, settings, device, guard, audit, max_attempts=None):
             guard()
 
         def tmsh(self, command, timeout):

@@ -265,6 +265,13 @@ def create_app(settings=None):
 
     authenticated = [Depends(auth)]
 
+    def scrape_auth(credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]):
+        # The metrics token opens /metrics only; the API token still works for existing scrapers.
+        offered = credentials.credentials.encode() if credentials else b""
+        allowed = [settings.token] + ([settings.metrics_token] if settings.metrics_token else [])
+        if not credentials or not any(hmac.compare_digest(offered, token.encode()) for token in allowed):
+            raise HTTPException(401, "valid bearer token required", headers={"WWW-Authenticate": "Bearer"})
+
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, exc):
         # Pydantic's default response echoes submitted values, including passwords.
@@ -402,9 +409,12 @@ def create_app(settings=None):
     def healthz():
         return {"status": "ok", "api_version": "v1", "version": __version__}
 
-    @app.get("/metrics", dependencies=authenticated, tags=["Metrics"], response_class=Response)
+    @app.get("/metrics", dependencies=[Depends(scrape_auth)], tags=["Metrics"], response_class=Response)
     def metrics():
         from prometheus_client import CONTENT_TYPE_LATEST
+
+        # Without workers or other API traffic, stale running jobs would otherwise stay counted.
+        store.reap(settings.stale_seconds)
 
         return Response(
             render_metrics(store, settings),
@@ -603,6 +613,16 @@ def create_app(settings=None):
     @app.post("/api/v1/credentials/rotate", dependencies=authenticated)
     def rotate():
         return vault.rotate()
+
+    @app.get("/api/v1/host-keys/alerts", dependencies=authenticated, tags=["Trust"])
+    def host_key_alerts(state: Literal["open", "trusted", "resolved"] | None = None):
+        """SSH host keys that changed: one alert per endpoint and presented key."""
+        return store.host_key_alerts(state)
+
+    @app.post("/api/v1/host-keys/alerts/{alert_id}/trust", dependencies=authenticated, tags=["Trust"])
+    def trust_host_key(alert_id: str):
+        """Pin the key this alert reports for its endpoint. Pinned (NETOPS_SSH_HOST_KEYS=pin) only."""
+        return store.trust_host_key(alert_id)
 
     @app.get("/api/v1/pins", dependencies=authenticated, tags=["Trust"])
     def pins():

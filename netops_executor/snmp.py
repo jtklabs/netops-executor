@@ -12,11 +12,10 @@ from paramiko import SSHException
 from pysnmp.hlapi.v3arch import asyncio as snmp
 from pysnmp.proto import rfc1902, rfc1905
 
-from .config import Device
 from .credentials import AuthenticationRejected, Selector, Vault
 from .discovery_overrides import apply_manual_fallback, apply_rules, load_rules
 from .f5_operations import license_details
-from .inventory_enrichment import collect_enrichment
+from .inventory_enrichment import attempts_for, collect_enrichment, discovery_target
 from .netbox_discovery import SyncError, sync_device, sync_licenses
 from .netbox_operations import preferred_image, report_failed_poll, report_observation, sync_observed_licenses
 from .snmp_address import collect_polled_address
@@ -482,6 +481,14 @@ class SnmpRunner:
             "interface_source": "placeholder",
         }
         facts["poll_status"] = "failed"
+        if (
+            facts.get("manufacturer") == "F5"
+            and facts.get("serial")
+            and re.search(r"\bBIG-IP\s+(?:Virtual Edition|VE)\b", facts.get("model", ""), re.I)
+        ):
+            # A partial poll read the VE's chassis serial, not its license serial: it may fill an
+            # empty NetBox serial but never replace one.
+            facts["serial_source"] = "snmp"
         self.result["discovery"] = facts
 
     def sync_inventory(self):
@@ -495,6 +502,9 @@ class SnmpRunner:
             virtual_edition = re.search(r"\bBIG-IP\s+(?:Virtual Edition|VE)\b", discovery["model"], re.I)
             if serial and virtual_edition:
                 discovery.update(serial=serial, serial_source="license")
+                if "field_sources" in discovery:
+                    # Observed over SSH: never treat it as a manual or NetBox-kept value.
+                    discovery["field_sources"]["serial"] = "observed"
             elif virtual_edition and discovery["serial"]:
                 # Without SSH, keep the chassis serial SNMP reported. It never replaces a
                 # serial NetBox already holds (see netbox_discovery.sync_inventory).
@@ -587,10 +597,16 @@ class SnmpRunner:
                         "access_point_inventory",
                         "license_lookup",
                         "license_inventory",
+                        "management_ip_sync",
                     )
                 )
             )
-            manual = [key for key, source in discovery.get("field_sources", {}).items() if source == "manual"]
+            # Blank SNMP readings, filled from manual data or kept from NetBox, are reported.
+            manual = [
+                key
+                for key, source in discovery.get("field_sources", {}).items()
+                if source in {"manual", "netbox-existing"}
+            ]
             discovery["manual_fields"] = manual
             rule_failure = discovery.get("identity_rules_config", {}).get("status") == "failed" or any(
                 row["status"] in {"failed", "missing"} for row in discovery.get("identity_rules", [])
@@ -606,44 +622,31 @@ class SnmpRunner:
         """Return the VE license serial or a failure with redacted diagnostics."""
         address = str(self.request.device_ip)
         self._f5_license = None
-        targets = [d for d in self.settings.devices.values() if d.host == address and d.device_type == "f5"]
-        if len(targets) > 1:
+        if not self.request.enrich_ssh:
+            return "", {"status": "skipped", "reason": "SSH enrichment disabled for this job"}
+        try:
+            target = discovery_target(self.settings, self.store, address, "f5")
+        except DeviceError as error:
+            return "", {"status": "skipped", "reason": str(error)}
+        except Conflict:
+            return "", {
+                "status": "failed",
+                "reason": "SSH credential store is unavailable; check NETOPS_CREDENTIAL_KEY_FILE",
+            }
+        if target is None:
             return "", {
                 "status": "skipped",
-                "reason": "several f5 inventory devices have this IP as their host",
+                "reason": "no SSH credential profile is enabled for discovery or lists this IP",
             }
-        if targets:
-            target = targets[0]
-        else:
-            # SNMP has already identified a BIG-IP VE. Dynamic discovery uses only
-            # saved SSH profiles eligible for this IP, with the usual host-key policy.
-            try:
-                candidates = Vault(self.store, self.settings.credential_key_file).candidates(
-                    "ssh", targets=(address,)
-                )
-            except Conflict:
-                return "", {
-                    "status": "failed",
-                    "reason": "SSH credential store is unavailable; check NETOPS_CREDENTIAL_KEY_FILE",
-                }
-            if not candidates:
-                return "", {
-                    "status": "skipped",
-                    "reason": "no enabled SSH credential profile is eligible for this IP",
-                }
-            target = Device(
-                id=address,
-                host=address,
-                device_type="f5",
-                credential_profiles=[candidate["id"] for candidate in candidates],
-            )
+        inventory = bool(self.settings.inventory_at(address))
         ssh = SSH(
             self.settings,
             target,
             guard=checkpoint,
             audit=lambda data: self.store.credential_event(self.job["id"], self.worker, data),
+            max_attempts=attempts_for(self.settings, address),
         )
-        lookup = {"device": target.id, "source": "inventory" if targets else "discovery"}
+        lookup = {"device": target.id, "source": "inventory" if inventory else "discovery"}
         try:
             self._f5_license = license_details(ssh)
             serial = self._f5_license["serial"]

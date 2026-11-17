@@ -182,3 +182,62 @@ def test_legacy_jobs_are_backfilled_once_and_worker_versions_are_aggregated(sett
     assert "private-worker-id" not in render_metrics(upgraded, settings).decode()
     clock[0] += settings.stale_seconds + 1
     assert value(samples(upgraded, settings), "netops_workers_online") == 0
+
+
+def test_rollup_keeps_totals_and_merges_jobs_finished_after_it(settings, store, clock, monkeypatch):
+    from netops_executor import metrics
+
+    first = store.submit({"device": "a"}, "a", kind="ssh")
+    store.claim("worker")
+    clock[0] = 1010
+    store.finish(first["id"], "worker", "succeeded")
+    for _ in range(2):  # repeated scrapes neither lose nor double the folded totals
+        observations = samples(store, settings)
+        assert value(observations, "netops_jobs_completed_total", job_type="ssh", result="pass") == 1
+        assert value(observations, "netops_job_duration_seconds_sum", job_type="ssh") == 10
+    with store.connect() as db:
+        # Finished rows were folded into the rollup, so a scrape no longer reads the whole history.
+        assert db.execute("SELECT count(*) FROM job_metrics WHERE finished_at IS NOT NULL").fetchone()[0] == 0
+    # A job finishing between the rollup and the read is counted from its live row.
+    monkeypatch.setattr(metrics, "rollup_metrics", lambda db: None)
+    second = store.submit({"device": "b"}, "b", kind="ssh")
+    store.claim("worker")
+    clock[0] = 1030
+    store.finish(second["id"], "worker", "succeeded")
+    observations = samples(store, settings)
+    assert value(observations, "netops_jobs_submitted_total", job_type="ssh") == 2
+    assert value(observations, "netops_jobs_completed_total", job_type="ssh", result="pass") == 2
+    assert value(observations, "netops_job_duration_seconds_count", job_type="ssh") == 2
+    assert value(observations, "netops_job_duration_seconds_sum", job_type="ssh") == 30
+
+
+def test_job_resumed_after_review_waits_from_the_decision(settings, store, clock):
+    from netops_executor.execution_models import ValidationDecision
+    from netops_executor.store import NeedsReview
+
+    job = store.submit({"device": "lab", "queue": "upgrade"}, "review", kind="upgrade")
+    store.claim("worker")
+    with pytest.raises(NeedsReview):
+        store.open_gate(job["id"], "worker", "post_validation", {}, {})
+    gate = store.get(job["id"])["validation_gates"][-1]
+    clock[0] = 15400  # four hours later, an operator approves the gate
+    store.decide(
+        job["id"],
+        ValidationDecision(
+            gate_id=gate["id"],
+            validation_revision=gate["revision"],
+            action="accept",
+            operator="jason",
+            reason="checked manually",
+        ),
+    )
+    assert value(samples(store, settings), "netops_queue_oldest_due_wait_seconds", queue="upgrade") == 0
+
+
+def test_metrics_token_opens_only_the_metrics_endpoint(settings):
+    settings.metrics_token = "m" * 40
+    client = TestClient(create_app(settings))
+    scrape = {"Authorization": "Bearer " + settings.metrics_token}
+    assert client.get("/metrics", headers=scrape).status_code == 200
+    assert client.get("/api/v1/jobs", headers=scrape).status_code == 401
+    assert client.get("/metrics", headers={"Authorization": "Bearer " + settings.token}).status_code == 200

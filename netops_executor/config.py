@@ -110,9 +110,13 @@ class Settings:
     smtp_username: str | None = None
     smtp_password: str | None = field(default=None, repr=False)
     smtp_from: str | None = None
+    # Operator addresses for executor alerts, such as a device's SSH host key changing.
+    alert_email: list = field(default_factory=list)
     smtp_ca_file: Path | None = None
     netbox_url: str | None = None
     netbox_token: str | None = field(default=None, repr=False)
+    # Read-only scrape credential for GET /metrics, so Prometheus never holds the API token.
+    metrics_token: str | None = field(default=None, repr=False)
     netbox_ca_file: Path | None = None
     poller_instance: str | None = None
     discovery_overrides_file: Path | None = None
@@ -122,6 +126,22 @@ class Settings:
             return self.devices[identifier]
         ip = str(ip_address(identifier))
         return next((d for d in self.devices.values() if d.host == ip), Device(id=ip, host=ip))
+
+    def inventory_at(self, address):
+        """Inventory entries whose host is this IP address, whatever their device_type.
+
+        An entry the administrator configured for an address keeps its credential limits even
+        when SNMP reports a different vendor. Hosts given as DNS names are not resolved.
+        """
+        wanted = ip_address(address)
+        matches = []
+        for device in self.devices.values():
+            try:
+                if ip_address(device.host) == wanted:
+                    matches.append(device)
+            except ValueError:
+                continue
+        return matches
 
     @classmethod
     def load(cls):
@@ -157,6 +177,13 @@ class Settings:
 
             result.discovery_overrides_file = Path(env("NETOPS_DISCOVERY_OVERRIDES_FILE"))
             load_rules(result.discovery_overrides_file)
+        result.metrics_token = env("NETOPS_METRICS_TOKEN") or None
+        if result.metrics_token is not None and (
+            len(result.metrics_token) < 32 or result.metrics_token == token
+        ):
+            raise ValueError(
+                "NETOPS_METRICS_TOKEN needs 32+ characters and must differ from NETOPS_API_TOKEN"
+            )
         result.netbox_url = env("NETOPS_NETBOX_URL") or None
         result.netbox_token = env("NETOPS_NETBOX_TOKEN") or None
         if result.netbox_url:
@@ -266,6 +293,11 @@ def smtp(result):
     result.smtp_username, result.smtp_password = username, password
     if env("NETOPS_SMTP_CA_FILE"):
         result.smtp_ca_file = Path(env("NETOPS_SMTP_CA_FILE"))
+    alerts = [item.strip() for item in env("NETOPS_ALERT_EMAIL", "").split(",") if item.strip()]
+    try:
+        result.alert_email = [TypeAdapter(Email).validate_python(item) for item in alerts[:20]]
+    except ValueError:
+        raise ValueError("NETOPS_ALERT_EMAIL must be up to 20 comma-separated addresses") from None
 
 
 def webhook_url(url, variable="NETOPS_WEBHOOK_URL"):

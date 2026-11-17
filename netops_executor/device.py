@@ -204,6 +204,12 @@ class BigIP:
             raise DeviceError("cannot identify a single healthy active volume")
         # Running version/build is authoritative, including hotfix builds.
         raw = self.ssh.tmsh("show /sys version")
+        if getattr(self.ssh, "f5_shell_type", None) == "tmsh":
+            # Upgrades use bash (df, sha256sum, SFTP and secret stdin): stop before any change.
+            raise DeviceError(
+                "F5 upgrades need an account whose login shell is bash (Advanced Shell); "
+                "the selected account logs in to tmsh"
+            )
         version = re.search(r"(?m)^\s*Version\s+(\S+)\s*$", raw)
         build = re.search(r"(?m)^\s*Build\s+(\S+)\s*$", raw)
         if not version or not build:

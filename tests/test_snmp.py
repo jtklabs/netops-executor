@@ -620,8 +620,8 @@ def test_f5_discovery_uses_license_suffix_for_ve_and_falls_back_to_snmp(
     seen = []
 
     class LicenseSSH:
-        def __init__(self, _settings, device, guard, audit):
-            assert device.id == "bigip"
+        def __init__(self, _settings, device, guard, audit, max_attempts=None):
+            assert device.id == "bigip" and max_attempts is None  # inventory: normal selection
             guard()
 
         def tmsh(self, command, timeout):
@@ -719,17 +719,20 @@ def test_f5_license_lookup_reports_redacted_command_diagnostics(
 
 
 @pytest.mark.parametrize(
-    ("targets", "enabled", "key_available", "lookup_status"),
+    ("targets", "opted_in", "enabled", "key_available", "lookup_status"),
     [
-        (["192.0.2.15"], True, True, "succeeded"),
-        ([], True, True, "succeeded"),
-        (["192.0.2.99"], True, True, "skipped"),
-        (["192.0.2.15"], False, True, "skipped"),
-        (["192.0.2.15"], True, False, "failed"),
+        # A profile naming the address is always eligible.
+        (["192.0.2.15"], False, True, True, "succeeded"),
+        # An unrestricted profile must be opted in before a discovered host may receive it.
+        ([], True, True, True, "succeeded"),
+        ([], False, True, True, "skipped"),
+        (["192.0.2.99"], True, True, True, "skipped"),
+        (["192.0.2.15"], False, False, True, "skipped"),
+        (["192.0.2.15"], False, True, False, "failed"),
     ],
 )
 def test_f5_discovery_uses_saved_ssh_profiles_with_empty_inventory(
-    client, settings, store, monkeypatch, targets, enabled, key_available, lookup_status
+    client, settings, store, monkeypatch, targets, opted_in, enabled, key_available, lookup_status
 ):
     from test_controls_credentials import vault_for
 
@@ -740,7 +743,12 @@ def test_f5_discovery_uses_saved_ssh_profiles_with_empty_inventory(
     vault_for(settings, store).put(
         "bigip-ssh",
         Credential(
-            kind="ssh", username="root", password="saved-ssh-password", targets=targets, enabled=enabled
+            kind="ssh",
+            username="root",
+            password="saved-ssh-password",
+            targets=targets,
+            enabled=enabled,
+            discovery=opted_in,
         ),
     )
     if not key_available:
@@ -748,7 +756,8 @@ def test_f5_discovery_uses_saved_ssh_profiles_with_empty_inventory(
     seen = []
 
     class LicenseSSH:
-        def __init__(self, current_settings, device, guard, audit):
+        def __init__(self, current_settings, device, guard, audit, max_attempts=None):
+            assert max_attempts == 2  # a discovered host gets few authentication attempts
             assert device.host == device.id == "192.0.2.15"
             assert device.device_type == "f5"
             assert device.credential_profiles == ["bigip-ssh"]
@@ -1005,14 +1014,14 @@ def test_cisco_stack_discovery_joins_member_chassis_and_excludes_provisioned_slo
     ]
 
 
-def discover(client, settings, store, monkeypatch, values):
+def discover(client, settings, store, monkeypatch, values, **options):
     settings.netbox_url = "https://netbox.example"
     settings.netbox_token = "x" * 40
     settings.poller_instance = "lab"
     agent = FakeAgent(monkeypatch, values)
     monkeypatch.setattr(snmp, "sync_device", lambda *_: ("created", 42))
     monkeypatch.setattr(snmp, "sync_licenses", lambda *args: {"status": "created", "assignment_id": 1})
-    response = client.post("/api/v1/snmp/walks", json={"device_ip": "192.0.2.15", "site": "Lab"})
+    response = client.post("/api/v1/snmp/walks", json={"device_ip": "192.0.2.15", "site": "Lab", **options})
     assert response.status_code == 202
     process(settings, store, store.claim("worker"), "worker")
     return store.get(response.json()["id"]), agent
@@ -1206,3 +1215,56 @@ def test_invalid_access_point_index_is_reported_without_failing_discovery(
         "error": "Aruba returned an invalid access point index",
     }
     assert "access_points" not in facts
+
+
+@pytest.mark.parametrize("inventory_type", [None, "linux"])
+def test_f5_license_lookup_respects_enrich_ssh_and_inventory_limits(
+    client, settings, store, monkeypatch, inventory_type
+):
+    from test_controls_credentials import vault_for
+
+    from netops_executor.config import Device
+    from netops_executor.credentials import Credential
+    from netops_executor.snmp_identity import SYS_NAME, SYS_OBJECT_ID
+
+    settings.devices = {}
+    vault = vault_for(settings, store)
+    vault.put("discovery-ro", Credential(kind="ssh", username="ro", password="ro-secret", discovery=True))
+    vault.put("lb-admin", Credential(kind="ssh", username="admin", password="admin-secret"))
+    if inventory_type:
+        # SNMP says F5, but the administrator registered the host as linux with one profile.
+        settings.devices["lb1"] = Device(
+            id="lb1", host="192.0.2.15", device_type=inventory_type, credential_profiles=["lb-admin"]
+        )
+    seen = []
+
+    class LicenseSSH:
+        def __init__(self, _settings, device, guard, audit, max_attempts=None):
+            seen.append((device.id, device.credential_profiles, max_attempts))
+
+        def tmsh(self, command, timeout):
+            return "Registration key    ABCDE-FGHIJ-KLMNO-PQRST-UVW1234"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(snmp, "SSH", LicenseSSH)
+    agent = {
+        SYS_NAME: rfc1902.OctetString("bigip"),
+        SYS_OBJECT_ID: rfc1902.ObjectName("1.3.6.1.4.1.3375.2.1.3.2"),
+        "1.3.6.1.4.1.3375.2.1.3.5.2.0": rfc1902.OctetString("BIG-IP Virtual Edition"),
+        "1.3.6.1.4.1.3375.2.1.3.3.3.0": rfc1902.OctetString("SNMP-SERIAL"),
+        "1.3.6.1.4.1.3375.2.1.4.2.0": rfc1902.OctetString("17.5.1"),
+    }
+    job, _ = discover(client, settings, store, monkeypatch, agent, enrich_ssh=False)
+    facts = job["result"]["discovery"]
+    # enrich_ssh=false means no SSH at all, including the F5 license lookup.
+    assert seen == [] and facts["license_lookup"]["status"] == "skipped"
+    assert facts["serial"] == "SNMP-SERIAL" and facts["serial_source"] == "snmp"
+    job, _ = discover(client, settings, store, monkeypatch, agent)
+    if inventory_type:
+        # The inventory entry's credential limit holds even though its device_type differs.
+        assert seen == [("lb1", ["lb-admin"], None)]
+        assert job["result"]["discovery"]["license_lookup"]["source"] == "inventory"
+    else:
+        assert seen == [("192.0.2.15", ["discovery-ro"], 2)]

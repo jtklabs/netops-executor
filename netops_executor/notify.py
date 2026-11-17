@@ -652,6 +652,54 @@ def batch_report(batch, jobs, state, label, generated=None):
 # Delivery
 
 
+def host_key_report(alert, label, generated=None):
+    """Subject, text and HTML for a changed SSH host key that needs an operator's decision."""
+    device = label(alert["device"])
+    host = alert["endpoint"].removeprefix("ssh:")
+    pinned = alert["mode"] == "pin"
+    action = (
+        f"POST /api/v1/host-keys/alerts/{alert['id']}/trust (with the API token)"
+        if pinned
+        else f"replace the entry for {host.rsplit(':', 1)[0]} in NETOPS_KNOWN_HOSTS"
+    )
+    rows = [
+        ("Device", device),
+        ("Endpoint", host),
+        ("Poller", alert.get("poller") or "default"),
+        ("Trusted key", alert.get("expected") or "unknown"),
+        ("Presented key", alert["presented"]),
+        ("First seen", when(alert["first_seen"])),
+        ("Trusted by", "executor pin store" if pinned else "NETOPS_KNOWN_HOSTS"),
+    ]
+    steps = [
+        "The executor stopped before sending any credential. SSH jobs for this device fail until "
+        "the key is trusted.",
+        "If the change is expected (device replaced, reinstalled or its keys regenerated), " + action + ".",
+        "If it is not expected, investigate before trusting it: a different device or an "
+        "intercepting host may be answering at this address.",
+        "This is the only email for this key. Further attempts are counted on the alert, "
+        "which closes once the key is trusted or the device presents its trusted key again.",
+    ]
+    subject = f"[NetOps] Action needed: SSH host key changed for {device}"
+    text = (
+        f"SSH host key changed for {device}\n\n"
+        + "\n".join(f"{name}: {value}" for name, value in rows)
+        + "\n\n"
+        + "\n".join("- " + step for step in steps)
+        + f"\n\nAlert: {alert['id']}\n"
+    )
+    footer = f"alert {e(alert['id'])} · executor {e(__version__)} · {e(when(generated or time.time()))}"
+    html_body = page(
+        "SSH host key changed",
+        device,
+        "needs_review",
+        fact_table(rows) + callout(steps, "needs_review"),
+        footer,
+        f"{device} presented a different SSH host key; action is needed to trust it.",
+    )
+    return subject, text, html_body
+
+
 def message(sender, recipients, subject, text, html_body, headers=None):
     # Header lines up to the RFC 5322 limit: Python 3.11 folds a long subject with quotes or angle
     # brackets onto a continuation line that some readers show with a leading space.
@@ -723,6 +771,17 @@ class EmailSender:
 
     def build(self, delivery):
         """(message, status) to send, or the reason to skip the delivery."""
+        if delivery["kind"] == "host_key":
+            alert = self.store.host_key_alert_get(delivery["subject"])
+            if alert["state"] != "open":
+                return "alert closed before delivery"
+            if not self.settings.alert_email:
+                return "no NETOPS_ALERT_EMAIL"
+            subject, text, html_body = host_key_report(alert, self.label)
+            headers = {"X-NetOps-Alert": alert["id"], "X-NetOps-Status": "host_key_changed"}
+            return message(
+                self.settings.smtp_from, self.settings.alert_email, subject, text, html_body, headers
+            ), ("open")
         if delivery["kind"] == "job":
             job = self.store.get(delivery["subject"])
             recipients = job["request"].get("notify_email")

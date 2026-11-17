@@ -177,6 +177,15 @@ class Store:
             from .metrics import initialize_metrics
 
             initialize_metrics(db)
+            # One alert per endpoint and presented key while it is open: repeated jobs that hit the
+            # same changed key update it instead of sending another email.
+            db.execute("""CREATE TABLE IF NOT EXISTS host_key_alerts (
+                id TEXT PRIMARY KEY, endpoint TEXT NOT NULL, device TEXT NOT NULL,
+                presented TEXT NOT NULL, expected TEXT, mode TEXT NOT NULL, poller TEXT,
+                state TEXT NOT NULL, first_seen REAL NOT NULL, last_seen REAL NOT NULL,
+                attempts INTEGER NOT NULL, resolved_at REAL, resolution TEXT)""")
+            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS host_key_alerts_open
+                ON host_key_alerts(endpoint,presented) WHERE state='open'""")
             if "digest" not in {row["name"] for row in db.execute("PRAGMA table_info(job_secrets)")}:
                 db.execute("ALTER TABLE job_secrets ADD COLUMN digest TEXT")
             # A job password is needed only while the job can run or resume after a review gate.
@@ -924,8 +933,10 @@ class Store:
                 (payload, key, gate["id"]),
             )
             db.execute(
-                "UPDATE jobs SET status='queued',worker=NULL,heartbeat=NULL,queue=coalesce(?,queue) WHERE id=?",
-                (decision.queue, job),
+                # updated marks when the resumed job became claimable again (queue wait metrics).
+                "UPDATE jobs SET status='queued',worker=NULL,heartbeat=NULL,queue=coalesce(?,queue),"
+                "updated=? WHERE id=?",
+                (decision.queue, time.time(), job),
             )
         return {"gate_id": decision.gate_id, "state": "pending"}
 
@@ -985,18 +996,108 @@ class Store:
         return False
 
     def pin(self, key, kind, fingerprint):
-        """Trust on first use: record a first fingerprint, then accept only a match."""
+        """Trust on first use: record a first fingerprint, then accept only a match.
+
+        Returns "new" when this call pinned the key, "match" for the pinned key, else False."""
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT fingerprint FROM pins WHERE key=?", (key,)).fetchone()
             now = time.time()
             if row is None:
                 db.execute("INSERT INTO pins VALUES (?,?,?,?,?)", (key, kind, fingerprint, now, now))
-                return True
+                return "new"
             if row["fingerprint"] != fingerprint:
                 return False
             db.execute("UPDATE pins SET last_seen=? WHERE key=?", (now, key))
-            return True
+            return "match"
+
+    def pinned(self, key):
+        with self.connect() as db:
+            row = db.execute("SELECT fingerprint FROM pins WHERE key=?", (key,)).fetchone()
+        return row["fingerprint"] if row else None
+
+    def host_key_alert(self, endpoint, device, presented, expected, mode, poller, notify):
+        """Record a changed host key; queue one email only when the alert is new."""
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT id FROM host_key_alerts WHERE endpoint=? AND presented=? AND state='open'",
+                (endpoint, presented),
+            ).fetchone()
+            if row:
+                db.execute(
+                    "UPDATE host_key_alerts SET last_seen=?,attempts=attempts+1 WHERE id=?", (now, row["id"])
+                )
+                return row["id"], False
+            alert = str(uuid.uuid4())
+            db.execute(
+                "INSERT INTO host_key_alerts VALUES (?,?,?,?,?,?,?,'open',?,?,1,NULL,NULL)",
+                (alert, endpoint, device, presented, expected, mode, poller, now, now),
+            )
+            if notify:
+                db.execute(
+                    """INSERT INTO email_deliveries(id,kind,subject,status,created,next_attempt,expires)
+                    VALUES (lower(hex(randomblob(16))),'host_key',?,'open',?,0,?)""",
+                    (alert, now, now + EMAIL_RETRY_SECONDS),
+                )
+            return alert, True
+
+    def host_key_alerts(self, state=None):
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM host_key_alerts WHERE ? IS NULL OR state=? ORDER BY first_seen DESC LIMIT 500",
+                (state, state),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def host_key_alert_get(self, alert):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM host_key_alerts WHERE id=?", (alert,)).fetchone()
+        if row is None:
+            raise KeyError(alert)
+        return dict(row)
+
+    def resolve_host_key_alerts(self, endpoint, presented, resolution):
+        """Close open alerts once the endpoint connects with a trusted key again."""
+        with self.connect() as db:
+            if not db.execute(
+                "SELECT 1 FROM host_key_alerts WHERE endpoint=? AND state='open' LIMIT 1", (endpoint,)
+            ).fetchone():
+                return 0
+            return db.execute(
+                """UPDATE host_key_alerts SET state=CASE WHEN presented=? THEN 'trusted' ELSE 'resolved' END,
+                resolved_at=?,resolution=? WHERE endpoint=? AND state='open'""",
+                (presented, time.time(), resolution, endpoint),
+            ).rowcount
+
+    def trust_host_key(self, alert):
+        """Pin the key an open alert reports, replacing the pin the alert was raised against."""
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM host_key_alerts WHERE id=?", (alert,)).fetchone()
+            if row is None:
+                raise KeyError(alert)
+            if row["state"] != "open":
+                raise Conflict("host key alert is not open")
+            if row["mode"] != "pin":
+                raise Conflict(
+                    "this endpoint is verified by NETOPS_KNOWN_HOSTS; replace its entry there to trust the new key"
+                )
+            current = db.execute("SELECT fingerprint FROM pins WHERE key=?", (row["endpoint"],)).fetchone()
+            if current is not None and current["fingerprint"] != row["expected"]:
+                raise Conflict("the pinned key changed since this alert; review the newer alert")
+            db.execute(
+                "INSERT OR REPLACE INTO pins VALUES (?,?,?,?,?)",
+                (row["endpoint"], "ssh", row["presented"], now, now),
+            )
+            db.execute(
+                """UPDATE host_key_alerts SET state=CASE WHEN presented=? THEN 'trusted' ELSE 'resolved' END,
+                resolved_at=?,resolution='key trusted through the API' WHERE endpoint=? AND state='open'""",
+                (row["presented"], now, row["endpoint"]),
+            )
+            return dict(db.execute("SELECT * FROM host_key_alerts WHERE id=?", (alert,)).fetchone())
 
     def pins(self):
         with self.connect() as db:

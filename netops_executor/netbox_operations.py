@@ -15,10 +15,33 @@ def preferred_image(settings, device_id, checkpoint):
         with netbox_client(settings) as http:
             response = http.get("plugins/refresh/readiness/", params={"device": device_id, "limit": 1})
             response.raise_for_status()
-            rows = response.json()["results"]
+            # A plugin that ignores the device filter must not lend another device's image.
+            rows = [
+                row
+                for row in response.json()["results"]
+                if (row.get("device") or {}).get("id", row.get("device")) == device_id
+            ]
             return rows[0].get("preferred_version") if rows else None
     except (httpx.HTTPError, ValueError, KeyError, TypeError):
         return None
+
+
+def merge_products(entries):
+    """One record per observed product: a product listed twice shares one reference, so its
+    entries are merged (all modules, latest expiration) instead of overwriting each other."""
+    merged = {}
+    for item in entries:
+        key = item.get("reference") or item["product"]
+        if key not in merged:
+            merged[key] = {**item, "installed_modules": list(item.get("installed_modules") or [])}
+            continue
+        current = merged[key]
+        for module in item.get("installed_modules") or []:
+            if module not in current["installed_modules"]:
+                current["installed_modules"].append(module)
+        dates = [d for d in (current.get("reported_expiration"), item.get("reported_expiration")) if d]
+        current["reported_expiration"] = max(dates) if dates else None
+    return list(merged.values())
 
 
 def sync_observed_licenses(settings, device_id, poller, vendor, entries, checkpoint):
@@ -26,7 +49,7 @@ def sync_observed_licenses(settings, device_id, poller, vendor, entries, checkpo
         results = []
         with netbox_client(settings) as http:
             writer = NetBoxDiscovery(http, checkpoint)
-            for item in entries:
+            for item in merge_products(entries):
                 info = {**item, "serial": "", "verified_at": datetime.now(timezone.utc).isoformat()}
                 # A device-observed product is not a vendor contract or activation key.
                 info["reference"] = (
@@ -47,6 +70,10 @@ def report_observation(settings, job_id, device_id, discovery, enrichment, check
         for key in ("serial", "model", "platform", "software_version")
         if discovery.get(key)
     }
+    if discovery.get("serial_source") == "snmp":
+        # A VE's chassis serial stands in only while its license cannot be read. Reporting it would
+        # alternate with the license serial between runs with and without SSH.
+        facts.pop("serial", None)
     facts["hostname"] = discovery["name"][:500]
     sources = {key: "observed" for key in facts}
     for key, source in discovery.get("field_sources", {}).items():

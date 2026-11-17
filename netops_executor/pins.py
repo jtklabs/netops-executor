@@ -42,13 +42,29 @@ def tls_key(base_url):
     return "tls:" + (parsed.hostname or "") + ":" + str(parsed.port or 443)
 
 
+def ssh_fingerprint(key):
+    return key.get_name() + ":" + hashlib.sha256(key.asbytes()).hexdigest()
+
+
+class HostKeyChanged(paramiko.SSHException):
+    """The endpoint presented a key other than the one trusted for it. No credential was sent."""
+
+    def __init__(self, endpoint, presented, expected):
+        super().__init__("SSH host key for " + endpoint + " does not match its pinned key")
+        self.endpoint, self.presented, self.expected = endpoint, presented, expected
+
+
 class PinnedHostKeys(paramiko.MissingHostKeyPolicy):
     """SSH host keys missing from known_hosts are pinned on first use; a changed key is rejected."""
 
     def __init__(self, store, key):
         self.store, self.key = store, key
+        # "pinned_now" when this connection created the pin, "pinned" when it matched one.
+        self.outcome = None
 
     def missing_host_key(self, client, hostname, key):
-        fingerprint = key.get_name() + ":" + hashlib.sha256(key.asbytes()).hexdigest()
-        if not self.store.pin(self.key, "ssh", fingerprint):
-            raise paramiko.SSHException("SSH host key for " + self.key + " does not match its pinned key")
+        fingerprint = ssh_fingerprint(key)
+        outcome = self.store.pin(self.key, "ssh", fingerprint)
+        if not outcome:
+            raise HostKeyChanged(self.key, fingerprint, self.store.pinned(self.key))
+        self.outcome = "pinned_now" if outcome == "new" else "pinned"

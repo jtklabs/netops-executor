@@ -17,6 +17,8 @@ LEGACY_DISCOVERY_ROLE = "snmp-discovered"
 WIRELESS_CONTROLLER = "wireless_controller"
 FIELD_SOURCES = "inventory_field_sources"
 POLL_STATUS = "inventory_poll_status"
+# The poller instance that created, seeded or adopted the device. Another poller never takes it over.
+OWNER = "discovery_poller"
 ACCESS_POINT_ROLE = "Wireless AP"
 
 # Platforms that only ever run one kind of appliance.
@@ -245,12 +247,19 @@ class NetBoxDiscovery:
             raise SyncError("Multiple NetBox devices from this poller share the polled address")
         if matches:
             return matches[0]
-        # A device recorded outside discovery, by name and address. A device another
-        # poller discovered carries the discovered tag and is never taken over.
+        # A device recorded outside discovery, by name and address. A device a poller created,
+        # seeded from manual data or adopted is owned by that poller and never taken over:
+        # it carries the discovered tag, its owner, or (before owners were recorded) a poll status.
         for device in self.records(path, name__ie=name):
-            if (device["name"] or "").casefold() != name.casefold() or tagged(device, discovered_tag):
-                continue
             fields = device["custom_fields"]
+            owner = fields.get(OWNER)
+            if (
+                (device["name"] or "").casefold() != name.casefold()
+                or tagged(device, discovered_tag)
+                or (owner and owner != poller_tag["name"])
+                or (not owner and fields.get(POLL_STATUS))
+            ):
+                continue
             primary = device.get("primary_ip6" if ":" in address else "primary_ip4")
             if fields.get(DISCOVERY_IP) == address or (
                 not fields.get(DISCOVERY_IP)
@@ -264,11 +273,21 @@ class NetBoxDiscovery:
 
     def sync(self, site_name, poller, address, facts):
         action, device = self.sync_inventory(site_name, poller, address, facts)
-        if (management_ip := facts.get("management_ip")) and self.assign_primary_ip(
-            device, management_ip, self.named_object("extras/tags/", poller, poller)
-        ):
-            if action == "unchanged":
-                action = "updated"
+        if management_ip := facts.get("management_ip"):
+            try:
+                if self.assign_primary_ip(
+                    device, management_ip, self.named_object("extras/tags/", poller, poller)
+                ):
+                    if action == "unchanged":
+                        action = "updated"
+                facts["management_ip_sync"] = {"status": "success"}
+            except SyncError as error:
+                facts["management_ip_sync"] = {"status": "failed", "error": str(error)}
+            except httpx.HTTPStatusError as error:
+                facts["management_ip_sync"] = {
+                    "status": "failed",
+                    "error": f"NetBox IP assignment returned HTTP {error.response.status_code}",
+                }
         if facts.get("stack_member_id"):
             try:
                 facts["stack_inventory"] = self.sync_stack(device, poller, facts)
@@ -908,10 +927,10 @@ class NetBoxDiscovery:
         # even from another of its interfaces after a rename.
         own = [
             row
-            for row in rows
+            for row in address_rows
             if row.get("assigned_object_type") == "dcim.interface"
             and row["assigned_object_id"] == interface["id"]
-        ] or [row for row in rows if assigned_device(row) == device_id]
+        ] or [row for row in address_rows if assigned_device(row) == device_id]
         # An unassigned record is claimed when it is this poller's, or the address's only record.
         free = [row for row in rows if row["assigned_object_id"] is None and (tagged(row) or len(rows) == 1)]
         candidates = own or free
@@ -960,6 +979,7 @@ class NetBoxDiscovery:
             raise SyncError("The poller instance cannot use the reserved discovered tag")
         self.custom_field(DISCOVERY_IP, "SNMP discovery IP", "Address polled by NetOps Executor.")
         self.custom_field(SOFTWARE_VERSION, "Software version", "Running software version reported by SNMP.")
+        self.custom_field(OWNER, "Discovery poller", "Poller instance that owns this discovered device.")
         site = self.named_object("dcim/sites/", site_name)
         tag = self.named_object("extras/tags/", poller, poller)
         discovered = self.named_object("extras/tags/", DISCOVERED_TAG)
@@ -972,19 +992,19 @@ class NetBoxDiscovery:
         if current:
             if sources.get("serial") == "manual" and current.get("serial"):
                 facts["serial"] = current["serial"]
-                sources["serial"] = previous_sources.get("serial", "netbox-existing")
+                sources["serial"] = "netbox-existing"
             if sources.get("model") == "manual":
                 facts["model"] = current["device_type"].get("model", facts["model"])
-                sources["model"] = previous_sources.get("model", "netbox-existing")
+                sources["model"] = "netbox-existing"
                 if sources.get("manufacturer") == "manual":
                     manufacturer = current["device_type"].get("manufacturer") or {}
                     facts["manufacturer"] = manufacturer.get("name", facts["manufacturer"])
-                    sources["manufacturer"] = previous_sources.get("manufacturer", "netbox-existing")
+                    sources["manufacturer"] = "netbox-existing"
             if sources.get("software_version") == "manual" and current.get("custom_fields", {}).get(
                 SOFTWARE_VERSION
             ):
                 facts["software_version"] = current["custom_fields"][SOFTWARE_VERSION]
-                sources["software_version"] = previous_sources.get("software_version", "netbox-existing")
+                sources["software_version"] = "netbox-existing"
         if "field_sources" in facts:
             facts["field_sources"] = sources
         members = facts.get("stack_members")
@@ -1011,7 +1031,7 @@ class NetBoxDiscovery:
         else:
             manufacturer = self.named_object("dcim/manufacturers/", facts["manufacturer"])
             device_type = self.device_type(manufacturer, facts["model"])
-        fields = {DISCOVERY_IP: address}
+        fields = {DISCOVERY_IP: address, OWNER: poller}
         if "field_sources" in facts:
             self.custom_field(
                 FIELD_SOURCES,

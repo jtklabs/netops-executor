@@ -5,8 +5,9 @@ from datetime import datetime
 
 
 def date_value(value):
-    value = value.strip()
-    for pattern in ("%Y-%m-%d", "%m/%d/%Y", "%B %d, %Y", "%b %d %Y", "%b %d, %Y"):
+    # FortiOS pads single-digit days ("Mon Jan  1 2024").
+    value = " ".join(value.split())
+    for pattern in ("%Y-%m-%d", "%m/%d/%Y", "%B %d, %Y", "%b %d %Y", "%b %d, %Y", "%a %b %d %Y"):
         try:
             return (
                 datetime.strptime(value[:10] if pattern == "%Y-%m-%d" else value, pattern).date().isoformat()
@@ -89,7 +90,9 @@ def parse_licenses(vendor, output):
                     found.append(entry(product, expiration[1]))
         status = re.search(r"(?im)^License Status:\s*(.+)$", output)
         if status and not found:
-            expiry = re.search(r"(?im)^(?:License Expiration|Expiration Date|Expiry Date):\s*(.+)$", output)
+            expiry = re.search(
+                r"(?im)^(?:License Expiration(?: Date)?|Expiration Date|Expiry Date)\s*:\s*(.+)$", output
+            )
             found.append(
                 entry(
                     "FortiGate VM",

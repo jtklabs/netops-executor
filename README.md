@@ -2126,6 +2126,29 @@ SSH works the same way with `NETOPS_SSH_HOST_KEYS=pin`: a host missing from
 Entries in the known_hosts file always take precedence. The default remains
 `known_hosts`, which rejects unknown hosts.
 
+### Changed SSH host keys
+
+When a device presents an SSH host key other than the trusted one (its pin, or its
+known_hosts entry), the connection stops before any credential is sent and the job
+reports that the key changed. The executor records one alert per endpoint and
+presented key. Set `NETOPS_ALERT_EMAIL` (up to 20 comma-separated addresses, with
+the `NETOPS_SMTP_*` relay configured) to receive **one** email per new key: the
+device, endpoint, poller, trusted and presented fingerprints, and the action to
+take. Later jobs that hit the same key only update the alert's attempt count. The
+alert closes when the key is trusted or the device presents its trusted key again;
+a further change raises a new alert and email.
+
+```http
+GET /api/v1/host-keys/alerts?state=open
+POST /api/v1/host-keys/alerts/{alert_id}/trust
+```
+
+`trust` pins exactly the fingerprint the alert reports (never whatever key the
+device presents next) and is refused if the pin changed since the alert. For
+`NETOPS_SSH_HOST_KEYS=known_hosts`, replace the host's entry in `NETOPS_KNOWN_HOSTS`
+instead. Verify an unexpected change before trusting it: a different device or an
+intercepting host may be answering.
+
 After a certificate or host key is legitimately replaced, inspect the device, then
 reset its pin; the next connection pins the new one:
 
@@ -2345,10 +2368,14 @@ Set `NETOPS_NETBOX_CA_FILE` if the executor needs a private CA.
 A polled IP is unique within one poller, but pollers in other networks can reach
 other devices at the same IP, so NetBox can hold the same address more than once.
 Discovery therefore finds the device by its poller tag and `snmp_discovery_ip`
-custom field, whatever its name, so a renamed device keeps its record. A device
-recorded outside discovery (without the `discovered` tag) is adopted when its name
-and polled IP match, using `snmp_discovery_ip` or its primary IP; a device another
-poller discovered is never taken over. The
+custom field, whatever its name, so a renamed device keeps its record. Every device
+a poller creates, seeds from manual data or adopts records that poller in the
+`discovery_poller` custom field. A device recorded outside discovery (no
+`discovered` tag, no `discovery_poller`, no `inventory_poll_status`) is adopted
+when its name and polled IP match, using `snmp_discovery_ip` or its primary IP.
+A device another poller owns is never taken over, even with the same name and
+IP; the polling poller creates its own record instead. A successful poll by the
+owning poller replaces manually seeded values. The
 executor creates missing sites and poller tags, reuses a matching manufacturer
 and model or part number from the device type catalog, and creates a basic
 device type when no match exists. It tags new devices `discovered` and sets a
@@ -2390,14 +2417,17 @@ base registration key as the serial. The same discovery job runs the read-only
 `show /sys license` command over SSH. An `f5` entry with the polled IP as its
 `host` supplies its configured SSH connection settings. When that entry is absent,
 including when `devices.json` is empty, discovery uses enabled saved `ssh`
-credential profiles eligible for the polled IP. A profile with empty `targets`
-is eligible for all SSH targets. A restricted profile must include the polled IP.
-The existing known-hosts or host-key pinning policy applies to this connection.
+credential profiles that may be sent to a discovered host (see **SSH credentials
+for discovered hosts**). The existing known-hosts or host-key pinning policy
+applies to this connection. `enrich_ssh: false` skips this lookup too.
 Before reading the license, the executor probes the authenticated connection to
 identify native TMSH or bash. It sends `show /sys license` to native TMSH and
 `tmsh -q -c 'show /sys license'` to bash. Detection is cached for that connection
-and cleared on reconnect. A successful lookup includes `license_lookup.shell`.
-Unrecognized shells report redacted probe diagnostics.
+and cleared on reconnect, and later tmsh commands on a native TMSH connection are
+sent unwrapped too. Operations that pass a secret on standard input need bash and
+fail clearly on a TMSH account, and F5 upgrades refuse a TMSH account before any
+change. A successful lookup includes `license_lookup.shell`. Unrecognized shells
+report redacted probe diagnostics.
 
 When SSH is unavailable, discovery falls back to the chassis serial SNMP reports.
 `result.discovery.serial_source` is `license` or `snmp`.
@@ -2440,8 +2470,13 @@ SNMP context and each address/interface query, including returned values and que
 errors. Its status is `warning` when no usable interface address can be resolved.
 If a combined query fails, discovery reads its objects individually so an
 unsupported optional object cannot discard a valid interface name or address row.
-NetBox requires unique device names within each site and tenant, so a device with the same name in that
-scope from another poller or address reports a conflict.
+This device's own IP record is reused in whatever VRF it was recorded, so an
+address whose VRF differs from its interface's is not duplicated. If NetBox refuses
+the IP assignment, `result.discovery.management_ip_sync` reports the error, the job
+completes with warnings, and licenses, enrichment and the Lifecycle observation
+still run. NetBox requires unique device names within each site and tenant, so a
+device with the same name in that scope from another poller or address reports a
+conflict.
 
 Cisco StackWise discovery joins present switch rows to their ENTITY-MIB chassis
 records. A stack gets a NetBox virtual chassis and one device per switch.
@@ -2507,8 +2542,14 @@ Other reporting failures finish with warnings after the device inventory sync.
 
 ## Prometheus and Grafana job metrics
 
-The authenticated `GET /metrics` endpoint exposes Prometheus metrics. Use the
-executor's bearer API token when scraping it. Set `NETOPS_POLLER_INSTANCE` to the
+The authenticated `GET /metrics` endpoint exposes Prometheus metrics. Set
+`NETOPS_METRICS_TOKEN` (32+ characters, different from the API token) and scrape
+with it: it opens `/metrics` only, so the Prometheus server never holds a token that
+can run device jobs or change credentials. The API token still works for existing
+scrapers. Finished jobs are folded into running totals, so a scrape reads only
+unfinished and newly finished jobs, however long the history; counters stay
+monotonic. A job resumed after a review gate counts its queue wait from the
+decision, and jobs held by an earlier batch wave are not counted as due. Set `NETOPS_POLLER_INSTANCE` to the
 collecting instance name, such as `checkmk-us`. Prometheus also supplies its
 normal `instance` target label.
 
@@ -2519,8 +2560,8 @@ and worker availability by release. Duration and queue-wait charts use the polle
 instance, queue, and job-type filters.
 
 Use `deploy/prometheus/netops-executor.yml` as a scrape example. Replace the
-target hostname and point `credentials_file` at the executor token file on the
-Prometheus server. If the executor is published under a prefix, set
+target hostname and point `credentials_file` at a file holding
+`NETOPS_METRICS_TOKEN` on the Prometheus server. If the executor is published under a prefix, set
 `metrics_path` to that prefix followed by `/metrics`, such as
 `/netops-executor/metrics`. Historical charts become available as Prometheus
 collects samples.
@@ -2812,7 +2853,11 @@ values. Partial identity uses warnings. No manual-data tag is added; the JSON
 custom field `inventory_field_sources` records each value's origin and
 `inventory_poll_status` distinguishes polled/unpolled. They are also in the job's
 discovery result. Running software supplied manually is reported with source
-`manual`, not `snmp`.
+`manual`, not `snmp`. When a successful poll returns a blank field and NetBox
+already has a value, that value is kept with source `netbox-existing`: it is not
+reported to Lifecycle as a new reading, and the field is listed in
+`manual_fields`, so the job completes with warnings. A partial poll that seeds a
+BIG-IP VE never replaces its license serial with the chassis serial.
 
 For recurring vendor quirks, copy `discovery-overrides.example.yaml` beside the
 executor configuration and set `NETOPS_DISCOVERY_OVERRIDES_FILE` to its path.
@@ -2867,9 +2912,35 @@ remain inventory evidence and do not create physical cables. Reciprocal matching
 links are marked confirmed. An unsuccessful collection preserves prior relationships.
 
 SSH enrichment uses the existing strict/pinned host keys, encrypted credentials,
-eligibility and audit rules. A matching inventory entry is used when available;
-otherwise eligible saved profiles can authenticate the discovered IP. Missing
-profiles are explicitly skipped. CLI command rejection or an unrecognized format
+eligibility and audit rules, and connects once: an unreachable host or a changed
+host key fails every component with that one reason. Readiness `trust` passes only
+for a key matched in known_hosts or an existing pin; a key pinned on first use
+during the job is `unknown` until its fingerprint is verified. A configuration
+snapshot containing a redacted stored credential is saved but not reported as a
+restorable backup.
+
+#### SSH credentials for discovered hosts
+
+SNMP discovery reaches hosts that identified their own vendor, so a host that is
+not in the inventory receives only:
+
+- profiles whose `targets` name its IP, and
+- unrestricted profiles (empty `targets`) opted in with `"discovery": true`.
+
+Opt in a dedicated read-only profile rather than an administrator one:
+
+```http
+PUT /api/v1/credentials/discovery-ro
+{"kind":"ssh","username":"netops-ro","password":"SECRET","discovery":true}
+```
+
+Such a host gets at most two authentication attempts per connection, below common
+lockout thresholds (FortiGate's default is three). An inventory entry whose `host`
+is the polled IP keeps its own `credential_profiles`, port and normal attempt
+limit, whatever `device_type` SNMP reports. Hosts written as DNS names are not
+matched. Profiles that are neither opted in nor scoped are skipped with a reason.
+With `NETOPS_SSH_HOST_KEYS=pin`, a discovered host's key is trusted on first use;
+pre-seed known_hosts where that is not acceptable. CLI command rejection or an unrecognized format
 produces a component gap and never fabricates an entitlement or a healthy HA state.
 Failed SNMP polls seeded with manual identity do not trigger SSH enrichment.
 

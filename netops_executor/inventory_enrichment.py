@@ -12,7 +12,7 @@ from .f5_operations import topology
 from .fortinet import ha_status
 from .inventory_licenses import parse_licenses
 from .network_ssh import NetworkSSH
-from .ssh import SSH, DeviceError
+from .ssh import SSH, DeviceError, HostKeyChangedError
 from .store import CancelRequested, LostOwnership
 
 DRIVERS = {
@@ -35,6 +35,40 @@ LICENSE_COMMANDS = {
 }
 
 
+# A discovered host outside the inventory gets few authentication attempts: each rejected
+# password can count toward the device's lockout threshold (FortiGate's default is 3).
+DISCOVERY_ATTEMPTS = 2
+
+
+def discovery_target(settings, store, address, device_type):
+    """The SSH target for a discovered address, or None when no credential may be sent to it.
+
+    An inventory entry for the address keeps the administrator's credential limits and port,
+    whatever vendor SNMP reported. Any other host identified its own vendor over SNMP, so it is
+    sent only profiles opted in for discovery or listing the address in their targets.
+    """
+    matches = settings.inventory_at(address)
+    if len(matches) > 1:
+        raise DeviceError("Multiple inventory entries have the discovered address as their host")
+    if matches:
+        return matches[0].model_copy(update={"device_type": device_type})
+    candidates = Vault(store, settings.credential_key_file).candidates(
+        "ssh", targets=(address,), discovery=True
+    )
+    if not candidates:
+        return None
+    return Device(
+        id=address,
+        host=address,
+        device_type=device_type,
+        credential_profiles=[row["id"] for row in candidates],
+    )
+
+
+def attempts_for(settings, address):
+    return None if settings.inventory_at(address) else DISCOVERY_ATTEMPTS
+
+
 def target_for(settings, store, address, vendor, platform):
     expected = {
         "F5": "f5",
@@ -44,17 +78,7 @@ def target_for(settings, store, address, vendor, platform):
         "Fortinet": "fortinet",
         "Opengear": "opengear",
     }.get(vendor, "linux")
-    matches = [d for d in settings.devices.values() if d.host == address and d.device_type == expected]
-    if len(matches) > 1:
-        raise DeviceError("Multiple inventory entries match the discovered SSH target")
-    if matches:
-        return matches[0]
-    candidates = Vault(store, settings.credential_key_file).candidates("ssh", targets=(address,))
-    if not candidates:
-        return None
-    return Device(
-        id=address, host=address, device_type=expected, credential_profiles=[row["id"] for row in candidates]
-    )
+    return discovery_target(settings, store, address, expected)
 
 
 def parse_ha(vendor, output, serial=""):
@@ -142,7 +166,10 @@ def collect_enrichment(
         target = target_for(settings, store, address, vendor, facts.get("platform", ""))
         if target is None:
             output["components"] = {
-                name: {"status": "skipped", "reason": "No eligible saved SSH profile"}
+                name: {
+                    "status": "skipped",
+                    "reason": "No SSH profile is enabled for discovery or lists this address",
+                }
                 for name in ("licenses", "ha", "readiness")
             }
             return output
@@ -155,11 +182,18 @@ def collect_enrichment(
                 "reason": "License CLI adapter supports ArubaOS controllers",
             }
             return output
+        attempts = attempts_for(settings, address)
         ssh = (
-            SSH(settings, target, guard=checkpoint, audit=audit)
+            SSH(settings, target, guard=checkpoint, audit=audit, max_attempts=attempts)
             if vendor == "F5"
             else NetworkSSH(
-                settings, target, guard=checkpoint, audit=audit, device_type=driver, read_only_session=True
+                settings,
+                target,
+                guard=checkpoint,
+                audit=audit,
+                device_type=driver,
+                read_only_session=True,
+                max_attempts=attempts,
             )
         )
 
@@ -255,11 +289,23 @@ def collect_enrichment(
 
         def readiness():
             ssh.connect()
-            for name in ("ssh", "credentials", "trust"):
-                output["readiness"][name] = {
-                    "status": "passed",
-                    "reason": "Authenticated SSH with verified or pinned host key",
+            for name in ("ssh", "credentials"):
+                output["readiness"][name] = {"status": "passed", "reason": "Authenticated SSH session"}
+            trust = getattr(ssh, "host_key_status", None)
+            output["readiness"]["trust"] = (
+                {
+                    "status": "unknown",
+                    "reason": "Host key pinned on first use during this job; verify its fingerprint "
+                    "out of band",
                 }
+                if trust == "pinned_now"
+                else {
+                    "status": "passed",
+                    "reason": "Host key matched NETOPS_KNOWN_HOSTS"
+                    if trust == "known_hosts"
+                    else "Host key matched its pin",
+                }
+            )
             commands = {
                 "Arista": "dir flash:",
                 "Cisco": "dir bootflash:" if driver == "cisco_nxos" else "dir flash:",
@@ -293,6 +339,8 @@ def collect_enrichment(
                     config = read(command)
                     if len(config.strip()) < 20:
                         raise DeviceError("Configuration output too short to verify a backup")
+                    # Saved credentials in the output are redacted, so the snapshot cannot restore them.
+                    redacted = "[REDACTED]" in config
                     directory = (
                         settings.backup_root / "discovery" / hashlib.sha256(address.encode()).hexdigest()[:20]
                     )
@@ -301,10 +349,18 @@ def collect_enrichment(
                     with path.open("x", encoding="utf-8") as handle:
                         os.chmod(path, 0o600)
                         handle.write(config)
-                    output["readiness"]["backup"] = {
-                        "status": "passed",
-                        "reason": "Private configuration snapshot saved on collecting executor",
-                    }
+                    output["readiness"]["backup"] = (
+                        {
+                            "status": "unknown",
+                            "reason": "Snapshot saved, but a stored credential in it was redacted; "
+                            "use the platform backup workflow for a restorable backup",
+                        }
+                        if redacted
+                        else {
+                            "status": "passed",
+                            "reason": "Private configuration snapshot saved on collecting executor",
+                        }
+                    )
                 else:
                     output["readiness"]["backup"] = {
                         "status": "unknown",
@@ -316,6 +372,25 @@ def collect_enrichment(
                     "reason": "Backup not requested; set backup_config or run platform backup workflow",
                 }
 
+        # Connect once: an unreachable host or a changed host key costs one attempt, not one per
+        # component, and the reason is reported instead of a generic collection failure.
+        try:
+            ssh.connect()
+        except (CancelRequested, LostOwnership):
+            raise
+        except HostKeyChangedError as error:
+            reason = str(error)
+        except Exception:
+            # Other error text can carry device output or credentials; report a fixed reason.
+            reason = "SSH connection or authentication failed; see credential attempts"
+        else:
+            reason = None
+        if reason:
+            output["components"] = {
+                name: {"status": "failed", "reason": reason} for name in ("licenses", "ha", "readiness")
+            }
+            output["readiness"]["ssh"] = {"status": "failed", "reason": reason}
+            return output
         attempt("licenses", licenses)
         attempt("ha", ha)
         attempt("readiness", readiness)
