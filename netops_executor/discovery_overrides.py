@@ -59,8 +59,10 @@ class IdentityReader(Model):
     oid: str | None = Field(default=None, max_length=1024)
     source: Literal["sysDescr", "sysName", "sysObjectID"] | None = None
     walk: bool = False
+    # With a capture group the regex extracts `group` (default 1). Without one it filters:
+    # a value is kept whole when the regex matches, so a walk takes the first matching row.
     regex: str | None = Field(default=None, max_length=1024)
-    group: int | str = 1
+    group: int | str | None = 1
 
     @field_validator("oid")
     @classmethod
@@ -80,6 +82,10 @@ class IdentityReader(Model):
                 compiled = regex.compile(self.regex)
             except regex.error:
                 raise ValueError("Invalid extraction regex") from None
+            if "group" not in self.model_fields_set and not compiled.groups:
+                self.group = None
+            if self.group is None:
+                return self
             if isinstance(self.group, int):
                 if not 0 <= self.group <= compiled.groups:
                     raise ValueError("Regex group does not exist")
@@ -166,7 +172,8 @@ def matches(rule, facts, system, address):
 def extracted(reader, value):
     if reader.regex:
         match = regex.search(reader.regex, value[:8192], timeout=0.05)
-        value = match.group(reader.group) if match else ""
+        # group None: a filter, which keeps the whole value when it matches.
+        value = (value if reader.group is None else match.group(reader.group)) if match else ""
     value = (value or "").strip()
     if not value or len(value) > 200 or any(ord(c) < 32 or ord(c) == 127 for c in value):
         return ""

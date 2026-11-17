@@ -3024,15 +3024,44 @@ then `manual_fallback`. All match conditions in a rule must hold. Matches suppor
 `fields` accepts the same six identity fields. Each reader specifies exactly one
 of `value` (manual provenance), `source` (`sysDescr`, `sysName`, `sysObjectID`), or
 numeric `oid`. An OID uses GET by default; `walk: true` searches at most 256 rows.
-An optional regex extracts `group` (number or name, default 1). Regex evaluation
-has a time limit and input/output limits. `mode: fallback` fills blanks;
+An optional `regex` filters or extracts the value read:
+
+- **Without a capture group it is a filter.** A value is kept whole only when the
+  regex matches, so a walk takes the first matching row. For example, `^C9300`
+  picks the Catalyst chassis model out of `entPhysicalModelName` and skips power
+  supplies and modules. Anchor it, as in `^C9300-\d+[A-Z]*$`, when module names
+  share the prefix. A GET whose value does not match leaves the field unset.
+- **With a capture group it extracts** `group` (number or name, default 1).
+
+Use `(?i)` for a case-insensitive match. Regex evaluation has a time limit and
+input/output limits. `mode: fallback` fills blanks;
 `mode: replace` explicitly replaces a reading. A missed regex or failed optional
 read preserves the previous value and records a diagnostic. An invalid reloaded
 file is reported as a warning; built-in discovery and manual fallback still run.
 The job records applied rule IDs and the YAML SHA-256 for troubleshooting.
 
 Your caller can send the same rule structure as `identity_rules` (up to 20 rules)
-when it already knows an alternate OID and parser. These are independent reads,
+when it already knows an alternate OID and parser. A model OID with an optional
+filter, in a discovery request:
+
+```json
+{
+  "device_ip": "192.0.2.9",
+  "site": "Sydney",
+  "identity_rules": [
+    {
+      "id": "catalyst-9300-model",
+      "match": {"sys_object_id_prefix": "1.3.6.1.4.1.9"},
+      "mode": "replace",
+      "fields": {
+        "model": {"oid": "1.3.6.1.2.1.47.1.1.1.1.13", "walk": true, "regex": "^C9300-\\d+[A-Z]*$"}
+      }
+    }
+  ]
+}
+```
+
+Omit `regex` to take the first non-empty value as before. These are independent reads,
 so an OID does not also need to be listed in `oids`. A subtree OID in `oids` alone
 continues to be raw walk output and does not imply which identity field to fill.
 The SRX5800 example illustrates the schema; use the OID and regex verified from

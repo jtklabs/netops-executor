@@ -71,6 +71,63 @@ def test_get_walk_regex_precedence_and_manual_blanks():
     assert facts["field_sources"]["serial"] == "manual"
 
 
+ENT_MODEL = "1.3.6.1.2.1.47.1.1.1.1.13"  # entPhysicalModelName
+
+
+def model_filter(**reader):
+    return rule(
+        match={"manufacturer": "Cisco"},
+        fields={"model": {"oid": ENT_MODEL, "regex": "^C9300", **reader}},
+    )
+
+
+def test_model_regex_without_a_group_filters_and_keeps_the_whole_value():
+    rows = ("", "PWR-C1-715WAC", "C9300-NM-8X-module", "C9300-48P")
+
+    async def walk(root, **kwargs):
+        assert root == ENT_MODEL
+        for index, row in enumerate(rows):
+            yield str(index), row
+
+    async def get(oids):
+        return {oids[0]: "PWR-C1-715WAC"}
+
+    facts = {"manufacturer": "Cisco", "model": ""}
+    asyncio.run(apply_rules(facts, {}, "192.0.2.9", get, walk, [model_filter(walk=True)]))
+    # The first row that matches is kept whole, not just the matched text.
+    assert facts["model"] == "C9300-NM-8X-module"
+    anchored = model_filter(walk=True, regex=r"^C9300-\d+[A-Z]*$")
+    facts["model"] = ""
+    asyncio.run(apply_rules(facts, {}, "192.0.2.9", get, walk, [anchored]))
+    assert facts["model"] == "C9300-48P"
+    # A GET whose value does not match is filtered out and the model stays blank.
+    facts["model"] = ""
+    asyncio.run(apply_rules(facts, {}, "192.0.2.9", get, walk, [model_filter()]))
+    assert facts["model"] == "" and facts["identity_rules"][0]["status"] == "missing"
+
+
+def test_model_regex_filter_is_optional_and_survives_yaml_and_payload(tmp_path):
+    assert model_filter().fields["model"].group is None
+    assert rule().fields["model"].group == 1  # a capture group still extracts
+    without = rule(match={"manufacturer": "Cisco"}, fields={"model": {"oid": ENT_MODEL, "walk": True}})
+    assert without.fields["model"].regex is None
+    # An explicit group must exist, as before.
+    with pytest.raises(ValidationError):
+        model_filter(group=1)
+    path = tmp_path / "overrides.yaml"
+    path.write_text(
+        "version: 1\nrules:\n  - id: c9300\n    match:\n      manufacturer: Cisco\n    fields:\n"
+        "      model:\n        oid: '" + ENT_MODEL + "'\n        walk: true\n        regex: '^C9300'\n"
+    )
+    rules, _ = load_rules(path)
+    assert rules[0].fields["model"].group is None
+    request = SnmpWalkRequest.model_validate(
+        {"device_ip": "192.0.2.9", "site": "Lab", "identity_rules": [model_filter(walk=True).model_dump()]}
+    )
+    queued = SnmpWalkRequest.model_validate(request.model_dump(mode="json"))
+    assert queued.identity_rules[0].fields["model"].group is None
+
+
 def test_match_conditions_use_oid_arc_boundaries_and_all_conditions():
     r = rule(
         match={
