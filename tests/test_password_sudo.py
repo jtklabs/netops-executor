@@ -27,17 +27,23 @@ prompt="$2"; shift 3
 printf '%s' "$prompt"
 stty -echo; IFS= read -r pw; stty echo; printf '\\n'
 [ "$pw" = "{login}" ] || {{ echo "Sorry, try again."; exit 1; }}
-# Stand in for the privilege change itself (the UID check), and put the test's stand-in
-# tools ahead of the root PATH the script sets.
-exec "$1" "$2" "$(printf '%s' "$3" | sed -e 's|test "$(id -u)" = 0|true|' -e "s|PATH=/bin:|PATH=$NETOPS_TOOLS:/bin:|")"
+# The privilege change itself is simulated: from here on `id -u` reports root (ROOT_ID),
+# however the test runs. The test's stand-in tools go ahead of the root PATH the script sets.
+export PATH="$NETOPS_ROOT:$PATH" NETOPS_TOOLS="$NETOPS_ROOT:$NETOPS_TOOLS"
+exec "$1" "$2" "$(printf '%s' "$3" | sed "s|PATH=/bin:|PATH=$NETOPS_TOOLS:/bin:|")"
+"""
+# `id` inside the simulated root shell (CI runs tests without root).
+ROOT_ID = """#!/bin/sh
+[ "$1" = "-u" ] && echo 0 && exit 0
+exec /usr/bin/id "$@"
 """
 
 
 class PtyChannel:
     """The subset of a paramiko channel run_as_root uses, backed by a local terminal."""
 
-    def __init__(self, path):
-        self.path, self.proc, self.master, self.done = path, None, None, False
+    def __init__(self, path, root):
+        self.path, self.root, self.proc, self.master, self.done = path, root, None, None, False
 
     def settimeout(self, value):
         pass
@@ -46,7 +52,12 @@ class PtyChannel:
         self.master, self.slave = os.openpty()
 
     def exec_command(self, command):
-        env = {**os.environ, "PATH": self.path + ":" + os.environ["PATH"], "NETOPS_TOOLS": self.path}
+        env = {
+            **os.environ,
+            "PATH": self.path + ":" + os.environ["PATH"],
+            "NETOPS_TOOLS": self.path,
+            "NETOPS_ROOT": self.root,
+        }
         self.proc = subprocess.Popen(
             ["sh", "-c", command],
             stdin=self.slave,
@@ -86,11 +97,11 @@ class PtyChannel:
 
 
 class Transport:
-    def __init__(self, path):
-        self.path, self.channels = path, []
+    def __init__(self, path, root):
+        self.path, self.root, self.channels = path, root, []
 
     def open_session(self, timeout=None):
-        self.channels.append(PtyChannel(self.path))
+        self.channels.append(PtyChannel(self.path, self.root))
         return self.channels[-1]
 
 
@@ -101,7 +112,11 @@ def transport(tmp_path):
     sudo = bin_dir / "sudo"
     sudo.write_text(FAKE_SUDO.format(login=LOGIN))
     sudo.chmod(0o755)
-    return Transport(str(bin_dir))
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "id").write_text(ROOT_ID)
+    (root / "id").chmod(0o755)
+    return Transport(str(bin_dir), str(root))
 
 
 def test_secret_line_reaches_the_command_without_echo_or_argv(transport, tmp_path):
