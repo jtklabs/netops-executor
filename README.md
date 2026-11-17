@@ -20,6 +20,9 @@ SQLite WAL must not be placed on NFS/SMB or shared between hosts. Separate remot
 have independent reservations: the central application must assign an entire HA
 pair/batch to one remote and prevent overlap across remotes.
 
+Upgrading a deployment to 0.27? Follow the post-deployment checklist in
+[docs/upgrade-to-0.27.md](docs/upgrade-to-0.27.md).
+
 ## API contract
 
 All `/api/v1` routes require `Authorization: Bearer <NETOPS_API_TOKEN>`. The token
