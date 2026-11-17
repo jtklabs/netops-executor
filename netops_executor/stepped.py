@@ -178,8 +178,12 @@ class StepRunner:
             self.result["backup"] = {**item, "format": backup_format}
         self.event(kind + "_backup_completed", serial=serial, bytes=item["bytes"])
 
-    # Runner hooks: what a failure leaves behind, what to put back, and connections to close.
+    # Runner hooks: what a failure leaves behind, what to put back, connections to close, and
+    # whether a completed job has something an operator should look at.
     def unsafe(self):
+        return False
+
+    def warnings(self):
         return False
 
     def restore_service(self):
@@ -203,6 +207,7 @@ class StepRunner:
                 self.result.get("validation_differences")
                 or self.result.get("manual_validations")
                 or any(len(used) > 1 for used in profiles.values())
+                or self.warnings()
             )
             self.store.finish(
                 self.job["id"], self.worker, "completed_with_warnings" if warnings else "succeeded"

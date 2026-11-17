@@ -278,8 +278,12 @@ class Panorama(Jobs):
         except ET.ParseError:
             raise PanosError("Panorama returned malformed XML") from None
         if root.tag != "response" or root.get("status") != "success":
-            detail = message(root) or "operation rejected"
-            raise PanosError(self.selector.redact(detail)[:500])
+            result = root.find("result")
+            detail = message(root) or (message(result) if result is not None else "") or "operation rejected"
+            error = PanosError(self.selector.redact(detail)[:500])
+            # PAN-OS API error code 403: an invalid key or insufficient admin rights for the call.
+            error.code = root.get("code")
+            raise error
         result = root.find("result")
         return result if result is not None else ET.Element("result")
 

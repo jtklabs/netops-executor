@@ -1427,6 +1427,10 @@ prompt.
 `POST /api/v1/password-rotation/jobs` changes a local account password or creates
 the account if it is missing. It supports every generic SSH device type: `linux`,
 `f5`, `opengear`, `cisco_ios`, `cisco_nxos`, `arista_eos`, `fortinet`, and `paloalto_panos`.
+Juniper Junos, ArubaOS 8 controllers, Check Point Gaia, Aruba ClearPass and Infoblox
+are available as [preview platforms](#preview-platforms-junos-arubaos-check-point-clearpass-infoblox).
+To rotate an account everywhere a Panorama manages it, see
+[Panorama-wide rotation](#panorama-wide-rotation-templates-and-every-firewall).
 Use `POST /api/v1/password-rotation/plan` with the same body to validate the request
 and inspect the steps without contacting the device. Both require the API bearer
 token. Swagger at `/docs` includes the request schema and an example.
@@ -1449,6 +1453,28 @@ omitted. `device_type` is inherited from inventory when omitted; an unregistered
 IP defaults to `linux`, so specify the type for a network appliance. The username
 identifies the account to create or update; it does not rename another account.
 This manages local accounts, not TACACS/RADIUS/LDAP identities or AAA order.
+
+**TACACS and other non-root logins.** On `linux` and `opengear`, a login without UID 0
+(a TACACS user, for example) runs every account command through `sudo` on a terminal,
+answering sudo's prompt with the selected credential's own password, as an operator's
+`sudo -i` would. Pre-validation proves sudo works first and stops at the first rejected
+sudo password, so a TACACS account is never retried into a lockout; `result.privilege`
+is `sudo` when it was used. Secrets for the root command (the `chpasswd` line, the
+`local_hash` check, Opengear's `config -P` prompt) are sent only after the root shell
+has turned terminal echo off, so they never appear in a command line, the process list
+or the job output.
+
+**Proof that the device accepted the change.** A login whose role or TACACS command
+authorization does not allow account changes may get an error, or an acknowledgement
+for a change that was never applied. The worker never trusts the acknowledgement: it
+reads the account again on a fresh session (the stored hash, or a digest of the Linux
+shadow entry, which never leaves the device). When that proves the account unchanged,
+the job **fails cleanly** with `change_accepted: false`, the device lock is released,
+and the error says whether the device refused it for the login's privileges
+(permission denied, command authorization failed). Nothing needs recovery. A write
+whose effect cannot be proved either way still ends in `recovery_required`. On success,
+`result.change_accepted` is `true` and `result.confirmed` lists what was proved, such as
+`account_changed`, or for Palo Alto `candidate_hash`, `commit` and `running_hash`.
 
 Existing accounts retain their roles, groups and access settings. A locked Linux
 account (`passwd -S` state `L`/`LK`, such as Ubuntu's default `root` or a key-only
@@ -1483,6 +1509,11 @@ Examples of explicit creation options:
 | `arista_eos` | `{"role": "network-admin", "privilege": 15}` | Native username with SHA-512 hash input; `write memory` and running/startup account comparison. |
 | `fortinet` | `{"role": "super_admin", "vdom": "root"}` | Local administrator in `config system admin`; `next`/`end` persists it. Handles global scope when VDOMs are enabled. |
 | `paloalto_panos` | `{"role": "superuser"}` | Direct SSH password prompt or Panorama XML API proxy, followed by a checked firewall commit. Other creation roles: `superreader`, `deviceadmin`, `devicereader`. |
+| `juniper_junos` (preview) | `{"role": "super-user"}` | `configure private`, SHA-512 `encrypted-password`, only-this-account `show \| compare`, `commit check`, `commit`. |
+| `aruba_os` (preview) | `{"role": "root"}` | `mgmt-user` at `/mm/mynode` with the native password prompts, then `write memory` when only this account is pending. |
+| `checkpoint_gaia` (preview) | `{"role": "adminRole"}` | clish `lock database override`, `set user ... password-hash` (SHA-512), `save config`. New users get `/etc/cli.sh`, never UID 0. |
+| `clearpass` (preview) | `{"role": "Super Administrator"}` | REST `admin-user` through `http_target`; the role is a ClearPass privilege level. |
+| `infoblox` (preview) | `{"groups": ["admin-group"]}` | WAPI `adminuser` through `http_target`; exactly one admin group. |
 
 For rotation of an existing F5 account without allowing creation:
 
@@ -1518,7 +1549,7 @@ be controlled by remote AAA, SSH access restrictions or MFA; this job does not
 change those settings to make verification pass.
 
 `verification: local_hash` checks the local password without a login attempt on
-Linux, F5, Opengear or Palo Alto. F5 non-root, Opengear and Palo Alto use supported SHA-crypt/MD5-crypt
+Linux, F5, Opengear, Palo Alto, Junos or Check Point. F5 non-root, Opengear and Palo Alto use supported SHA-crypt/MD5-crypt
 formats; Linux and F5 root require target-side Python with `crypt` and `spwd`
 modules (available in Python 3.9–3.12, removed in 3.13). Unsupported verification
 fails or opens review; it is never reported as verified. A readable hash that does
@@ -1539,7 +1570,8 @@ are refused. Password changes follow the native platform’s password-aging beha
 
 Passwords must contain 1–256 UTF-8 bytes without control characters. IOS additionally
 requires a single ASCII token of at most 128 characters; whitespace, quotes,
-backslash, `?`, pipe and semicolon are rejected before submission. FortiGate
+backslash, `?`, pipe and semicolon are rejected before submission. Infoblox
+passwords must be printable ASCII. FortiGate
 passwords cannot contain `?`, which the FortiOS CLI treats as a help request even
 inside quotes. FortiGate per-administrator tables such as `config gui-dashboard`
 are preserved and never used as access settings. Other native
@@ -1630,8 +1662,11 @@ with `panorama` to avoid choosing the wrong credential type. Credential attempts
 and the successful profile are audited through the normal job fields.
 
 Panorama requests proxy to the firewall using `target=<serial>` and update its
-local administrator configuration. This does not edit Panorama templates or push
-template stacks. The default verification for Panorama is `local_hash`: read the
+local administrator configuration. This job does not edit Panorama templates; to
+change an account a template defines, use
+[Panorama-wide rotation](#panorama-wide-rotation-templates-and-every-firewall). Creating
+a local account whose name a pushed template already defines is refused, since the
+local copy would silently override the template's. The default verification for Panorama is `local_hash`: read the
 committed firewall hash through Panorama and compare it with the requested
 password, without a direct firewall connection. This verifies the stored password,
 not SSH access or AAA selection. Explicit `verification: ssh_login` additionally
@@ -1659,9 +1694,22 @@ Commit completion is bounded by `commit_timeout` (default 600 seconds). The work
 checks the committed account before reporting `saved: true`, then performs the
 selected verification. A lost commit response is never replayed. Through Panorama,
 a lost commit-job status response is read again until the deadline, since the
-commit already runs. Failed or
-interrupted changes retain recovery state; PAN-OS locks and candidate changes may
-also remain for manual inspection. Successful commits release native device locks.
+commit already runs.
+
+**Restricted admin roles (TACACS).** A login whose admin role may not edit
+administrators or commit is detected rather than assumed to have worked:
+
+| What happens | How the worker proves it | Job outcome |
+| --- | --- | --- |
+| The set is refused (for example API error 403) | The candidate still equals the clean baseline | `failed`, `change_accepted: false`, "permission denied" |
+| The set is acknowledged but nothing is staged | Same | `failed`, `change_accepted: false` |
+| The locks cannot be taken | Nothing staged; only locks this job verified as its own are ever removed | `failed`, `change_accepted: false` |
+| The commit is refused, or its job fails | The running configuration still equals the baseline; the staged change is reverted (`load config from running-config.xml`) and the candidate is read back | `failed`, `change_accepted: false`, "reverted" |
+| Anything else (a partial stage, a lost commit, a revert that fails) | Cannot be proved | `recovery_required` |
+
+The job releases its configuration and commit locks whenever the outcome is known.
+Interrupted changes keep recovery state, and their locks and candidate changes stay
+for manual inspection.
 Direct SSH applies its CLI output settings to every new CLI session, including a
 validation continuation or a reconnect after a failed command.
 Validation continuations only repeat verification, and manual acceptance remains
@@ -1673,6 +1721,89 @@ References: [PAN-OS administrator CLI](https://knowledgebase.paloaltonetworks.co
 and [PAN-OS lock behavior](https://docs.paloaltonetworks.com/ngfw/administration/firewall-administration/launch-the-web-interface/manage-locks-for-restricting-configuration-changes).
 Coverage includes a real loopback SSH CLI/password dialogue and simulated Panorama
 API responses; physical Palo Alto release acceptance remains required before rollout.
+
+### Panorama-wide rotation: templates and every firewall
+
+`POST /api/v1/password-rotation/panorama/jobs` rotates one administrator everywhere a
+Panorama manages it. `POST /api/v1/password-rotation/panorama/plan` validates the same
+body without contacting anything. It is a preview: set `allow_preview: true` after
+trying it against a non-production Panorama.
+
+```json
+{
+  "panorama": "panorama",
+  "username": "automation",
+  "password": "REPLACE_WITH_DESIRED_PASSWORD",
+  "allow_preview": true
+}
+```
+
+1. **Discover (read-only).** With `templates` (default true), Panorama must have no
+   uncommitted changes. The job lists every template and template stack that defines
+   the account, and the firewalls those reach. With `firewalls` (default true), it
+   asks every connected firewall, through Panorama, whether it has the account
+   configured locally. `serials` limits the firewall phase.
+2. **Templates.** Under a Panorama lock, the new hash goes into each template that
+   defines the account with a local password. Templates where the account uses
+   external authentication are skipped. The job proves that only those hashes changed,
+   then **commits on Panorama only**. Nothing is pushed: `result.push_required` lists
+   the firewalls whose template stacks include a changed template, to push when you
+   choose.
+3. **Firewalls.** Each firewall with a local copy is rotated through Panorama, one at
+   a time, with the same proofs as a single-firewall job, and verified by its
+   committed hash. Firewalls that receive the account only from a template are left
+   to the push.
+
+`result.templates` and `result.firewalls` give each one's `status`: `committed` or
+`rotated`; `skipped` with a `reason` (pending local changes, external authentication,
+no local account, not connected); or `not_accepted` with a `reason` (refused for the
+login's admin role, refused commit reverted). `result.summary` counts them. Any
+skipped or not-accepted entry makes the job `completed_with_warnings`. A firewall
+whose outcome cannot be proved stops the job as `recovery_required`. The remaining
+firewalls are left untouched, and a continuation never replays a firewall left
+mid-change.
+
+Each firewall must accept the hash format Panorama generates, so keep firewalls and
+Panorama on compatible PAN-OS releases. Both members of an HA pair are rotated
+independently. Panorama's own local administrators are not part of this job; rotate
+them with a direct `paloalto_panos` SSH job to Panorama.
+
+### Preview platforms: Junos, ArubaOS, Check Point, ClearPass, Infoblox
+
+These platforms were built from vendor documentation and tested against simulated
+devices, not lab hardware. Each request must set `allow_preview: true`. Run the
+first rotation on a non-production device and check its `result.confirmed`.
+
+- **Juniper Junos** (`juniper_junos`). Uses `configure private`, which Junos refuses
+  while others have uncommitted shared changes. Only this account's change may
+  appear in `show | compare`. A refused set or commit is rolled back and proved
+  unchanged. Accounts with no local `encrypted-password` (remote or template users),
+  and `root`, are refused. The login class needs the `secret` permission to read
+  hashes.
+- **ArubaOS 8** (`aruba_os`). Mobility Controllers and Conductors. Uses the device's
+  own `/mm/mynode` `mgmt-user`. Any pending change on any node is refused before the
+  write, because `write memory` would commit it too. An existing account keeps its
+  role. Verification is `ssh_login` only.
+- **Check Point Gaia** (`checkpoint_gaia`). Uses clish (the login must land in
+  clish, not expert mode). `lock database override`, a SHA-512 `password-hash`
+  (R81 or later), then `save config`. Rotate each cluster member separately.
+- **Aruba ClearPass** (`clearpass`) and **Infoblox** (`infoblox`). These use HTTPS
+  APIs, not SSH. Give `device_type`, `http_target` (an entry in `http-targets.json`
+  with a read-only `auth_probe_path`) and optionally `http_credential_profiles`.
+  `device` is just a label. Verification is `api_login`, one login as the rotated
+  account with the new password.
+  - **ClearPass:** the session uses an `oauth2` HTTP credential (an API client with
+    the client-credentials grant; `token_path` defaults to `/api/oauth`). ClearPass
+    admin users have no API login of their own, so `api_login` uses the OAuth
+    password grant. That needs a **second** API client with the password grant,
+    saved as an `oauth2` profile named `<http_target>-password-grant`, and a
+    ClearPass service that authenticates the Admin User Repository for that grant.
+    Without that service, a correct password is reported as rejected and the job
+    goes to review. The job refuses before any write if the profile is missing.
+  - **Infoblox:** the session uses `basic` credentials. The WAPI version comes from
+    the target's `auth_probe_path`, for example `/wapi/v2.12/grid`. Remote and SAML
+    administrators are refused, and so is rotating the account the API session
+    itself logs in with.
 
 ## Opengear IM7200 upgrades
 
@@ -2215,6 +2346,13 @@ Example credential bodies for `PUT /api/v1/credentials/PROFILE_ID`:
 
 SSH also accepts private-key PEM in `private_key` and its optional `passphrase`.
 HTTP basic uses `scheme:basic`, `username`, `password`; bearer uses `token`.
+`scheme:oauth2` holds an API client's ID and secret in `username` and `password` and
+exchanges them for a bearer token (client-credentials grant) at `token_path`, default
+`/api/oauth` as on ClearPass. The token stays in memory for that connection only.
+
+```json
+{"kind":"http","scheme":"oauth2","username":"netops-client","password":"SECRET","targets":["clearpass"]}
+```
 UCS encryption selects the first eligible passphrase profile, since archive
 creation has no remote authentication test. A specified `ucs_credential`
 restricts that choice. Unencrypted UCS must be explicitly requested.

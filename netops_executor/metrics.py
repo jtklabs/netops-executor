@@ -8,7 +8,16 @@ from . import __version__
 from .models import QUEUES
 from .store import EMAIL_STATUSES, UPGRADE_KINDS
 
-JOB_KINDS = (*UPGRADE_KINDS, "rollback", "snmp_walk", "ssh", "http", "cipher_scan", "password_rotation")
+JOB_KINDS = (
+    *UPGRADE_KINDS,
+    "rollback",
+    "snmp_walk",
+    "ssh",
+    "http",
+    "cipher_scan",
+    "password_rotation",
+    "panorama_password_rotation",
+)
 RESULTS = {
     "succeeded": "pass",
     "completed_with_warnings": "warning",

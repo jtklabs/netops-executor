@@ -23,7 +23,30 @@ def credential_options(selector, c, client=None):
         return {"auth": (c["username"], c["password"])}
     if c["scheme"] == "keygen":
         return {"headers": {"X-PAN-KEY": keygen(client, selector, c)}}
+    if c["scheme"] == "oauth2":
+        return {"headers": {"Authorization": "Bearer " + oauth_token(client, selector, c)}}
     return {"headers": {c["header"]: ("Bearer " if c["scheme"] == "bearer" else "") + c["token"]}}
+
+
+def oauth_token(client, selector, c):
+    """Client credentials grant; the token lives only in memory for this connection."""
+    response = client.post(
+        c.get("token_path") or "/api/oauth",
+        json={"grant_type": "client_credentials", "client_id": c["username"], "client_secret": c["password"]},
+        timeout=30,
+    )
+    if response.status_code in (400, 401, 403):
+        raise AuthenticationRejected()
+    if len(response.content) > 1024 * 1024:
+        raise ValueError("token response exceeded bounds")
+    try:
+        token = response.json().get("access_token")
+    except (ValueError, AttributeError):
+        token = None
+    if not token or not isinstance(token, str):
+        raise ValueError("token endpoint did not return an access token")
+    selector.secrets.add(token)
+    return token
 
 
 def keygen(client, selector, c):

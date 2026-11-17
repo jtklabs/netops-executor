@@ -1,10 +1,11 @@
 """Durable local password rotation. Ambiguous account writes are never retried."""
 
+import importlib
 import time
 
 from .credentials import Vault
-from .password_devices import AccountDevice, PasswordRejected, check_password_syntax
-from .password_models import PasswordRotationOptions
+from .password_devices import AccountDevice, ChangeNotAccepted, PasswordRejected, check_password_syntax
+from .password_models import API_PLATFORMS, PasswordRotationOptions
 from .password_panos import PanosAccountDevice
 from .ssh import DeviceError
 from .stepped import StepRunner
@@ -12,6 +13,23 @@ from .stepped import StepRunner
 
 class RotationFailure(RuntimeError):
     """A safe terminal error that validation must not sample again."""
+
+
+# Platform modules share one interface: __init__(settings, store, device, request, password, guard,
+# audit), preflight() -> account existed, apply(), save(), verify(), close(), and optional
+# `report` (public facts such as `confirmed`) and `reservations` (extra resource keys).
+ADAPTERS = {
+    "juniper_junos": ("password_junos", "JunosAccounts"),
+    "aruba_os": ("password_aruba", "ArubaAccounts"),
+    "checkpoint_gaia": ("password_checkpoint", "CheckpointAccounts"),
+    "clearpass": ("password_clearpass", "ClearpassAccounts"),
+    "infoblox": ("password_infoblox", "InfobloxAccounts"),
+}
+
+
+def adapter(platform):
+    module, name = ADAPTERS[platform]
+    return getattr(importlib.import_module("." + module, __package__), name)
 
 
 class PasswordRotationRunner(StepRunner):
@@ -43,13 +61,30 @@ class PasswordRotationRunner(StepRunner):
         if "account_change" in self.result.get("mutations", []):
             raise DeviceError("account mutation was already attempted; inspect it before recovery")
         self.intent("account_change")
-        self.client.apply()
+        try:
+            self.client.apply()
+        except ChangeNotAccepted as exc:
+            self.not_accepted(exc)
+        self.result["change_accepted"] = True
+        self.result.update(getattr(self.client, "report", {}))
         self.event("account_changed")
+
+    def not_accepted(self, exc):
+        # The device refused the change and the account is unchanged: nothing to recover.
+        self.result["mutations"].remove("account_change")
+        self.result["change_accepted"] = False
+        self.result.update(getattr(self.client, "report", {}))
+        self.event("account_change_not_accepted")
+        raise RotationFailure(str(exc)) from None
 
     def save(self):
         # Once a change starts, finish saving before acknowledging cancellation.
         self.guard()
-        self.client.save()
+        try:
+            self.client.save()
+        except ChangeNotAccepted as exc:
+            # A refused commit whose staged change was reverted (Palo Alto).
+            self.not_accepted(exc)
         self.result.update(getattr(self.client, "report", {}))
         self.result["saved"] = True
 
@@ -67,15 +102,22 @@ class PasswordRotationRunner(StepRunner):
                 {"critical": [str(exc)]},
                 self.result,
             )
+        self.result.update(getattr(self.client, "report", {}))
         self.result["verified"] = True
         return [], []
 
     def upgrade(self):
         r = self.request = PasswordRotationOptions.model_validate(self.job["request"])
-        device = self.settings.device(r.device)
-        r.device_type = r.device_type or device.device_type
-        r.for_platform(r.device_type)
-        keys = [self.job["lock_key"], "endpoint:" + device.host]
+        if r.device_type in API_PLATFORMS:
+            # ClearPass and Infoblox: the HTTP target is the device; its lock key names it.
+            device = None
+            r.for_platform(r.device_type)
+            keys = [self.job["lock_key"]]
+        else:
+            device = self.settings.device(r.device)
+            r.device_type = r.device_type or device.device_type
+            r.for_platform(r.device_type)
+            keys = [self.job["lock_key"], "endpoint:" + device.host]
         if r.serial:
             keys.append("panos:" + r.serial)
         elif self.result.get("serial"):
@@ -90,11 +132,16 @@ class PasswordRotationRunner(StepRunner):
         password = Vault(self.store, self.settings.credential_key_file).job_password(self.job["id"])
         check_password_syntax(r.device_type, password)
         if self.client is None:
-            self.client = (
-                PanosAccountDevice(self.settings, self.store, device, r, password, self.guard, self.audit)
-                if r.device_type == "paloalto_panos"
-                else AccountDevice(self.settings, device, r, password, self.guard, self.audit)
-            )
+            if r.device_type == "paloalto_panos":
+                self.client = PanosAccountDevice(
+                    self.settings, self.store, device, r, password, self.guard, self.audit
+                )
+            elif r.device_type in ADAPTERS:
+                self.client = adapter(r.device_type)(
+                    self.settings, self.store, device, r, password, self.guard, self.audit
+                )
+            else:
+                self.client = AccountDevice(self.settings, device, r, password, self.guard, self.audit)
         self.result.update(username=r.username, device_type=r.device_type, verification=r.verification)
         self.result.setdefault("verified", False)
         self.result.setdefault("progress", {})["steps_total"] = 4

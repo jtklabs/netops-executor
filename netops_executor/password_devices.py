@@ -1,5 +1,6 @@
 """Native local-account operations. Raw account records and commands never enter job output."""
 
+import importlib
 import re
 import shlex
 import time
@@ -10,6 +11,7 @@ from passlib.hash import md5_crypt, sha256_crypt, sha512_crypt
 from .device import blocks, field, name
 from .f5_operations import qualified, topology
 from .network_ssh import CLI_ERROR, NetworkSSH
+from .opengear_sudo import login_password, root_shell
 from .password_models import AccountCreation
 from .pins import PinnedHostKeys
 from .platforms import NETWORK_TYPES
@@ -19,11 +21,44 @@ from .store import Store
 ERROR = re.compile(
     r"(?im)^\s*(?:%.*(?:error|invalid|cannot|failed|denied)|Command fail|Unknown action|command parse error|.*password.*(?:invalid|rejected|requirements|too short))"
 )
+EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+# Refusals for the login's privileges: role-based CLIs, TACACS+/RADIUS command authorization.
+PERMISSION = re.compile(
+    r"(?i)permission denied|not authori[sz]ed|unauthori[sz]ed|authori[sz]ation (?:failed|denied)"
+    r"|insufficient (?:privilege|permission|access|rights)|access denied|not allowed"
+    r"|privilege level|read[- ]only (?:user|account|access|admin)"
+)
+PLATFORM_CHECKS = {"infoblox": ("password_infoblox", "check_password")}
 IOS_PASSWORD = re.compile(r"[A-Za-z0-9!@#$%^&*()_+=.,:/~-]{1,128}")
 # The device group must settle after a synchronized account change.
 F5_SYNC_TIMEOUT = 120
 # The target-side verifier's exit status for a readable hash that does not match.
 HASH_MISMATCH = 3
+
+
+class ChangeNotAccepted(DeviceError):
+    """The device refused the change and the account is provably unchanged (for example the
+    login's role lacks permission). Nothing needs recovery: the job fails and is released."""
+
+
+class PermissionRefused(DeviceError):
+    """The device refused a command for the login's privileges (role, TACACS+ authorization)."""
+
+
+def refusal(output, message="account command rejected; device output omitted"):
+    """A fixed-message error for rejected device output, naming a permission refusal."""
+    if PERMISSION.search(output or ""):
+        return PermissionRefused("the device refused the account change for this login's privileges")
+    return DeviceError(message)
+
+
+def not_accepted(error, what="account"):
+    reason = (
+        "the device refused the change for this login's privileges (check its role or TACACS authorization)"
+        if isinstance(error, PermissionRefused)
+        else "the device rejected the change"
+    )
+    return ChangeNotAccepted(reason + "; the " + what + " is unchanged")
 
 
 class PasswordRejected(DeviceError):
@@ -40,6 +75,10 @@ def check_password_syntax(platform, password):
     # The FortiOS CLI also answers '?' with help while a line is typed, even inside quotes.
     if platform == "fortinet" and "?" in password:
         raise ValueError("FortiGate CLI passwords cannot contain a question mark")
+    # Vendor modules that carry passwords in ways with their own limits say so themselves.
+    if platform in PLATFORM_CHECKS:
+        module, name = PLATFORM_CHECKS[platform]
+        getattr(importlib.import_module("." + module, __package__), name)(password)
 
 
 def quote(value):
@@ -198,6 +237,7 @@ class AccountDevice:
         # Extra resources discovered during preflight, and public facts for the job result.
         self.reservations, self.report = [], {}
         self.sleep, self.clock = time.sleep, time.monotonic
+        self.uid = self.before_total = None
 
     def administrator_defaults(self):
         group = None
@@ -222,10 +262,40 @@ class AccountDevice:
             self.shell("command -v sudo >/dev/null")
         return AccountCreation.administrator(self.platform, group)
 
+    def elevated(self):
+        """Linux and Opengear logins without UID 0 (TACACS users) run account commands through
+        sudo, answering its prompt with the login's own password as `sudo -i` would."""
+        if self.platform not in ("linux", "opengear"):
+            return False
+        if self.uid is None:
+            result = self.ssh.execute("id -u", timeout=self.request.command_timeout)
+            uid = result["stdout"].strip()
+            if result["exit_code"] != 0 or not uid.isdigit():
+                raise DeviceError("shell identity is unavailable")
+            self.uid = uid
+        return self.uid != "0"
+
+    def run(self, command, stdin=None, answer=None):
+        """Run a shell command as root. `stdin` is one secret line; `answer` replies to the
+        command's own password prompts (elevated sessions only)."""
+        if not self.elevated():
+            return self.ssh.execute(command, timeout=self.request.command_timeout, stdin_text=stdin)
+        result = root_shell(
+            self.ssh.connect().get_transport(),
+            command,
+            login_password(self.ssh),
+            self.guard,
+            self.request.command_timeout,
+            line=stdin.removesuffix("\n") if stdin is not None else None,
+            answer=answer,
+        )
+        result["stdout"] = self.ssh.selector.redact(result["stdout"])
+        return result
+
     def shell(self, command, stdin=None):
-        result = self.ssh.execute(command, timeout=self.request.command_timeout, stdin_text=stdin)
+        result = self.run(command, stdin)
         if result["exit_code"] != 0:
-            raise DeviceError("account command rejected; device output omitted")
+            raise refusal(result["stdout"] + result.get("stderr", ""))
         return result["stdout"].strip()
 
     def cli(self, command, config=False):
@@ -233,7 +303,7 @@ class AccountDevice:
             command, timeout=self.request.command_timeout, mode="config" if config else "exec", enable=True
         )
         if result["cli_error"] or CLI_ERROR.search(result["stdout"]) or ERROR.search(result["stdout"]):
-            raise DeviceError("account command rejected; device output omitted")
+            raise refusal(result["stdout"])
         return result["stdout"]
 
     def tmsh(self, command):
@@ -250,8 +320,11 @@ class AccountDevice:
 
     def preflight(self):
         p = self.platform
-        if p in ("linux", "opengear") and self.shell("id -u") != "0":
-            raise DeviceError("local account management requires a root shell")
+        if self.elevated():
+            # Prove sudo works before anything else; it stops at the first rejected password.
+            if self.shell("id -u") != "0":
+                raise DeviceError("local account management requires a root shell or working sudo")
+            self.report["privilege"] = "sudo"
         if p == "linux":
             self.shell(
                 "command -v useradd >/dev/null && command -v chpasswd >/dev/null"
@@ -271,6 +344,8 @@ class AccountDevice:
                 raise DeviceError("FortiGate VDOM mode could not be determined")
             self.vdoms = "disable" not in match[1].lower()
         self.before = self.read()
+        # Opengear's user count, so a partial creation is never mistaken for no change.
+        self.before_total = self.total
         if self.before is None:
             if not self.request.create_if_missing:
                 raise DeviceError("local account is missing and create_if_missing is false")
@@ -283,7 +358,7 @@ class AccountDevice:
                 if not set(self.creation.groups or []) <= groups:
                     raise DeviceError("a requested account group does not exist")
             if p == "linux":
-                result = self.ssh.execute("getent passwd " + self.request.username, timeout=30)
+                result = self.run("getent passwd " + self.request.username)
                 if result["exit_code"] != 2:
                     raise DeviceError("username resolves outside the local passwd file or NSS lookup failed")
         if p == "linux" and self.before is not None:
@@ -400,10 +475,56 @@ class AccountDevice:
             return forti_accounts(self.forti("show system admin")).get(user)
         return network_account(self.cli("show running-config | include ^username"), user)
 
+    def fingerprint(self):
+        """A value that changes when the stored password changes, or None when unknown.
+        Linux reads only a digest of the shadow entry: the hash itself never leaves the device."""
+        try:
+            p, record = self.platform, self.read()
+            if record is None:
+                return None
+            if p == "linux":
+                digest = self.shell("getent shadow " + self.request.username + " | sha256sum")
+                # A failed lookup pipes nothing: the digest of empty input proves nothing.
+                if not re.fullmatch(r"[0-9a-f]{64}\s+-", digest) or digest.startswith(EMPTY_SHA256):
+                    return None
+                return digest.split()[0]
+            if p == "opengear":
+                return record.get("password") or None
+            if p == "f5":
+                return field(record, "encrypted-password") if self.request.username != "root" else None
+            if p == "fortinet":
+                return tuple(record.get("password", [])) or None
+            # IOS, NX-OS and EOS username lines carry the secret.
+            return tuple(sorted(record))
+        except DeviceError:
+            return None
+
+    def unchanged(self, mark):
+        """True only when a fresh session proves the account is exactly as it was."""
+        self.ssh.close()
+        try:
+            if self.read() != self.before or self.total != self.before_total:
+                return False
+        except DeviceError:
+            return False
+        return self.before is None or (mark is not None and self.fingerprint() == mark)
+
     def apply(self):
-        p, user, password, new = self.platform, self.request.username, self.password, self.creation
         if self.read() != self.before:
             raise DeviceError("account changed since precheck; submit a new job")
+        mark = self.fingerprint() if self.before is not None else None
+        try:
+            self.write()
+        except DeviceError as exc:
+            # A refused or failed write: if a fresh read proves nothing changed, the job ends
+            # cleanly instead of leaving a device to inspect.
+            if not isinstance(exc, PasswordRejected) and self.unchanged(mark):
+                raise not_accepted(exc) from None
+            raise
+        self.confirm(mark)
+
+    def write(self):
+        p, user, password, new = self.platform, self.request.username, self.password, self.creation
         if p == "linux":
             if self.before is None:
                 command = "useradd -m -s " + (new.shell or "/bin/bash")
@@ -436,9 +557,14 @@ class AccountDevice:
                 self.shell("config -s " + prefix + ".username=" + user)
                 for index, group in enumerate(new.groups, 1):
                     self.shell("config -s " + prefix + f".groups.group{index}=" + group)
-            password_prompt(
-                self.ssh, "config -P " + prefix + ".password", password, self.request.command_timeout
-            )
+            if self.elevated():
+                result = self.run("config -P " + prefix + ".password", answer=password)
+                if result["exit_code"] != 0 or not result["answers"] or ERROR.search(result["stdout"]):
+                    raise refusal(result["stdout"], "device did not acknowledge password change")
+            else:
+                password_prompt(
+                    self.ssh, "config -P " + prefix + ".password", password, self.request.command_timeout
+                )
             self.shell("config -a")
         elif p == "fortinet":
             if self.vdoms:
@@ -475,9 +601,23 @@ class AccountDevice:
                 if self.before is None and p == "cisco_nxos":
                     command += " role " + new.role
             self.cli(command, config=True)
+
+    def confirm(self, mark):
+        p, user = self.platform, self.request.username
         after = self.read()
         if after is None:
+            if self.before is None and self.total == self.before_total:
+                raise ChangeNotAccepted(
+                    "the device reported success but did not create the account; check the login's privileges"
+                )
             raise DeviceError("account is not present after write")
+        if mark is not None and self.fingerprint() == mark:
+            # Some role-limited sessions acknowledge a command they did not apply.
+            raise ChangeNotAccepted(
+                "the device reported success but the stored password did not change; "
+                "check the login's privileges (role or TACACS authorization)"
+            )
+        self.report["confirmed"] = ["account_changed"] if mark is not None else ["account_written"]
         if self.before is not None and self.access(self.before) != self.access(after):
             raise DeviceError("account privileges changed unexpectedly; inspect before recovery")
         if p == "linux" and self.before is None and self.request.new_account is None:
@@ -554,10 +694,8 @@ class AccountDevice:
                 "h=spwd.getspnam(sys.argv[1]).sp_pwdp; "
                 f"sys.exit(0 if hmac.compare_digest(crypt.crypt(p,h) or '',h) else {HASH_MISMATCH})"
             )
-            result = self.ssh.execute(
-                "python3 -c " + shlex.quote(script) + " " + self.request.username,
-                timeout=self.request.command_timeout,
-                stdin_text=self.password + "\n",
+            result = self.run(
+                "python3 -c " + shlex.quote(script) + " " + self.request.username, self.password + "\n"
             )
             if result["exit_code"] not in (0, HASH_MISMATCH):
                 raise DeviceError(

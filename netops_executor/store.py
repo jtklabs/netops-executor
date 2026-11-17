@@ -46,7 +46,7 @@ def default_queue(kind):
     """Recovery and account rotation are priority; upgrades get their own pool; other work is bulk."""
     return (
         "priority"
-        if kind in ("rollback", "password_rotation")
+        if kind in ("rollback", "password_rotation", "panorama_password_rotation")
         else "upgrade"
         if kind in UPGRADE_KINDS
         else "scheduled"
@@ -436,7 +436,10 @@ class Store:
                 VALUES (?,?,?,?,?,?,'queued',?,?,?,?,?,?)""",
                 (
                     job_id,
-                    request.get("device", request.get("device_ip", request.get("serial"))),
+                    # A Panorama-wide job names its Panorama target as the device.
+                    request.get(
+                        "device", request.get("device_ip", request.get("serial", request.get("panorama")))
+                    ),
                     lock_key,
                     kind,
                     parent,
