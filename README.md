@@ -2485,6 +2485,19 @@ retries 1 (0–5); job timeout 300 seconds (1–3600); maximum rows 10000
 with partial results retained. Authentication fallback is allowed before a root
 produces data; partial roots are never replayed with another identity.
 
+Saved SNMP profiles are tried in `priority` order until one works. A profile moves on
+to the next when the agent rejects it (unknown user, wrong digest, decryption error),
+and also when the agent **never answers** it: many agents silently drop requests
+from a user they do not know or their access list refuses. Silence counts as a
+credential problem only until the agent has answered once in the job. After that, a
+timeout is a network or agent problem and fails the operation as before. An
+unanswered profile is recorded as `no_response` in `credential_usage` and gets no
+cooldown. When no profile gets an answer, the job reports
+`no SNMP response with any eligible credential (request timed out)` and does not
+ask again for later roots. Each extra profile costs up to `timeout` × (`retries` + 1)
+per request, so an unreachable device takes a little longer to fail. A request that
+names a file-based `profile`, or lists `credential_profiles`, tries only those.
+
 Walks to the same IP/port serialize; SNMP reads may overlap upgrades and observe
 transitional state. Stale SNMP workers fail and release their read reservations.
 Cancellation retains committed rows. Job/result retention is manual.

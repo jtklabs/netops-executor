@@ -12,7 +12,7 @@ from paramiko import SSHException
 from pysnmp.hlapi.v3arch import asyncio as snmp
 from pysnmp.proto import rfc1902, rfc1905
 
-from .credentials import AuthenticationRejected, Selector, Vault
+from .credentials import AuthenticationRejected, CredentialUnanswered, Selector, Vault
 from .discovery_overrides import apply_manual_fallback, apply_rules, load_rules
 from .f5_operations import license_details
 from .inventory_enrichment import attempts_for, collect_enrichment, discovery_target
@@ -32,6 +32,8 @@ MAX_RESULT_BYTES = 16 * 1024 * 1024
 GET_BATCH = 10
 TOO_BIG = 1
 AUTH_ERRORS = ("UnknownUserName", "WrongDigest", "DecryptionError", "UnsupportedSecurityLevel")
+TIMED_OUT = "SNMP engine error: RequestTimedOut"
+NO_ANSWER = "no SNMP response with any eligible credential (request timed out)"
 MISSING = (rfc1905.NoSuchObject, rfc1905.NoSuchInstance, rfc1905.EndOfMibView)
 
 
@@ -111,6 +113,8 @@ class SnmpRunner:
         # GETBULK size is learned per agent: a reduction or GETNEXT fallback applies to later roots too.
         self.repetitions = 0 if self.request.walk_mode == "next" else self.request.max_repetitions
         self.responded = False
+        # Every eligible credential went unanswered: later operations fail without trying again.
+        self.silent = False
         self.requests = 0
         self._f5_license = None
         self.result = {
@@ -210,6 +214,8 @@ class SnmpRunner:
                     # Credential fallback is allowed only until this operation has produced data.
                     if not use_vault:
                         return await operation(auth, profile.context_name)
+                    if self.silent:
+                        raise WalkError(NO_ANSWER)
 
                     async def attempt(c):
                         auth_data = snmp.UsmUserData(
@@ -224,9 +230,31 @@ class SnmpRunner:
                             else snmp.usmNoPrivProtocol,
                         )
                         self.current_credential = c
-                        await operation(auth_data, c["context_name"])
+                        walk = self.result["walk"]
+                        state = (
+                            self.repetitions,
+                            walk["method"],
+                            walk["max_repetitions"],
+                            len(walk["fallbacks"]),
+                        )
+                        try:
+                            await operation(auth_data, c["context_name"])
+                        except WalkError as exc:
+                            if self.responded or str(exc) != TIMED_OUT:
+                                raise
+                            # Silence before the agent has ever answered: an SNMPv3 agent drops
+                            # requests from a user it does not know or its access list refuses,
+                            # so try the next credential. Undo the GETBULK fallback that silence
+                            # caused: it says nothing about the agent's GETBULK support.
+                            self.repetitions, walk["method"], walk["max_repetitions"], kept = state
+                            del walk["fallbacks"][kept:]
+                            raise CredentialUnanswered() from None
 
-                    await self.selector.run_async(attempt)
+                    try:
+                        await self.selector.run_async(attempt)
+                    except CredentialUnanswered:
+                        self.silent = True
+                        raise WalkError(NO_ANSWER) from None
 
                 for start in range(0, len(self.result["gets"]), GET_BATCH):
                     batch = self.result["gets"][start : start + GET_BATCH]

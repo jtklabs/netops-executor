@@ -225,6 +225,11 @@ class Vault:
         return {"rotated": True}
 
 
+class CredentialUnanswered(Exception):
+    """The target never answered this credential. Some protocols cannot tell that apart from a
+    rejection: an SNMPv3 agent drops requests from a user it does not know or does not allow."""
+
+
 class AuthenticationRejected(Exception):
     pass
 
@@ -285,10 +290,13 @@ class Selector:
         raise AuthenticationRejected("eligible credentials rejected, unavailable, or cooling down")
 
     async def run_async(self, authenticate, aliases=()):
+        """Try eligible credentials in order. A rejection, or no answer at all (CredentialUnanswered),
+        moves on to the next one; no answer does not start a cooldown. Raises CredentialUnanswered
+        when no credential got an answer."""
         candidates = self.vault.candidates(self.kind, self.names, (self.target, *aliases))
         if self.last:
             candidates.sort(key=lambda c: c["id"] != self.last)
-        attempted = 0
+        attempted = unanswered = 0
         for c in candidates:
             key = f"{self.kind}:{self.target}:{c['id']}:{c['revision']}"
             with self.vault.store.connect() as db:
@@ -319,6 +327,10 @@ class Selector:
             }
             try:
                 value = await authenticate(c)
+            except CredentialUnanswered:
+                unanswered += 1
+                self.audit({**event, "outcome": "no_response"})
+                continue
             except AuthenticationRejected:
                 with self.vault.store.connect() as db:
                     db.execute(
@@ -329,7 +341,11 @@ class Selector:
             self.audit({**event, "outcome": "authenticated", "previous": self.last})
             self.last = c["id"]
             return value
-        raise AuthenticationRejected("eligible credentials rejected, unavailable, or cooling down")
+        if attempted and unanswered == attempted:
+            raise CredentialUnanswered()
+        raise AuthenticationRejected(
+            "eligible credentials rejected, unanswered, unavailable, or cooling down"
+        )
 
     def redact(self, text):
         for value in sorted(self.secrets, key=len, reverse=True):
