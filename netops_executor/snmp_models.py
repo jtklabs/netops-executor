@@ -1,9 +1,17 @@
-"""SNMP v3 requests and server-side credential references."""
+"""SNMP requests, request credentials and server-side credential references."""
 
 from typing import Annotated, Literal
 
-from pydantic import Field, IPvAnyAddress, field_validator, model_validator
+from pydantic import Field, IPvAnyAddress, SecretStr, field_validator, model_validator
 
+from .credentials import (
+    SnmpAuthProtocol,
+    SnmpPrivProtocol,
+    SnmpSecurityLevel,
+    SnmpVersion,
+    check_snmp,
+    snmp_version,
+)
 from .discovery_overrides import IdentityRule, ManualFallback
 from .models import Model, Name, ScheduledRequest
 
@@ -32,6 +40,76 @@ class SnmpProfile(Model):
         if len(self.username.encode()) > 32 or len(self.context_name.encode()) > 32:
             raise ValueError("username and context_name must be at most 32 UTF-8 bytes")
         return self
+
+
+class SnmpCredential(Model):
+    """An SNMP credential sent with one request. It is encrypted apart from the job and erased
+    when the job finishes; the job itself records only how many were sent."""
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"version": "2c", "community": "REPLACE_WITH_COMMUNITY"},
+                {
+                    "version": "3",
+                    "username": "netops",
+                    "auth_protocol": "SHA256",
+                    "auth_password": "REPLACE_WITH_AUTH_PASSPHRASE",
+                    "priv_protocol": "AES256C",
+                    "priv_password": "REPLACE_WITH_PRIV_PASSPHRASE",
+                },
+            ]
+        }
+    }
+
+    version: SnmpVersion = Field(default="3", description="1, 2c or 3 (v1, v2, v2c, v3 are accepted too)")
+    community: SecretStr | None = Field(default=None, description="v1/v2c community")
+    username: str | None = Field(default=None, max_length=32, description="v3 USM user")
+    security_level: SnmpSecurityLevel | None = Field(
+        default=None,
+        description="v3. Omitted: authPriv with a privacy passphrase, authNoPriv with only an "
+        "authentication passphrase, otherwise noAuthNoPriv",
+    )
+    auth_protocol: SnmpAuthProtocol | None = Field(
+        default=None, description="v3, required with an authentication passphrase"
+    )
+    auth_password: SecretStr | None = None
+    priv_protocol: SnmpPrivProtocol | None = Field(
+        default=None,
+        description="v3, required with a privacy passphrase. AES is AES-128. AES192/AES256 use the "
+        "standard key extension; AES192C/AES256C the one Cisco devices use for AES-192/256.",
+    )
+    priv_password: SecretStr | None = None
+    context_name: str = Field(default="", max_length=32)
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def normalize_version(cls, value):
+        return snmp_version(value)
+
+    @model_validator(mode="after")
+    def valid(self):
+        if self.version == "3" and self.security_level is None:
+            self.security_level = (
+                "authPriv" if self.priv_password else "authNoPriv" if self.auth_password else "noAuthNoPriv"
+            )
+        plain = self.plaintext()
+        if self.version != "3" and (self.security_level or self.auth_protocol or self.priv_protocol):
+            raise ValueError("SNMP v1/v2c uses only a community; remove the v3 settings")
+        check_snmp(plain)
+        if self.version == "3":
+            level = self.security_level
+            if (level != "noAuthNoPriv") != (self.auth_protocol is not None):
+                raise ValueError("auth_protocol is required with authentication, and only then")
+            if (level == "authPriv") != (self.priv_protocol is not None):
+                raise ValueError("priv_protocol is required with privacy, and only then")
+        return self
+
+    def plaintext(self):
+        return {
+            key: value.get_secret_value() if isinstance(value, SecretStr) else value
+            for key, value in self.__dict__.items()
+        }
 
 
 def numeric_oid_list(values):
@@ -76,6 +154,25 @@ class SnmpWalkRequest(ScheduledRequest):
         max_length=256,
         description="Exact instance OIDs read with GET, several per request. Absent instances are reported as missing.",
     )
+    credentials: list[SnmpCredential] = Field(
+        default_factory=list,
+        max_length=10,
+        exclude=True,
+        description="SNMP credentials to try first, in order, before any saved or configured "
+        "profile. Held encrypted apart from the job (requires NETOPS_CREDENTIAL_KEY_FILE) and erased "
+        "when it finishes; never returned, logged or sent in webhooks.",
+    )
+    use_profiles: bool = Field(
+        default=True,
+        description="After request credentials, also try saved and configured profiles. false tries "
+        "only the request's credentials.",
+    )
+    credential_count: int = Field(
+        default=0,
+        ge=0,
+        le=10,
+        description="Set by the executor: how many request credentials the job holds encrypted.",
+    )
     profile: Name | None = None
     credential_profiles: list[Name] | None = Field(default=None, min_length=1, max_length=10)
     manual_fallback: ManualFallback = Field(
@@ -118,6 +215,11 @@ class SnmpWalkRequest(ScheduledRequest):
             raise ValueError("manual_fallback and identity_rules require a discovery site")
         if self.profile and self.credential_profiles:
             raise ValueError("use profile or credential_profiles, not both")
+        if not self.use_profiles:
+            if self.profile or self.credential_profiles:
+                raise ValueError("profile and credential_profiles need use_profiles")
+            if not self.credentials and not self.credential_count:
+                raise ValueError("use_profiles false needs credentials")
         if self.poller_instance and not self.site:
             raise ValueError("poller_instance requires a site")
         if not self.site and not self.oids and not self.get_oids:

@@ -5,8 +5,8 @@ CLI and durable SQLite queue. It runs F5 upgrades over **SSH/SFTP only**, PAN-OS
 firewall upgrades through **Panorama's XML API**, Arista EOS, Cisco IOS XE
 (Catalyst 9300, 9350, 3650 and 3850) and classic IOS (Catalyst 2960-X/2960-XR) switch
 upgrades, FortiGate (FortiOS 7.4), and Opengear IM7200 upgrades over **SSH**, arbitrary SSH commands, HTTPS
-requests (including Panorama requests targeting a firewall), asynchronous SNMP v3
-walks, and Nmap SSH/HTTPS cipher scans. It has no NetBox dependency.
+requests (including Panorama requests targeting a firewall), asynchronous SNMP
+(v1, v2c and v3) walks, and Nmap SSH/HTTPS cipher scans. It has no NetBox dependency.
 
 The main application submits jobs and polls their results. F5 and PAN-OS upgrade
 sequencing, reconnection, HA checks, backups and validation live on the remote.
@@ -66,7 +66,7 @@ keeps the token only in tab memory and uses the same API.
 | GET | `/api/v1/http/targets` | Configured HTTP targets |
 | POST | `/api/v1/cipher-scans` | Queue a single-IP SSH/HTTPS cipher scan |
 | GET | `/api/v1/cipher-scans/{id}` | Scan status, structured cipher data and readable output |
-| POST | `/api/v1/snmp/walks` | Queue SNMP v3 subtree walks (GETBULK with fallback) and GETs |
+| POST | `/api/v1/snmp/walks` | Queue SNMP v1/v2c/v3 subtree walks (GETBULK with fallback) and GETs |
 | GET | `/api/v1/snmp/walks/{id}` | Walk status and per-root progress |
 | GET | `/api/v1/snmp/walks/{id}/results?after=0&limit=500` | Paginated partial/final rows |
 | GET | `/api/v1/jobs?limit=100&offset=0` or `/jobs/{id}` | Jobs and full results/credential audit |
@@ -2333,7 +2333,11 @@ Example credential bodies for `PUT /api/v1/credentials/PROFILE_ID`:
 ```
 
 ```json
-{"kind":"snmp","username":"reader","security_level":"authPriv","auth_protocol":"SHA256","auth_password":"SECRET_AT_LEAST_8_BYTES","priv_password":"SECRET_AT_LEAST_8_BYTES"}
+{"kind":"snmp","username":"reader","security_level":"authPriv","auth_protocol":"SHA256","auth_password":"SECRET_AT_LEAST_8_BYTES","priv_protocol":"AES","priv_password":"SECRET_AT_LEAST_8_BYTES"}
+```
+
+```json
+{"kind":"snmp","version":"2c","community":"SECRET_COMMUNITY","targets":["192.0.2.0"]}
 ```
 
 ```json
@@ -2432,7 +2436,7 @@ Once encrypted profiles of a protocol exist, automatic selection uses them.
 Explicit legacy SNMP `profile` can still select a configured environment profile.
 New deployments should use encrypted profiles.
 
-## SNMP v3 walks
+## SNMP walks
 
 Submit an IPv4/IPv6 address with numeric OID subtrees (`oids`) and/or exact
 instances (`get_oids`) to `/snmp/walks`:
@@ -2441,10 +2445,63 @@ instances (`get_oids`) to `/snmp/walks`:
 {"device_ip":"192.0.2.10","oids":["1.3.6.1.2.1.2.2","1.3.6.1.4.1.3375"],"get_oids":["1.3.6.1.2.1.1.5.0","1.3.6.1.2.1.1.3.0"]}
 ```
 
-`credential_profiles` optionally restricts selection. SNMP v3 only: authPriv,
-authNoPriv or noAuthNoPriv, SHA/SHA224/SHA256/SHA384/SHA512, AES128 privacy.
-Authentication/privacy passphrases need at least eight UTF-8 bytes. Profiles
-support a context name. Credentials never appear in walk job requests.
+`credential_profiles` optionally restricts selection of saved profiles.
+
+**Credentials in the request.** Send `credentials` to try specific SNMP credentials
+first, in the order given, before any saved or configured profile:
+
+```json
+{
+  "device_ip": "192.0.2.10",
+  "oids": ["1.3.6.1.2.1.1"],
+  "credentials": [
+    {"version": "2c", "community": "REPLACE_WITH_COMMUNITY"},
+    {
+      "version": "3",
+      "username": "netops",
+      "auth_protocol": "SHA256",
+      "auth_password": "REPLACE_WITH_AUTH_PASSPHRASE",
+      "priv_protocol": "AES256C",
+      "priv_password": "REPLACE_WITH_PRIV_PASSPHRASE"
+    }
+  ]
+}
+```
+
+| Field | Values |
+| --- | --- |
+| `version` | `1`, `2c` or `3` (`v1`, `v2`, `v2c`, `v3` and numbers are accepted) |
+| `community` | v1/v2c only, 1-256 bytes |
+| `username` | v3 USM user, up to 32 bytes |
+| `security_level` | v3 `noAuthNoPriv`, `authNoPriv` or `authPriv`. Omitted, it follows the passphrases given |
+| `auth_protocol`, `auth_password` | `MD5`, `SHA`, `SHA224`, `SHA256`, `SHA384`, `SHA512`; passphrase 8-256 bytes |
+| `priv_protocol`, `priv_password` | `DES`, `3DES`, `AES` (AES-128), `AES192`, `AES256`, `AES192C`, `AES256C`; passphrase 8-256 bytes |
+| `context_name` | v3 context, up to 32 bytes |
+
+For AES-192 and AES-256 the key extension must match the device. `AES192` and
+`AES256` use the standard one (net-snmp's default). `AES192C` and `AES256C` use the
+one Cisco devices implement, which net-snmp calls AES-192-C/AES-256-C. A Cisco
+device configured with `priv aes 256` therefore needs `AES256C`. A mismatch shows up
+as a rejected or unanswered credential.
+
+- Up to 10 credentials. A credential that is rejected or gets no answer moves on to
+  the next one, then to the saved profiles. `use_profiles: false` tries only the
+  request's credentials.
+- They are encrypted with the credential keyring (`NETOPS_CREDENTIAL_KEY_FILE`, or
+  the request gets 409), held apart from the job, and erased when it finishes. The
+  stored request keeps only `credential_count`. Responses, events, webhooks and
+  email never include them.
+- `credential_usage` names them `request:1`, `request:2` and so on. They never get
+  the 60-second cooldown that a rejected saved profile does.
+- An `Idempotency-Key` replay with the same credentials returns the original job;
+  different credentials return 409.
+- SNMPv1 has no GETBULK, so a v1 credential always walks with GETNEXT.
+
+**Saved profiles** (`PUT /api/v1/credentials/{profile}` with `kind: snmp`) take the
+same `version`, `community`, `auth_protocol` and `priv_protocol` values; a profile
+without `version` is v3, and one without `priv_protocol` is AES-128 as before.
+Configured `snmp-profiles.json` entries remain v3 with AES-128. Credentials never
+appear in walk job requests.
 
 Walks run one root at a time and stop at the subtree boundary. `walk_mode` chooses
 the request type:
@@ -2903,7 +2960,7 @@ or use `--url`/`--env-file`. Secrets are never command-line credential arguments
 Tests cover SQLite concurrency and wave barriers, credential encryption/rotation,
 fallback/audit, cancellation, manual continuation without replay, HA active-first
 handoff, HTTP operation fencing, image/config/drain/rollback sequencing, synthetic
-F5 parsers, and real SNMP v3 loopback exchanges. Run:
+F5 parsers, and real SNMP v1/v2c/v3 loopback exchanges. Run:
 
 ```bash
 pip install -e '.[test]'

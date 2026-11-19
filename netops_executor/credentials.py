@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from cryptography.fernet import Fernet, InvalidToken, MultiFernet
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 
 from .models import Model, Name
 from .store import Conflict
@@ -37,6 +37,63 @@ def digest_matches(digest: str, value: bytes) -> bool:
     return hmac.compare_digest(derived.hex(), expected)
 
 
+# SNMP versions and USM protocols, shared by saved profiles and request credentials.
+SnmpVersion = Literal["1", "2c", "3"]
+SnmpSecurityLevel = Literal["authPriv", "authNoPriv", "noAuthNoPriv"]
+SnmpAuthProtocol = Literal["MD5", "SHA", "SHA224", "SHA256", "SHA384", "SHA512"]
+# AES192/AES256 use the standard (Blumenthal) key extension, as net-snmp does by default.
+# AES192C/AES256C use the Reeder key extension that Cisco devices implement for AES-192/256.
+SnmpPrivProtocol = Literal["DES", "3DES", "AES", "AES192", "AES256", "AES192C", "AES256C"]
+SECRET_FIELDS = (
+    "password",
+    "private_key",
+    "enable_password",
+    "passphrase",
+    "token",
+    "auth_password",
+    "priv_password",
+    "community",
+)
+
+
+def snmp_version(value):
+    """Accept 1, "v1", 2, "2", "v2c", 3, "v3" and so on."""
+    text = str(value).strip().lower().removeprefix("v")
+    return {"1": "1", "2": "2c", "2c": "2c", "3": "3"}.get(text, value)
+
+
+def check_snmp(c):
+    """Shared SNMP credential rules on a plaintext dict (saved profile or request credential)."""
+    if len((c.get("context_name") or "").encode()) > 32:
+        raise ValueError("SNMP context must contain at most 32 bytes")
+    if c["version"] in ("1", "2c"):
+        community = c.get("community") or ""
+        if (
+            not community
+            or len(community.encode()) > 256
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in community)
+        ):
+            raise ValueError("SNMP v1/v2c requires a community of 1-256 bytes without control characters")
+        if c.get("username") or c.get("auth_password") or c.get("priv_password"):
+            raise ValueError("SNMP v1/v2c uses only a community; remove the v3 user settings")
+        return
+    if c.get("community"):
+        raise ValueError("SNMP v3 does not use a community")
+    if not c.get("username") or len(c["username"].encode()) > 32:
+        raise ValueError("SNMP requires a username of at most 32 bytes")
+    level = c["security_level"]
+    for needed, value in (
+        (level != "noAuthNoPriv", c.get("auth_password")),
+        (level == "authPriv", c.get("priv_password")),
+    ):
+        if needed and (not value or not 8 <= len(value.encode()) <= 256):
+            raise ValueError("SNMP authentication/privacy passphrases require 8-256 bytes")
+    if level == "noAuthNoPriv" and (c.get("auth_password") or c.get("priv_password")):
+        raise ValueError("noAuthNoPriv does not use passphrases")
+    if level == "authNoPriv" and c.get("priv_password"):
+        raise ValueError("authNoPriv does not use a privacy passphrase")
+
+
 class Credential(Model):
     kind: Literal["ssh", "snmp", "http", "ucs", "f5_admin"]
     username: str = Field(default="", max_length=128)
@@ -51,9 +108,12 @@ class Credential(Model):
     # for a bearer token (client credentials grant, as ClearPass uses).
     scheme: Literal["bearer", "basic", "header", "keygen", "oauth2"] = "bearer"
     token_path: str = Field(default="/api/oauth", pattern=r"^/[A-Za-z0-9/._-]{0,200}$")
-    security_level: Literal["authPriv", "authNoPriv", "noAuthNoPriv"] = "authPriv"
-    auth_protocol: Literal["SHA", "SHA224", "SHA256", "SHA384", "SHA512"] = "SHA256"
+    version: SnmpVersion = "3"
+    community: SecretStr | None = None
+    security_level: SnmpSecurityLevel = "authPriv"
+    auth_protocol: SnmpAuthProtocol = "SHA256"
     auth_password: SecretStr | None = None
+    priv_protocol: SnmpPrivProtocol = "AES"
     priv_password: SecretStr | None = None
     context_name: str = Field(default="", max_length=32)
     priority: int = Field(default=100, ge=0, le=10000)
@@ -64,23 +124,15 @@ class Credential(Model):
     # vendor. Only profiles opted in here (or naming the address in targets) are sent to them.
     discovery: bool = False
 
+    @field_validator("version", mode="before")
+    @classmethod
+    def normalize_version(cls, value):
+        return snmp_version(value)
+
     @model_validator(mode="after")
     def valid(self):
         for key, value in self.plaintext().items():
-            if (
-                key
-                in (
-                    "password",
-                    "private_key",
-                    "enable_password",
-                    "passphrase",
-                    "token",
-                    "auth_password",
-                    "priv_password",
-                )
-                and value
-                and len(value) > 65536
-            ):
+            if key in SECRET_FIELDS and value and len(value) > 65536:
                 raise ValueError("credential field exceeds 64 KiB")
         if self.kind == "ssh" and (not self.username or not (self.password or self.private_key)):
             raise ValueError("SSH requires username and password or private_key")
@@ -98,16 +150,7 @@ class Credential(Model):
         if self.kind == "ucs" and not self.passphrase:
             raise ValueError("UCS requires passphrase")
         if self.kind == "snmp":
-            if len(self.context_name.encode()) > 32:
-                raise ValueError("SNMP context must contain at most 32 bytes")
-            if not self.username or len(self.username.encode()) > 32:
-                raise ValueError("SNMP requires a username of at most 32 bytes")
-            for needed, value in (
-                (self.security_level != "noAuthNoPriv", self.auth_password),
-                (self.security_level == "authPriv", self.priv_password),
-            ):
-                if needed and (not value or len(value.get_secret_value().encode()) < 8):
-                    raise ValueError("SNMP authentication/privacy passphrases require 8 bytes")
+            check_snmp(self.plaintext())
         return self
 
     def plaintext(self):
@@ -256,19 +299,7 @@ class Selector:
             if self.max_attempts is not None and attempted >= self.max_attempts:
                 break
             attempted += 1
-            self.secrets.update(
-                str(c[k])
-                for k in (
-                    "password",
-                    "private_key",
-                    "enable_password",
-                    "passphrase",
-                    "token",
-                    "auth_password",
-                    "priv_password",
-                )
-                if c.get(k)
-            )
+            self.secrets.update(str(c[k]) for k in SECRET_FIELDS if c.get(k))
             event = {
                 "profile": c["id"],
                 "revision": c["revision"],
@@ -289,36 +320,30 @@ class Selector:
             return value
         raise AuthenticationRejected("eligible credentials rejected, unavailable, or cooling down")
 
-    async def run_async(self, authenticate, aliases=()):
+    async def run_async(self, authenticate, aliases=(), extra=(), vault=True):
         """Try eligible credentials in order. A rejection, or no answer at all (CredentialUnanswered),
         moves on to the next one; no answer does not start a cooldown. Raises CredentialUnanswered
-        when no credential got an answer."""
-        candidates = self.vault.candidates(self.kind, self.names, (self.target, *aliases))
+        when no credential got an answer.
+
+        `extra` candidates (credentials sent with the request, or a file-based profile) come first,
+        in their order, and never get cooldowns. `vault=False` skips saved profiles."""
+        candidates = list(extra)
+        if vault:
+            candidates += self.vault.candidates(self.kind, self.names, (self.target, *aliases))
         if self.last:
             candidates.sort(key=lambda c: c["id"] != self.last)
         attempted = unanswered = 0
         for c in candidates:
             key = f"{self.kind}:{self.target}:{c['id']}:{c['revision']}"
+            transient = c.get("transient", False)
             with self.vault.store.connect() as db:
                 cool = db.execute("SELECT until FROM credential_cooldowns WHERE key=?", (key,)).fetchone()
-                if cool and cool["until"] > time.time():
+                if cool and cool["until"] > time.time() and not transient:
                     continue
             if self.max_attempts is not None and attempted >= self.max_attempts:
                 break
             attempted += 1
-            self.secrets.update(
-                str(c[k])
-                for k in (
-                    "password",
-                    "private_key",
-                    "enable_password",
-                    "passphrase",
-                    "token",
-                    "auth_password",
-                    "priv_password",
-                )
-                if c.get(k)
-            )
+            self.secrets.update(str(c[k]) for k in SECRET_FIELDS if c.get(k))
             event = {
                 "profile": c["id"],
                 "revision": c["revision"],
@@ -332,10 +357,12 @@ class Selector:
                 self.audit({**event, "outcome": "no_response"})
                 continue
             except AuthenticationRejected:
-                with self.vault.store.connect() as db:
-                    db.execute(
-                        "INSERT OR REPLACE INTO credential_cooldowns VALUES (?,?)", (key, time.time() + 60)
-                    )
+                if not transient:
+                    with self.vault.store.connect() as db:
+                        db.execute(
+                            "INSERT OR REPLACE INTO credential_cooldowns VALUES (?,?)",
+                            (key, time.time() + 60),
+                        )
                 self.audit({**event, "outcome": "rejected"})
                 continue
             self.audit({**event, "outcome": "authenticated", "previous": self.last})

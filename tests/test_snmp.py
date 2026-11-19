@@ -228,7 +228,7 @@ def test_unreachable_agent_fails_after_one_getnext_attempt(client, settings, sto
     process(settings, store, store.claim("w"), "w")
     state = store.get(job["id"])
     assert state["status"] == "failed"
-    assert state["result"]["oids"][0]["error"] == "SNMP engine error: RequestTimedOut"
+    assert state["result"]["oids"][0]["error"] == snmp.NO_ANSWER
     assert agent.kinds() == ["bulk", "next"]
 
 
@@ -407,10 +407,10 @@ def test_v3_profiles_and_credentials(monkeypatch):
         id="default", username="reader", auth_password_env="SNMP_AUTH", priv_password_env="SNMP_PRIV"
     )
     with pytest.raises(snmp.WalkError):
-        snmp.credentials(profile)
+        snmp.file_candidate(profile)
     monkeypatch.setenv("SNMP_AUTH", "test-auth-password")
     monkeypatch.setenv("SNMP_PRIV", "test-priv-password")
-    auth = snmp.credentials(profile)
+    auth = snmp.usm(snmp.file_candidate(profile))
     assert auth.security_level == "authPriv"
     assert auth.authentication_protocol == snmp.snmp.usmHMAC192SHA256AuthProtocol
     assert auth.privacy_protocol == snmp.snmp.usmAesCfb128Protocol

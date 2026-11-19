@@ -1,4 +1,5 @@
 import hmac
+import json
 import os
 import smtplib
 import threading
@@ -516,12 +517,18 @@ def create_app(settings=None):
         else:
             # Preserve saved requests and idempotency for ordinary walks.
             del payload["site"], payload["poller_instance"]
-        return store.submit(
-            payload,
-            f"snmp:{request.device_ip}:{request.port}",
-            idempotency_key,
-            kind="snmp_walk",
-        )
+        # The count is the executor's to set; the credentials themselves never enter the job.
+        payload["credential_count"] = len(request.credentials)
+        if not request.use_profiles and not request.credentials:
+            raise HTTPException(422, "use_profiles false needs credentials")
+        for key, unused in (("credential_count", 0), ("use_profiles", True)):
+            if payload[key] == unused:
+                del payload[key]
+        lock = f"snmp:{request.device_ip}:{request.port}"
+        if not request.credentials:
+            return store.submit(payload, lock, idempotency_key, kind="snmp_walk")
+        secret = json.dumps([c.plaintext() for c in request.credentials], sort_keys=True).encode()
+        return submit_with_secret(payload, lock, idempotency_key, "snmp_walk", secret)
 
     @app.get("/api/v1/snmp/walks/{job_id}", dependencies=authenticated, response_model=JobResponse)
     def walk_job(job_id: str):
@@ -764,8 +771,18 @@ def create_app(settings=None):
         )
 
     def submit_secret(request, plan, idempotency_key, kind):
+        return submit_with_secret(
+            plan.request.model_dump(mode="json"),
+            plan.lock_key,
+            idempotency_key,
+            kind,
+            request.password.get_secret_value().encode(),
+        )
+
+    def submit_with_secret(payload, lock, idempotency_key, kind, secret):
+        """Queue a job whose secret is encrypted apart from its public request (409 without a
+        credential key file)."""
         cipher = vault.cipher()
-        secret = request.password.get_secret_value().encode()
 
         def matches(saved):
             if saved["digest"]:
@@ -777,8 +794,8 @@ def create_app(settings=None):
             )
 
         return store.submit(
-            plan.request.model_dump(mode="json"),
-            plan.lock_key,
+            payload,
+            lock,
             idempotency_key,
             kind=kind,
             secret=cipher.encrypt(secret),

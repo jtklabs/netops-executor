@@ -43,6 +43,7 @@ class WalkError(Exception):
 
 def auth_protocols():
     return {
+        "MD5": snmp.usmHMACMD5AuthProtocol,
         "SHA": snmp.usmHMACSHAAuthProtocol,
         "SHA224": snmp.usmHMAC128SHA224AuthProtocol,
         "SHA256": snmp.usmHMAC192SHA256AuthProtocol,
@@ -51,7 +52,39 @@ def auth_protocols():
     }
 
 
-def credentials(profile):
+def priv_protocols():
+    return {
+        "DES": snmp.usmDESPrivProtocol,
+        "3DES": snmp.usm3DESEDEPrivProtocol,
+        "AES": snmp.usmAesCfb128Protocol,
+        # Standard (Blumenthal) key extension, as net-snmp's AES-192/AES-256.
+        "AES192": snmp.usmAesBlumenthalCfb192Protocol,
+        "AES256": snmp.usmAesBlumenthalCfb256Protocol,
+        # Reeder key extension: Cisco's AES-192/256 (net-snmp's AES-192-C/AES-256-C).
+        "AES192C": snmp.usmAesCfb192Protocol,
+        "AES256C": snmp.usmAesCfb256Protocol,
+    }
+
+
+def usm(c):
+    """pysnmp authentication data for a credential: a community for v1/v2c, a USM user for v3."""
+    version = c.get("version") or "3"
+    if version in ("1", "2c"):
+        return snmp.CommunityData(c["community"], mpModel=0 if version == "1" else 1)
+    level = c.get("security_level") or "authPriv"
+    auth, private = level != "noAuthNoPriv", level == "authPriv"
+    return snmp.UsmUserData(
+        c["username"],
+        authKey=c.get("auth_password") if auth else None,
+        privKey=c.get("priv_password") if private else None,
+        authProtocol=auth_protocols()[c.get("auth_protocol") or "SHA256"] if auth else snmp.usmNoAuthProtocol,
+        privProtocol=priv_protocols()[c.get("priv_protocol") or "AES"] if private else snmp.usmNoPrivProtocol,
+    )
+
+
+def file_candidate(profile):
+    """A configured snmp-profiles.json entry (secrets from the environment) as a credential."""
+
     def secret(name):
         value = os.environ.get(name or "", "")
         if len(value.encode()) < 8:
@@ -60,13 +93,19 @@ def credentials(profile):
 
     auth = profile.security_level != "noAuthNoPriv"
     private = profile.security_level == "authPriv"
-    return snmp.UsmUserData(
-        profile.username,
-        authKey=secret(profile.auth_password_env) if auth else None,
-        privKey=secret(profile.priv_password_env) if private else None,
-        authProtocol=auth_protocols()[profile.auth_protocol] if auth else snmp.usmNoAuthProtocol,
-        privProtocol=snmp.usmAesCfb128Protocol if private else snmp.usmNoPrivProtocol,
-    )
+    return {
+        "id": "file:" + profile.id,
+        "revision": 0,
+        "transient": True,
+        "version": "3",
+        "username": profile.username,
+        "security_level": profile.security_level,
+        "auth_protocol": profile.auth_protocol,
+        "auth_password": secret(profile.auth_password_env) if auth else None,
+        "priv_protocol": "AES",
+        "priv_password": secret(profile.priv_password_env) if private else None,
+        "context_name": profile.context_name,
+    }
 
 
 def serialize(root, oid, value):
@@ -113,6 +152,7 @@ class SnmpRunner:
         # GETBULK size is learned per agent: a reduction or GETNEXT fallback applies to later roots too.
         self.repetitions = 0 if self.request.walk_mode == "next" else self.request.max_repetitions
         self.responded = False
+        self.v1 = False
         # Every eligible credential went unanswered: later operations fail without trying again.
         self.silent = False
         self.requests = 0
@@ -183,22 +223,43 @@ class SnmpRunner:
             except LostOwnership:
                 pass
 
+    def request_credentials(self):
+        """Credentials sent with the request, decrypted from the job's secret, as candidates."""
+        if not self.request.credential_count:
+            return []
+        try:
+            values = json.loads(
+                Vault(self.store, self.settings.credential_key_file).job_password(self.job["id"])
+            )
+        except (Conflict, ValueError):
+            raise WalkError("request SNMP credentials are unavailable; submit the job again") from None
+        if not isinstance(values, list) or len(values) != self.request.credential_count:
+            raise WalkError("request SNMP credentials are unavailable; submit the job again")
+        return [
+            {**value, "id": "request:" + str(number), "revision": 0, "transient": True}
+            for number, value in enumerate(values, 1)
+        ]
+
     async def walk(self):
         engine = snmp.SnmpEngine()
         try:
             async with asyncio.timeout(self.request.job_timeout):
-                use_vault = bool(self.request.credential_profiles) or any(
-                    c["kind"] == "snmp" for c in self.selector.vault.list()
+                # Request credentials first, then (unless use_profiles is false) the configured
+                # file profile or the saved profiles, as before.
+                extra = self.request_credentials()
+                use_vault = self.request.use_profiles and (
+                    bool(self.request.credential_profiles)
+                    or any(c["kind"] == "snmp" for c in self.selector.vault.list())
                 )
                 if (
                     self.request.profile in self.settings.snmp_profiles
                     and not self.request.credential_profiles
                 ):
                     use_vault = False
-                profile = (
-                    None if use_vault else self.settings.snmp_profiles[self.request.profile or "default"]
-                )
-                auth = None if use_vault else credentials(profile)
+                if self.request.use_profiles and not use_vault:
+                    name = self.request.profile or "default"
+                    if name in self.settings.snmp_profiles or not extra:
+                        extra.append(file_candidate(self.settings.snmp_profiles[name]))
                 transport = (
                     snmp.Udp6TransportTarget
                     if self.request.device_ip.version == 6
@@ -212,23 +273,13 @@ class SnmpRunner:
 
                 async def authenticated(operation):
                     # Credential fallback is allowed only until this operation has produced data.
-                    if not use_vault:
-                        return await operation(auth, profile.context_name)
                     if self.silent:
                         raise WalkError(NO_ANSWER)
 
                     async def attempt(c):
-                        auth_data = snmp.UsmUserData(
-                            c["username"],
-                            authKey=c.get("auth_password"),
-                            privKey=c.get("priv_password"),
-                            authProtocol=auth_protocols()[c["auth_protocol"]]
-                            if c["security_level"] != "noAuthNoPriv"
-                            else snmp.usmNoAuthProtocol,
-                            privProtocol=snmp.usmAesCfb128Protocol
-                            if c["security_level"] == "authPriv"
-                            else snmp.usmNoPrivProtocol,
-                        )
+                        auth_data = usm(c)
+                        # SNMPv1 has no GETBULK.
+                        self.v1 = c.get("version") == "1"
                         self.current_credential = c
                         walk = self.result["walk"]
                         state = (
@@ -238,7 +289,7 @@ class SnmpRunner:
                             len(walk["fallbacks"]),
                         )
                         try:
-                            await operation(auth_data, c["context_name"])
+                            await operation(auth_data, c.get("context_name") or "")
                         except WalkError as exc:
                             if self.responded or str(exc) != TIMED_OUT:
                                 raise
@@ -251,7 +302,7 @@ class SnmpRunner:
                             raise CredentialUnanswered() from None
 
                     try:
-                        await self.selector.run_async(attempt)
+                        await self.selector.run_async(attempt, extra=extra, vault=use_vault)
                     except CredentialUnanswered:
                         self.silent = True
                         raise WalkError(NO_ANSWER) from None
@@ -321,7 +372,7 @@ class SnmpRunner:
             current = prefix = rfc1902.ObjectName(root)
             remaining = limit
             while True:
-                kind = "bulk" if bulk and self.repetitions else "next"
+                kind = "bulk" if bulk and self.repetitions and not self.v1 else "next"
                 indication, status, index, bindings = await self.send(
                     engine, auth, target, context, kind, [current]
                 )
@@ -789,7 +840,7 @@ class SnmpRunner:
         prefix = rfc1902.ObjectName(root)
         current = prefix
         while True:
-            kind = "bulk" if self.repetitions else "next"
+            kind = "bulk" if self.repetitions and not self.v1 else "next"
             indication, status, index, bindings = await self.send(
                 engine, auth, target, context, kind, [current]
             )
