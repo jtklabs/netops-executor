@@ -157,7 +157,9 @@ def verify_login(settings, device, username, password, guard):
         guard()
     except paramiko.AuthenticationException:
         raise PasswordRejected(
-            "new-account SSH authentication was rejected; no automatic authentication retry"
+            "new-account SSH authentication was rejected; no automatic authentication retry. If the "
+            "device checks TACACS or RADIUS before local accounts, a local account cannot log in while "
+            "those servers answer: use verification local_hash where the platform supports it"
         ) from None
     except (paramiko.SSHException, OSError):
         raise DeviceError(
@@ -238,6 +240,8 @@ class AccountDevice:
         self.reservations, self.report = [], {}
         self.sleep, self.clock = time.sleep, time.monotonic
         self.uid = self.before_total = None
+        # The hash this job wrote (EOS, NX-OS); output redaction shows it as [REDACTED].
+        self.hashed = None
 
     def administrator_defaults(self):
         group = None
@@ -591,7 +595,7 @@ class AccountDevice:
             else:
                 # Native encrypted input avoids terminal metacharacters in EOS/NX-OS passwords.
                 algorithm = sha512_crypt if p == "arista_eos" else sha256_crypt
-                hashed = algorithm.using(rounds=5000).hash(password)
+                hashed = self.hashed = algorithm.using(rounds=5000).hash(password)
                 self.ssh.selector.secrets.add(hashed)
                 if self.before is None and p == "arista_eos":
                     if new.privilege is not None:
@@ -677,7 +681,17 @@ class AccountDevice:
         if self.request.verification == "ssh_login":
             verify_login(self.settings, self.device, self.request.username, self.password, self.guard)
             return
-        if self.platform == "f5" and self.request.username != "root":
+        if self.platform in ("arista_eos", "cisco_nxos"):
+            # The running configuration holds the hash: `secret sha512 $6$...` on EOS,
+            # `password 5 $5$...` on NX-OS. A login check would depend on the AAA order.
+            line = " ".join(self.read() or [])
+            found = re.search(r"\b(?:secret sha512|password 5)\s+(\S+)", line)
+            encoded = found[1] if found else ""
+            if encoded == "[REDACTED]" and self.hashed:
+                # Redaction replaced exactly the hash this job generated and wrote.
+                encoded = self.hashed
+            matched = crypt_matches(self.password, encoded)
+        elif self.platform == "f5" and self.request.username != "root":
             account = self.read()
             encoded = field(account, "encrypted-password") if account is not None else ""
             matched = crypt_matches(self.password, encoded or "")

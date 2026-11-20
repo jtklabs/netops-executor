@@ -77,15 +77,152 @@ function request() {
       .filter(Boolean);
   return r;
 }
+const LABELS = {
+  queued: "Queued",
+  running: "Running",
+  needs_review: "Needs review",
+  recovery_required: "Needs recovery",
+  failed: "Failed",
+  succeeded: "Succeeded",
+  completed_with_warnings: "Completed with warnings",
+  cancelled: "Cancelled",
+  expired: "Expired",
+  resolved: "Resolved",
+  manually_completed: "Manually completed",
+};
+let refreshAgain = false,
+  searchTimer = null;
+const when = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : "");
+function el(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  if (className) node.className = className;
+  return node;
+}
+function badge(status) {
+  return el("span", LABELS[status] || status.replaceAll("_", " "), "badge " + status);
+}
+async function openJob(id) {
+  try {
+    await select(id);
+    $("detail").scrollIntoView({ behavior: "smooth" });
+  } catch (e) {
+    message(e.message, true);
+  }
+}
+function showDevice(device) {
+  $("job-search").value = device || "";
+  $("job-status").value = "";
+  refresh();
+  $("jobs").scrollIntoView({ behavior: "smooth" });
+}
+function renderActivity(activity) {
+  const s = activity.summary;
+  $("activity-summary").replaceChildren(
+    ...[
+      ["running", s.running, "running"],
+      ["needs_review", s.needs_review, s.needs_review === 1 ? "needs review" : "need review"],
+      [
+        "recovery_required",
+        s.recovery_required,
+        s.recovery_required === 1 ? "needs recovery" : "need recovery",
+      ],
+      ["queued", s.queued, "queued"],
+      ["blocked", s.blocked, "blocked"],
+    ].map(([cls, n, text]) => el("span", `${n} ${text}`, "badge " + (n ? cls : ""))),
+  );
+  $("held").replaceChildren();
+  if (!activity.held.length)
+    $("held").append(el("p", "Nothing is running or holding a device.", "hint"));
+  activity.held.forEach((h) => {
+    const card = el("article", undefined, "held " + h.state);
+    const head = el("div", undefined, "held-head");
+    const device = el("button", h.device || "(no device)", "device");
+    device.type = "button";
+    device.title = "Show this device's jobs";
+    device.onclick = () => showDevice(h.device);
+    head.append(
+      badge(h.state),
+      device,
+      el(
+        "span",
+        `${h.job.kind} · ${h.job.id.slice(0, 8)} · since ${when(h.job.started_at || h.job.created)}`,
+        "muted",
+      ),
+    );
+    card.append(head, el("p", h.detail));
+    if (h.blocking.length) {
+      card.append(
+        el(
+          "p",
+          `Blocking ${h.blocking.length} queued job${h.blocking.length > 1 ? "s" : ""}:`,
+          "blocking",
+        ),
+      );
+      const list = el("ul");
+      h.blocking.forEach((q) =>
+        list.append(
+          el("li", `${q.kind} on ${q.device} · queued ${when(q.created)} · ${q.id.slice(0, 8)}`),
+        ),
+      );
+      card.append(list);
+    }
+    const actions = el("div", undefined, "actions");
+    const open = el(
+      "button",
+      h.action === "review"
+        ? "Review and decide"
+        : h.action === "resolve"
+          ? "Inspect and release"
+          : "Open job",
+    );
+    open.type = "button";
+    open.onclick = () => openJob(h.job.id);
+    actions.append(open);
+    if (h.holds.length) actions.append(el("span", "Holds " + h.holds.join(", "), "muted"));
+    card.append(actions);
+    $("held").append(card);
+  });
+  $("waiting-summary").textContent = `Queued jobs (${activity.queued.length})`;
+  $("waiting").replaceChildren();
+  if (!activity.queued.length) $("waiting").append(el("p", "No queued jobs.", "hint"));
+  else {
+    const list = el("ul");
+    activity.queued.forEach((q) => {
+      const item = el("li", `${q.device} · ${q.kind} · ${q.id.slice(0, 8)} — ${q.waiting.detail}`);
+      item.style.cursor = "pointer";
+      item.onclick = () => openJob(q.id);
+      list.append(item);
+    });
+    $("waiting").append(list);
+  }
+}
 async function refresh() {
-  if (!token || polling) return;
+  if (!token) return;
+  if (polling) {
+    refreshAgain = true;
+    return;
+  }
   polling = true;
   try {
-    const jobs = await api("jobs");
+    const params = new URLSearchParams();
+    const search = $("job-search").value.trim(),
+      status = $("job-status").value;
+    if (search) params.set("search", search);
+    if (status) params.set("status", status);
+    const query = params.toString();
+    const [jobs, activity] = await Promise.all([
+      api("jobs" + (query ? "?" + query : "")),
+      api("activity"),
+    ]);
+    renderActivity(activity);
+    const waiting = new Map(activity.queued.map((q) => [q.id, q.waiting]));
     $("jobs").replaceChildren();
     if (!jobs.length)
       $("jobs").textContent =
-        "No jobs yet. Preview a job to see its inherited steps.";
+        search || status
+          ? "No jobs match this filter."
+          : "No jobs yet. Preview a job to see its inherited steps.";
     jobs.forEach((j) => {
       const b = document.createElement("button");
       b.className = "job";
@@ -93,16 +230,13 @@ async function refresh() {
       title.textContent = `${j.device} · ${j.kind} · ${j.queue}`;
       const detail = document.createElement("span");
       detail.className = "status";
-      detail.textContent = `${j.status.replaceAll("_", " ")} · ${new Date(j.created * 1000).toLocaleString()} · ${j.id.slice(0, 8)}`;
+      detail.append(
+        badge(j.status),
+        ` ${when(j.created)} · ${j.id.slice(0, 8)}`,
+      );
       b.append(title, detail);
-      b.onclick = async () => {
-        try {
-          await select(j.id);
-          $("detail").scrollIntoView({ behavior: "smooth" });
-        } catch (e) {
-          message(e.message, true);
-        }
-      };
+      if (waiting.has(j.id)) b.append(el("span", waiting.get(j.id).detail, "waiting"));
+      b.onclick = () => openJob(j.id);
       $("jobs").append(b);
     });
     const [batches, workers, credentials] = await Promise.all([
@@ -135,8 +269,17 @@ async function refresh() {
     message(e.message, true);
   } finally {
     polling = false;
+    if (refreshAgain) {
+      refreshAgain = false;
+      refresh();
+    }
   }
 }
+$("job-search").oninput = () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(refresh, 300);
+};
+$("job-status").onchange = refresh;
 async function select(id) {
   selected = id;
   const j = await api("jobs/" + id),

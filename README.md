@@ -31,7 +31,10 @@ is a shared service identity loaded from `.env` or the service environment.
 the release `version`, which the console header also shows. `GET /api/v1/workers`
 reports worker heartbeats, claim order and the release each worker runs, and `GET /api/v1/queues`
 the backlog per queue. The web console at `/`
-keeps the token only in tab memory and uses the same API.
+keeps the token only in tab memory and uses the same API. Its **Active and held**
+panel at the top shows every running job and every job holding a device (waiting
+for a review decision or for recovery), with what releases it and the queued jobs
+it blocks; the job list can be filtered by IP, device or job ID, and by status.
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
@@ -69,7 +72,8 @@ keeps the token only in tab memory and uses the same API.
 | POST | `/api/v1/snmp/walks` | Queue SNMP v1/v2c/v3 subtree walks (GETBULK with fallback), GETs and discovery; optional request `credentials` are tried before saved profiles ([details](#snmp-walks)) |
 | GET | `/api/v1/snmp/walks/{id}` | Walk status and per-root progress |
 | GET | `/api/v1/snmp/walks/{id}/results?after=0&limit=500` | Paginated partial/final rows |
-| GET | `/api/v1/jobs?limit=100&offset=0` or `/jobs/{id}` | Jobs and full results/credential audit |
+| GET | `/api/v1/jobs?limit=100&offset=0` or `/jobs/{id}` | Jobs and full results/credential audit. `search` finds an IP (exactly, plus its inventory ID), device, kind or job ID; `status` takes statuses or `active` |
+| GET | `/api/v1/activity` | What is running, which jobs hold a device (needs review, needs recovery) and the queued jobs each one blocks, and why every queued job is waiting |
 | GET | `/api/v1/queues` | Queued, due and running jobs and workers per queue |
 | GET | `/api/v1/webhooks` | Webhook configuration and delivery backlog |
 | POST | `/api/v1/webhooks/test` or `/retry` | Send a signed `ping`, or requeue failed deliveries |
@@ -1548,9 +1552,17 @@ failures may retry within `validation_timeout` (default 60 seconds). SSH login c
 be controlled by remote AAA, SSH access restrictions or MFA; this job does not
 change those settings to make verification pass.
 
+A job waiting at that review gate keeps the device locked, so later jobs for the
+device wait too (the console's Active and held panel shows this). The common
+cause is AAA order: a device that checks TACACS or RADIUS before local accounts
+(`aaa authentication login default group tacacs+ local`) only uses the local
+account when those servers do not answer, so the new local password cannot log
+in. Use `verification: local_hash` on those devices.
+
 `verification: local_hash` checks the local password without a login attempt on
-Linux, F5, Opengear, Palo Alto, Junos or Check Point. F5 non-root, Opengear and Palo Alto use supported SHA-crypt/MD5-crypt
-formats; Linux and F5 root require target-side Python with `crypt` and `spwd`
+Linux, F5, Opengear, Palo Alto, Junos, Check Point, Arista EOS or NX-OS. F5 non-root,
+Opengear, Palo Alto, Arista EOS (`secret sha512`) and NX-OS (`password 5`) use
+supported SHA-crypt/MD5-crypt formats read from the configuration; Linux and F5 root require target-side Python with `crypt` and `spwd`
 modules (available in Python 3.9–3.12, removed in 3.13). Unsupported verification
 fails or opens review; it is never reported as verified. A readable hash that does
 not match is definitive: like a rejected login, it opens review (or fails)

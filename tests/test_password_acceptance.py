@@ -243,3 +243,47 @@ def test_hash_helper_is_unused_by_reports():
     assert "$5$" not in repr(device.report)
     assert sha256_crypt.identify(account(backend.running, "automation").findtext("phash"))
     assert SERIAL == device.serial
+
+
+# Arista EOS and NX-OS: local_hash reads the hash from the running configuration, so a switch
+# that checks TACACS before local accounts can still be verified.
+
+
+class Running:
+    def __init__(self, line):
+        self.line, self.selector = line, SimpleNamespace(secrets=set())
+
+    def execute(self, command, timeout=60, mode="exec", enable=False):
+        return {"stdout": self.line + "\n", "cli_error": False}
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize(
+    "platform,template,algorithm",
+    [
+        ("arista_eos", "username automation privilege 15 role network-admin secret sha512 {}", "sha512"),
+        ("cisco_nxos", "username automation password 5 {} role network-admin", "sha256"),
+    ],
+)
+def test_switch_local_hash_reads_the_running_configuration(platform, template, algorithm):
+    from passlib.hash import sha256_crypt, sha512_crypt
+    from test_password_rotation import device
+
+    from netops_executor.password_devices import PasswordRejected
+
+    crypt = sha512_crypt if algorithm == "sha512" else sha256_crypt
+    shell = Running(template.format(crypt.hash(PASSWORD)))
+    client = device(platform, shell, verification="local_hash")
+    client.verify()
+    shell.line = template.format(crypt.hash("some-other-password"))
+    with pytest.raises(PasswordRejected):
+        client.verify()
+    # Output redaction hides the hash this job wrote; that is the hash to check.
+    client.hashed = crypt.hash(PASSWORD)
+    shell.line = template.format("[REDACTED]")
+    client.verify()
+    shell.line = "username automation privilege 15 nopassword"
+    with pytest.raises(DeviceError):
+        client.verify()

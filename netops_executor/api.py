@@ -4,6 +4,7 @@ import os
 import smtplib
 import threading
 from contextlib import asynccontextmanager
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -192,6 +193,93 @@ class EosPlanResponse(Model):
     request: EosUpgradeRequest
     steps: list[str]
     lock_key: str
+
+
+JobStatus = Literal[
+    "queued",
+    "expired",
+    "running",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "recovery_required",
+    "resolved",
+    "needs_review",
+    "completed_with_warnings",
+    "manually_completed",
+]
+# Job statuses that still need attention: waiting to run, running, or holding a device.
+ACTIVE_STATUSES = ("queued", "running", "needs_review", "recovery_required")
+
+
+class ActivityJob(Model):
+    id: str
+    device: str | None
+    kind: str
+    queue: str
+    status: JobStatus
+    created: float
+    updated: float | None
+    started_at: float | None
+    step: str | None = Field(default=None, description="Current step of a running or paused job")
+    percent: float | None = None
+    error: str | None = Field(default=None, description="Why a job needs recovery, when it recorded one")
+
+
+class Waiting(Model):
+    reason: Literal[
+        "blocked", "takeover", "scheduled", "earlier_wave", "wave_limit", "retrying", "worker"
+    ] = Field(
+        description="blocked: another job holds its device or resource (see blocked_by). takeover: a "
+        "rollback waiting for its source job. scheduled: start_at is in the future. earlier_wave / "
+        "wave_limit: batch ordering. retrying: a reservation conflict, retried every few seconds. "
+        "worker: ready, waiting for a free worker on its queue."
+    )
+    detail: str
+    blocked_by: str | None = Field(default=None, description="ID of the job holding what it needs")
+    until: str | None = Field(default=None, description="Scheduled start (ISO 8601), for scheduled jobs")
+
+
+class QueuedActivity(ActivityJob):
+    waiting: Waiting
+
+
+class HeldDevice(Model):
+    device: str | None
+    state: JobStatus = Field(
+        description="running, needs_review, recovery_required, or another status still holding a lock"
+    )
+    job: ActivityJob
+    holds: list[str] = Field(
+        description="Lock and reservation keys the job holds, such as device:fw1 or panos:<serial>"
+    )
+    gate: str | None = Field(default=None, description="Open review gate, for needs_review")
+    detail: str = Field(description="What is happening and what releases the device")
+    action: Literal["review", "resolve"] | None = Field(
+        default=None,
+        description="review: decide the validation gate (POST /api/v1/jobs/{id}/validation-decisions). "
+        "resolve: inspect the device, then release it (POST /api/v1/jobs/{id}/resolve).",
+    )
+    blocking: list[QueuedActivity] = Field(
+        description="Queued jobs that cannot start until this one releases its hold"
+    )
+
+
+class ActivitySummary(Model):
+    running: int
+    needs_review: int
+    recovery_required: int
+    held: int = Field(description="Jobs not running that still hold a device")
+    queued: int
+    blocked: int = Field(description="Queued jobs waiting on another job's hold")
+
+
+class ActivityResponse(Model):
+    summary: ActivitySummary
+    held: list[HeldDevice] = Field(
+        description="Running jobs and jobs holding a device, needing attention first"
+    )
+    queued: list[QueuedActivity] = Field(description="Every queued job, oldest first, with why it is waiting")
 
 
 class PasswordRotationPlanResponse(Model):
@@ -633,10 +721,69 @@ def create_app(settings=None):
         store.reap(settings.stale_seconds)
         return store.snmp_results(job_id, after, limit)
 
-    @app.get("/api/v1/jobs", dependencies=authenticated, response_model=list[JobResponse])
-    def jobs(limit: int = Query(default=100, ge=1, le=500), offset: int = Query(default=0, ge=0)):
+    @app.get(
+        "/api/v1/jobs",
+        dependencies=authenticated,
+        response_model=list[JobResponse],
+        summary="List jobs, newest first, optionally filtered by device or status",
+    )
+    def jobs(
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        search: str | None = Query(
+            default=None,
+            min_length=1,
+            max_length=200,
+            description="An IP, device name, kind or job ID. An IP matches exactly, and also matches "
+            "jobs submitted with the inventory ID that has that address (and the reverse); other text "
+            "matches part of the device, kind or the start of a job ID.",
+            examples=["192.0.2.10"],
+        ),
+        status: str | None = Query(
+            default=None,
+            description="Comma-separated statuses, or `active` for queued, running, needs_review and "
+            "recovery_required.",
+            examples=["active", "needs_review,recovery_required"],
+        ),
+    ):
         store.reap(settings.stale_seconds)
-        return store.list(limit, offset)
+        statuses = None
+        if status:
+            statuses = [s.strip() for s in status.split(",") if s.strip()]
+            statuses = list(ACTIVE_STATUSES) if statuses == ["active"] else statuses
+            if not set(statuses) <= set(JobStatus.__args__):
+                raise HTTPException(422, "unknown job status")
+        devices = []
+        if search:
+            search = search.strip()
+            try:
+                address = str(ip_address(search))
+            except ValueError:
+                address = None
+            # An address also finds jobs submitted with its inventory ID, and an inventory ID its address.
+            for device in settings.devices.values():
+                if address and device.host == address:
+                    devices.append(device.id)
+                elif device.id == search:
+                    devices.append(device.host)
+            if address:
+                devices.append(address)
+                return store.list(limit, offset, search=None, statuses=statuses, devices=devices, exact=True)
+        return store.list(limit, offset, search=search or None, statuses=statuses, devices=devices)
+
+    @app.get(
+        "/api/v1/activity",
+        dependencies=authenticated,
+        response_model=ActivityResponse,
+        summary="What is running, what is held, and what each queued job is waiting for",
+        description="A job keeps its device locked while it runs, while it waits for a review decision "
+        "(needs_review) and while it needs recovery (recovery_required). Queued jobs for that device "
+        "wait until the hold is released. `held` lists each holding job with an explanation, the action "
+        "that releases it, and the queued jobs it is blocking; `queued` gives every queued job's reason.",
+    )
+    def activity():
+        store.reap(settings.stale_seconds)
+        return store.activity()
 
     @app.get("/api/v1/jobs/{job_id}", dependencies=authenticated, response_model=JobResponse)
     def job(job_id: str):

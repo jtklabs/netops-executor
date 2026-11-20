@@ -2,6 +2,7 @@
 
 import fcntl
 import json
+import re
 import sqlite3
 import time
 import uuid
@@ -364,15 +365,230 @@ class Store:
             ]
             return item
 
-    def list(self, limit=100, offset=0):
+    def list(self, limit=100, offset=0, search=None, statuses=None, devices=(), exact=False):
+        """Newest first. `search` matches part of the device, kind or job ID (any case); `devices`
+        are exact device names that also match (an IP's inventory IDs, for example). With `exact`,
+        only `devices` match: an IP search must not find 10.0.0.10 for 10.0.0.1."""
+        clauses, params = [], []
+        if statuses:
+            clauses.append("status IN (" + ",".join("?" * len(statuses)) + ")")
+            params += list(statuses)
+        if exact:
+            clauses.append("device IN (" + ",".join("?" * len(devices)) + ")")
+            params += list(devices)
+        elif search:
+            like = "%" + re.sub(r"([%_\\])", r"\\\1", search.lower()) + "%"
+            terms = [
+                "lower(device) LIKE ? ESCAPE '\\'",
+                "lower(kind) LIKE ? ESCAPE '\\'",
+                "id LIKE ? ESCAPE '\\'",
+            ]
+            params += [like, like, like[1:]]
+            if devices:
+                terms.append("device IN (" + ",".join("?" * len(devices)) + ")")
+                params += list(devices)
+            clauses.append("(" + " OR ".join(terms) + ")")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         with self.connect() as db:
             return [
                 self.get(r["id"])
                 for r in db.execute(
-                    "SELECT jobs.*, EXISTS(SELECT 1 FROM locks WHERE job=jobs.id) AS lock_held FROM jobs ORDER BY created DESC LIMIT ? OFFSET ?",
-                    (limit, offset),
+                    "SELECT id FROM jobs" + where + " ORDER BY created DESC LIMIT ? OFFSET ?",
+                    (*params, limit, offset),
                 )
             ]
+
+    def activity(self, now=None):
+        """Jobs running or holding a device, what each holds, the queued jobs it blocks, and why
+        every queued job is still waiting."""
+        now = time.time() if now is None else now
+        with self.connect() as db:
+            locks = {r["key"]: r["job"] for r in db.execute("SELECT key,job FROM locks")}
+            resources = {r["key"]: r["job"] for r in db.execute("SELECT key,job FROM resources")}
+            holding = set(locks.values()) | set(resources.values())
+            marks = ",".join("?" * len(holding))
+            rows = {
+                r["id"]: dict(r)
+                for r in db.execute(
+                    "SELECT id,device,kind,queue,status,lock_key,parent,created,updated,started_at,start_at,"
+                    "result FROM jobs WHERE status IN ('queued','running','needs_review','recovery_required')"
+                    + (f" OR id IN ({marks})" if holding else ""),
+                    tuple(holding),
+                )
+            }
+            controls = {
+                r["job"]: r["next_attempt"] for r in db.execute("SELECT job,next_attempt FROM controls")
+            }
+            gates = {
+                r["job"]: r["phase"]
+                for r in db.execute("SELECT job,phase FROM gates WHERE decision IS NULL ORDER BY revision")
+            }
+            members = {r["job"]: dict(r) for r in db.execute("SELECT job,batch,wave FROM batch_members")}
+            batch_states = {}
+            for member in members.values():
+                key = (member["batch"], member["wave"])
+                if key not in batch_states:
+                    earlier = db.execute(
+                        """SELECT 1 FROM batch_members m JOIN jobs j ON j.id=m.job WHERE m.batch=? AND m.wave<?
+                        AND j.status NOT IN ('succeeded','completed_with_warnings','manually_completed') LIMIT 1""",
+                        key,
+                    ).fetchone()
+                    payload = json.loads(
+                        db.execute("SELECT request FROM batches WHERE id=?", (member["batch"],)).fetchone()[0]
+                    )
+                    limit = next(
+                        (
+                            w["upgrade_at_a_time"]
+                            for w in payload.get("waves", [])
+                            if w["wave"] == member["wave"]
+                        ),
+                        None,
+                    )
+                    running = db.execute(
+                        "SELECT count(*) FROM batch_members m JOIN jobs j ON j.id=m.job "
+                        "WHERE m.batch=? AND m.wave=? AND j.status='running'",
+                        key,
+                    ).fetchone()[0]
+                    batch_states[key] = (bool(earlier), limit is not None and running >= limit)
+
+        def brief(row):
+            result = json.loads(row["result"] or "{}")
+            progress = result.get("progress") or {}
+            return {
+                "id": row["id"],
+                "device": row["device"],
+                "kind": row["kind"],
+                "queue": row["queue"],
+                "status": row["status"],
+                "created": row["created"],
+                "updated": row["updated"],
+                "started_at": row["started_at"],
+                "step": progress.get("step"),
+                "percent": progress.get("percent"),
+                "error": result.get("error"),
+            }
+
+        def describe(row):
+            words = {
+                "running": "running",
+                "needs_review": "waiting for a review decision",
+                "recovery_required": "waiting for recovery",
+            }
+            return words.get(row["status"], "holding the device after it " + row["status"].replace("_", " "))
+
+        queued = []
+        for row in sorted(rows.values(), key=lambda r: (r["created"], r["id"])):
+            if row["status"] != "queued":
+                continue
+            holder = locks.get(row["lock_key"]) or resources.get(row["lock_key"])
+            if holder == row["id"]:
+                holder = None
+            retry = controls.get(row["id"])
+            if holder is None and retry is not None:
+                # Deferred after another job reserved something it needs: name that job when a
+                # reservation names this job's device.
+                device = row["device"] or ""
+                holder = next(
+                    (
+                        job
+                        for key, job in resources.items()
+                        if job != row["id"] and key.split(":", 1)[-1] == device
+                    ),
+                    None,
+                )
+            waiting = {"blocked_by": None, "until": None}
+            member = members.get(row["id"])
+            if holder and row["kind"] == "rollback" and holder == row["parent"]:
+                waiting.update(
+                    reason="takeover", detail="Waiting to take over the lock of the job it rolls back"
+                )
+            elif holder and holder in rows:
+                other = rows[holder]
+                waiting.update(
+                    reason="blocked",
+                    blocked_by=holder,
+                    detail=f"Blocked by {other['kind']} job {holder[:8]} on {other['device']}, which is "
+                    + describe(other),
+                )
+            elif holder:
+                waiting.update(reason="blocked", blocked_by=holder, detail=f"Blocked by job {holder[:8]}")
+            elif row["start_at"] is not None and row["start_at"] > now:
+                until = (
+                    datetime.fromtimestamp(row["start_at"], timezone.utc).isoformat().replace("+00:00", "Z")
+                )
+                waiting.update(reason="scheduled", until=until, detail="Scheduled to start at " + until)
+            elif member and batch_states[(member["batch"], member["wave"])][0]:
+                waiting.update(
+                    reason="earlier_wave", detail="Waiting for earlier waves of its batch to finish"
+                )
+            elif member and batch_states[(member["batch"], member["wave"])][1]:
+                waiting.update(reason="wave_limit", detail="Waiting for room in its batch wave")
+            elif retry is not None and retry > now:
+                waiting.update(
+                    reason="retrying",
+                    detail="Another job holds a device or resource it needs; it retries every few seconds",
+                )
+            else:
+                waiting.update(reason="worker", detail=f"Ready; waiting for a free {row['queue']} worker")
+            queued.append({**brief(row), "waiting": waiting})
+
+        held = []
+        order = {"recovery_required": 0, "needs_review": 1, "running": 2}
+        for row in sorted(rows.values(), key=lambda r: (order.get(r["status"], 0), -(r["updated"] or 0))):
+            owns = sorted(
+                {k for k, j in locks.items() if j == row["id"]}
+                | {k for k, j in resources.items() if j == row["id"]}
+            )
+            if row["status"] == "queued" or (row["status"] != "running" and not owns):
+                continue
+            job = brief(row)
+            if row["status"] == "running":
+                detail = "Running" + (f": {job['step']}" if job["step"] else "")
+                detail += f" ({job['percent']}%)" if job["percent"] is not None else ""
+                action = None
+            elif row["status"] == "needs_review":
+                phase = gates.get(row["id"])
+                detail = (
+                    "Waiting for an operator decision"
+                    + (f" on {phase.replace('_', ' ')}" if phase else "")
+                    + ". The device stays locked until someone accepts or retries validation."
+                )
+                action = "review"
+            elif row["status"] == "recovery_required":
+                detail = (
+                    "Needs recovery"
+                    + (f": {job['error']}" if job["error"] else "")
+                    + ". The device stays locked until an operator inspects it and releases the recovery "
+                    "reservation."
+                )
+                action = "resolve"
+            else:
+                detail = (
+                    f"Finished as {row['status'].replace('_', ' ')} but still holds the device lock until it is "
+                    "released."
+                )
+                action = "resolve"
+            held.append(
+                {
+                    "device": row["device"],
+                    "state": row["status"],
+                    "job": job,
+                    "holds": owns,
+                    "gate": gates.get(row["id"]),
+                    "detail": detail,
+                    "action": action,
+                    "blocking": [q for q in queued if q["waiting"]["blocked_by"] == row["id"]],
+                }
+            )
+        summary = {
+            "running": sum(h["state"] == "running" for h in held),
+            "needs_review": sum(h["state"] == "needs_review" for h in held),
+            "recovery_required": sum(h["state"] == "recovery_required" for h in held),
+            "held": sum(h["state"] != "running" for h in held),
+            "queued": len(queued),
+            "blocked": sum(q["waiting"]["reason"] in ("blocked", "takeover") for q in queued),
+        }
+        return {"summary": summary, "held": held, "queued": queued}
 
     def submit(
         self,

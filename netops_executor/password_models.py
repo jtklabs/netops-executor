@@ -14,7 +14,16 @@ API_PLATFORMS = ("clearpass", "infoblox")
 RotationPlatform = Literal[(*DEVICE_TYPES, *API_PLATFORMS)]
 # Built from vendor documentation without a lab device: each request must opt in.
 PREVIEW_PLATFORMS = {"juniper_junos", "aruba_os", "checkpoint_gaia", *API_PLATFORMS}
-LOCAL_HASH_PLATFORMS = ("linux", "f5", "opengear", "paloalto_panos", "juniper_junos", "checkpoint_gaia")
+LOCAL_HASH_PLATFORMS = (
+    "linux",
+    "f5",
+    "opengear",
+    "paloalto_panos",
+    "juniper_junos",
+    "checkpoint_gaia",
+    "arista_eos",
+    "cisco_nxos",
+)
 
 Username = Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")]
 # ClearPass privilege levels have spaces ("Super Administrator"); no other platform allows them,
@@ -140,7 +149,7 @@ class PasswordRotationOptions(ScheduledRequest):
     )
     verification: Literal["ssh_login", "local_hash", "api_login"] = Field(
         default="ssh_login",
-        description="Fresh password-only SSH authentication, local hash comparison (Linux/F5/Opengear/Palo Alto/Junos), or an API login with the new password (ClearPass/Infoblox, their default). Panorama defaults to local_hash and needs no direct firewall connection.",
+        description="Fresh password-only SSH authentication, local hash comparison (Linux/F5/Opengear/Palo Alto/Junos/Check Point/Arista EOS/NX-OS), or an API login with the new password (ClearPass/Infoblox, their default). Panorama defaults to local_hash and needs no direct firewall connection.",
     )
     ios_algorithm: Literal["scrypt", "sha256", "legacy"] = Field(
         default="scrypt",

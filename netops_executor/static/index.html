@@ -12,7 +12,7 @@
       <div>
         <span class="eyebrow">NETWORK OPERATIONS</span>
         <h1>NetOps Executor <span id="version" class="version"></span></h1>
-        <p>F5, PAN-OS, Arista EOS, Cisco IOS XE, 2960-X and FortiGate upgrades, SSH commands, HTTP requests and SNMP v3 walks.</p>
+        <p>F5, PAN-OS, Arista EOS, Cisco IOS XE, 2960-X and FortiGate upgrades, SSH commands, HTTP requests and SNMP walks.</p>
       </div>
       <a href="docs">API reference ↗</a>
     </header>
@@ -37,6 +37,22 @@
       </section>
       <p id="message" role="status" aria-live="polite"></p>
       <div id="workspace" hidden>
+        <section id="activity" aria-labelledby="activity-title">
+          <div class="heading">
+            <h2 id="activity-title">Active and held</h2>
+            <div id="activity-summary" class="chips" aria-live="polite"></div>
+          </div>
+          <p class="hint">
+            A job keeps its device locked while it runs, while it waits for a
+            review decision and while it needs recovery. Queued jobs for that
+            device wait until the hold is released.
+          </p>
+          <div id="held"></div>
+          <details id="waiting-details">
+            <summary id="waiting-summary">Queued jobs</summary>
+            <div id="waiting"></div>
+          </details>
+        </section>
         <div class="columns">
           <section>
             <h2>New job</h2>
@@ -196,6 +212,31 @@
             <p class="hint">
               Updates every five seconds · one job per device or HA lock group
             </p>
+            <div class="filters">
+              <label
+                >Find a device or job
+                <input
+                  id="job-search"
+                  type="search"
+                  autocomplete="off"
+                  placeholder="IP, device, kind or job ID" /></label
+              ><label
+                >Status
+                <select id="job-status">
+                  <option value="">All</option>
+                  <option value="active">Active (queued, running or held)</option>
+                  <option value="queued">Queued</option>
+                  <option value="running">Running</option>
+                  <option value="needs_review">Needs review</option>
+                  <option value="recovery_required">Needs recovery</option>
+                  <option value="failed">Failed</option>
+                  <option value="succeeded,completed_with_warnings">Succeeded</option>
+                  <option value="cancelled,expired,resolved,manually_completed">
+                    Cancelled, expired or resolved
+                  </option>
+                </select></label
+              >
+            </div>
             <div id="jobs"></div>
           </section>
         </div>
