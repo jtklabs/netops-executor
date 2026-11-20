@@ -209,7 +209,10 @@ async def collect_identity(get, chassis_index, first_value, system_values=None):
     if vendor.manufacturer == "Opengear" and version:
         version = version.split(maxsplit=1)[0]
     if vendor.manufacturer == "Fortinet" and version:
-        version = extract(VERSION, version) or version
+        # fgSysVersion reads "v7.4.11,build2829,250924 (GA.M)" (FortiManager/FortiAnalyzer:
+        # "v7.4.5-build2464 241122"). Keep the release and its build: "7.4.11 build2829".
+        build = re.search(r"\bv?(\d+\.\d+\.\d+)\s*[,-]?\s*build\s*(\d+)", version, re.IGNORECASE)
+        version = f"{build[1]} build{build[2]}" if build else extract(VERSION, version) or version
     if enterprise == "14823" and "clearpass" in description.casefold():
         entry = ENTERPRISE + "14823.1.6.1.1.1.1.1"
         model = model or await first_value(f"{entry}.1")

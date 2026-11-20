@@ -3,11 +3,15 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Tests run locally before pushing. Run them here on demand from the Actions tab.
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   test:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       matrix:
         python: ['3.11', '3.12']

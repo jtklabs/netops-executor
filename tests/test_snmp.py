@@ -1062,6 +1062,36 @@ def discover(client, settings, store, monkeypatch, values, **options):
             ("Blue Coat", "SG-S400", "0723160042", "6.6.5.2", "SGOS"),
         ),
         (
+            # FortiGate: the release and its build, without the date and release tag.
+            "12356.101.1.1",
+            "FortiGate-201F",
+            {
+                "12356.101.4.1.1.0": rfc1902.OctetString("v7.4.11,build2829,250924 (GA.M)"),
+                "12356.100.1.1.1.0": rfc1902.OctetString("FG201FT923912957"),
+            },
+            ("Fortinet", "FortiGate-201F", "FG201FT923912957", "7.4.11 build2829", "FortiOS"),
+        ),
+        (
+            # FortiAnalyzer writes the build with a hyphen.
+            "12356.103.3.1",
+            "FortiAnalyzer-3000G",
+            {
+                "12356.103.2.1.7.0": rfc1902.OctetString("v7.4.5-build2464 241122 (GA.M)"),
+                "12356.100.1.1.1.0": rfc1902.OctetString("FAZ3KGT921000001"),
+            },
+            ("Fortinet", "FortiAnalyzer-3000G", "FAZ3KGT921000001", "7.4.5 build2464", "FortiAnalyzer"),
+        ),
+        (
+            # A version with no build keeps just the release, as before.
+            "12356.101.1.1",
+            "FortiGate-60F",
+            {
+                "12356.101.4.1.1.0": rfc1902.OctetString("v7.2.8"),
+                "12356.100.1.1.1.0": rfc1902.OctetString("FGT60FTK2209000"),
+            },
+            ("Fortinet", "FortiGate-60F", "FGT60FTK2209000", "7.2.8", "FortiOS"),
+        ),
+        (
             # SGOS 7.4 answers sgProxyVersion with the whole banner, not just the release.
             "3417.1.1.37",
             "Symantec SG-S400 Series, Version: SGOS 7.4.14.1, Release id: 307087 SWG Edition",

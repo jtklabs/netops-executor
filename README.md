@@ -2724,9 +2724,11 @@ Vendor identity comes from ENTITY-MIB where the device fills it in, and from the
 vendor's own MIB otherwise. Discovery reads model, serial, version and platform
 for Cisco (IOS, IOS-XE, IOS-XR, NX-OS, ASA), Arista EOS, Juniper Junos
 (including SRX chassis-cluster primaries), Palo Alto PAN-OS, Fortinet FortiOS,
-F5 TMOS, Check Point Gaia (version written as `R81.20 Take 89`), Infoblox NIOS,
-Blue Coat SGOS, Opengear, Aruba Mobility controllers (ArubaOS), and Aruba
-ClearPass. The vendor OIDs were checked against each vendor's MIB by the
+FortiManager and FortiAnalyzer (version written as `7.4.11 build2829`), F5 TMOS,
+Check Point Gaia (version written as `R81.20 Take 89`), Infoblox NIOS, Blue Coat
+SGOS (version written as `7.4.14.1`), Opengear, Aruba Mobility controllers
+(ArubaOS), and Aruba ClearPass. Lifecycle compares the reported version text
+exactly, so approve versions in a standard in these forms. The vendor OIDs were checked against each vendor's MIB by the
 snmp-inventory scanner in jtklabs/Netbox (`scripts/snmp-inventory/docs/OID-SOURCES.md`).
 `tests/lab/snmp_discovery` polls a simulated device for each of these except
 Cisco IOS-XR, NX-OS and ASA, and checks every NetBox record it writes.
