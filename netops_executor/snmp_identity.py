@@ -196,7 +196,13 @@ async def collect_identity(get, chassis_index, first_value, system_values=None):
             r"\s+(?:internet (?:backbone )?router|services gateway|ethernet switch)$", "", model, flags=re.I
         )
     serial = chassis.get("serial") or first(vendor.serial)
-    version = first(vendor.version) or extract(vendor.version_pattern, description)
+    version = first(vendor.version)
+    # Some version scalars carry the whole banner: SGOS 7.x answers sgProxyVersion with
+    # "Version: SGOS 7.4.14.1, Release id: 307087 SWG Edition". Keep just the release when the
+    # vendor's own version pattern finds it; plain values such as "10.2.4" are kept as they are.
+    version = (
+        extract(vendor.version_pattern, version) or version or extract(vendor.version_pattern, description)
+    )
     build = fallback.get(ENTERPRISE + vendor.build)
     if version and build and build != "0":
         version = vendor.build_format.format(version=version, build=build)

@@ -1062,6 +1062,18 @@ def discover(client, settings, store, monkeypatch, values, **options):
             ("Blue Coat", "SG-S400", "0723160042", "6.6.5.2", "SGOS"),
         ),
         (
+            # SGOS 7.4 answers sgProxyVersion with the whole banner, not just the release.
+            "3417.1.1.37",
+            "Symantec SG-S400 Series, Version: SGOS 7.4.14.1, Release id: 307087 SWG Edition",
+            {
+                "3417.2.11.1.3.0": rfc1902.OctetString(
+                    "Version: SGOS 7.4.14.1, Release id: 307087 SWG Edition"
+                ),
+                "3417.2.11.1.4.0": rfc1902.OctetString("0723160044"),
+            },
+            ("Blue Coat", "SG-S400", "0723160044", "7.4.14.1", "SGOS"),
+        ),
+        (
             "3417.1.1.37",
             "Symantec SG-S200 Series, Version: SGOS 7.3.6.1, Release id: 266521 Proxy Edition",
             {"3417.2.11.1.4.0": rfc1902.OctetString("0723160043")},
