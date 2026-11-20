@@ -580,7 +580,8 @@ $("json-submit").onsubmit = async (e) => {
     $("json-result").textContent = JSON.stringify(result, null, 2);
     jsonPending = "";
     jsonKey = "";
-    if (path.startsWith("password-rotation/")) $("json-body").value = "";
+    // Bodies that carry secrets are not left in the editor.
+    if (path.startsWith("password-rotation/") || body.credentials) $("json-body").value = "";
     if (!path.endsWith("upgrade-batches")) selected = result.id;
     message("Queued: " + result.id);
     await refresh();

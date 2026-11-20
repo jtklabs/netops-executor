@@ -66,7 +66,7 @@ keeps the token only in tab memory and uses the same API.
 | GET | `/api/v1/http/targets` | Configured HTTP targets |
 | POST | `/api/v1/cipher-scans` | Queue a single-IP SSH/HTTPS cipher scan |
 | GET | `/api/v1/cipher-scans/{id}` | Scan status, structured cipher data and readable output |
-| POST | `/api/v1/snmp/walks` | Queue SNMP v1/v2c/v3 subtree walks (GETBULK with fallback) and GETs |
+| POST | `/api/v1/snmp/walks` | Queue SNMP v1/v2c/v3 subtree walks (GETBULK with fallback), GETs and discovery; optional request `credentials` are tried before saved profiles ([details](#snmp-walks)) |
 | GET | `/api/v1/snmp/walks/{id}` | Walk status and per-root progress |
 | GET | `/api/v1/snmp/walks/{id}/results?after=0&limit=500` | Paginated partial/final rows |
 | GET | `/api/v1/jobs?limit=100&offset=0` or `/jobs/{id}` | Jobs and full results/credential audit |
@@ -84,7 +84,7 @@ keeps the token only in tab memory and uses the same API.
 | POST | `/api/v1/jobs/{id}/rollback` | Reboot to the original recorded volume |
 | POST | `/api/v1/jobs/{id}/resolve` | Release an inspected recovery reservation |
 | GET | `/api/v1/credentials` | Credential metadata only |
-| PUT | `/api/v1/credentials/{profile}` | Idempotent full replacement/upsert |
+| PUT | `/api/v1/credentials/{profile}` | Idempotent full replacement/upsert (SSH, SNMP v1/v2c/v3, HTTP, UCS, F5 admin) |
 | POST | `/api/v1/credentials/rotate` | Re-encrypt records using the first key in the keyring |
 
 Job creation returns HTTP `202` with an `id`, `kind`, `status`, normalized

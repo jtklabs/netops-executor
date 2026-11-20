@@ -171,7 +171,9 @@ class SnmpWalkRequest(ScheduledRequest):
         default=0,
         ge=0,
         le=10,
-        description="Set by the executor: how many request credentials the job holds encrypted.",
+        description="Set by the executor: how many request credentials the job holds encrypted. "
+        "Ignored in requests.",
+        json_schema_extra={"readOnly": True},
     )
     profile: Name | None = None
     credential_profiles: list[Name] | None = Field(default=None, min_length=1, max_length=10)

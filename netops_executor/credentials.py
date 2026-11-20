@@ -108,14 +108,18 @@ class Credential(Model):
     # for a bearer token (client credentials grant, as ClearPass uses).
     scheme: Literal["bearer", "basic", "header", "keygen", "oauth2"] = "bearer"
     token_path: str = Field(default="/api/oauth", pattern=r"^/[A-Za-z0-9/._-]{0,200}$")
-    version: SnmpVersion = "3"
-    community: SecretStr | None = None
-    security_level: SnmpSecurityLevel = "authPriv"
-    auth_protocol: SnmpAuthProtocol = "SHA256"
+    version: SnmpVersion = Field(default="3", description="SNMP only: 1, 2c or 3")
+    community: SecretStr | None = Field(default=None, description="SNMP v1/v2c community")
+    security_level: SnmpSecurityLevel = Field(default="authPriv", description="SNMP v3")
+    auth_protocol: SnmpAuthProtocol = Field(default="SHA256", description="SNMP v3 authentication")
     auth_password: SecretStr | None = None
-    priv_protocol: SnmpPrivProtocol = "AES"
+    priv_protocol: SnmpPrivProtocol = Field(
+        default="AES",
+        description="SNMP v3 privacy. AES is AES-128; AES192/AES256 use the standard key extension, "
+        "AES192C/AES256C the one Cisco devices use for AES-192/256.",
+    )
     priv_password: SecretStr | None = None
-    context_name: str = Field(default="", max_length=32)
+    context_name: str = Field(default="", max_length=32, description="SNMP v3 context")
     priority: int = Field(default=100, ge=0, le=10000)
     enabled: bool = True
     # Empty means usable for any target of this protocol; use exact addresses/IDs to restrict.

@@ -278,3 +278,21 @@ def test_real_agent_accepts_each_version_and_cipher(settings, store, credential)
             sock.close()
 
     asyncio.run(exercise())
+
+
+def test_swagger_documents_request_credentials_with_valid_examples(api):
+    spec = api.get("/openapi.json").json()
+    walk = spec["paths"]["/api/v1/snmp/walks"]["post"]
+    assert "v1, v2c or v3" in walk["summary"] and "AES256C" in walk["description"]
+    examples = walk["requestBody"]["content"]["application/json"]["examples"]
+    assert {"profiles", "v2c", "v3", "only"} <= set(examples)
+    for example in examples.values():
+        SnmpWalkRequest.model_validate(example["value"])
+    schemas = spec["components"]["schemas"]
+    assert schemas["SnmpWalkRequest"]["properties"]["credential_count"]["readOnly"] is True
+    assert set(schemas["SnmpCredential"]["properties"]) >= {"version", "community", "priv_protocol"}
+    saved = spec["paths"]["/api/v1/credentials/{profile}"]["put"]["requestBody"]["content"][
+        "application/json"
+    ]
+    for example in saved["examples"].values():
+        Credential.model_validate(example["value"])

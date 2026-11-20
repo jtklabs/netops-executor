@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -495,9 +495,83 @@ def create_app(settings=None):
             raise HTTPException(404, "cipher scan job not found")
         return result
 
-    @app.post("/api/v1/snmp/walks", dependencies=authenticated, status_code=202, response_model=JobResponse)
+    @app.post(
+        "/api/v1/snmp/walks",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=JobResponse,
+        tags=["SNMP"],
+        summary="Queue an SNMP walk, GET or discovery (SNMP v1, v2c or v3)",
+        description="Walks `oids` subtrees and reads `get_oids`; with `site`, also discovers the device "
+        "into NetBox. **Credentials are tried in this order:** the request's `credentials` (in the order "
+        "given), then the `snmp-profiles.json` profile or the saved SNMP profiles "
+        "(`PUT /api/v1/credentials/{profile}` with `kind: snmp`), unless `use_profiles` is false. A "
+        "credential the agent rejects, or never answers, moves on to the next; once the agent has "
+        "answered, a timeout is not retried with another credential.\n\n"
+        "**Request credentials** support `version` 1, 2c (`community`) and 3 (`username`, "
+        "`security_level`, `auth_protocol` MD5/SHA/SHA224/SHA256/SHA384/SHA512, `priv_protocol` "
+        "DES/3DES/AES/AES192/AES256/AES192C/AES256C). For AES-192/256 on Cisco devices use "
+        "AES192C/AES256C (Cisco's key extension). They require NETOPS_CREDENTIAL_KEY_FILE (409 "
+        "without it), are encrypted apart from the job and erased when it finishes, and never appear in "
+        "responses, events, webhooks or email: the job keeps only `credential_count`, and "
+        "`credential_usage` names them `request:1`, `request:2`. Poll `GET /api/v1/snmp/walks/{id}`.",
+    )
     def submit_walk(
-        request: SnmpWalkRequest,
+        request: Annotated[
+            SnmpWalkRequest,
+            Body(
+                openapi_examples={
+                    "profiles": {
+                        "summary": "Walk with saved profiles",
+                        "value": {"device_ip": "192.0.2.10", "oids": ["1.3.6.1.2.1.1"]},
+                    },
+                    "v2c": {
+                        "summary": "SNMP v2c community, then saved profiles",
+                        "value": {
+                            "device_ip": "192.0.2.10",
+                            "oids": ["1.3.6.1.2.1.1"],
+                            "credentials": [{"version": "2c", "community": "REPLACE_WITH_COMMUNITY"}],
+                        },
+                    },
+                    "v3": {
+                        "summary": "SNMP v3 (SHA-256, Cisco AES-256), then saved profiles",
+                        "value": {
+                            "device_ip": "192.0.2.10",
+                            "get_oids": ["1.3.6.1.2.1.1.5.0"],
+                            "credentials": [
+                                {
+                                    "version": "3",
+                                    "username": "netops",
+                                    "auth_protocol": "SHA256",
+                                    "auth_password": "REPLACE_WITH_AUTH_PASSPHRASE",
+                                    "priv_protocol": "AES256C",
+                                    "priv_password": "REPLACE_WITH_PRIV_PASSPHRASE",
+                                }
+                            ],
+                        },
+                    },
+                    "only": {
+                        "summary": "Only the request's credentials, with discovery",
+                        "value": {
+                            "device_ip": "192.0.2.10",
+                            "site": "Sydney",
+                            "use_profiles": False,
+                            "credentials": [
+                                {"version": "2c", "community": "REPLACE_WITH_COMMUNITY"},
+                                {
+                                    "version": "3",
+                                    "username": "netops",
+                                    "auth_protocol": "SHA256",
+                                    "auth_password": "REPLACE_WITH_AUTH_PASSPHRASE",
+                                    "priv_protocol": "AES256C",
+                                    "priv_password": "REPLACE_WITH_PRIV_PASSPHRASE",
+                                },
+                            ],
+                        },
+                    },
+                }
+            ),
+        ],
         idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
     ):
         if (
@@ -530,7 +604,13 @@ def create_app(settings=None):
         secret = json.dumps([c.plaintext() for c in request.credentials], sort_keys=True).encode()
         return submit_with_secret(payload, lock, idempotency_key, "snmp_walk", secret)
 
-    @app.get("/api/v1/snmp/walks/{job_id}", dependencies=authenticated, response_model=JobResponse)
+    @app.get(
+        "/api/v1/snmp/walks/{job_id}",
+        dependencies=authenticated,
+        response_model=JobResponse,
+        tags=["SNMP"],
+        summary="SNMP walk status, per-root progress and credential usage",
+    )
     def walk_job(job_id: str):
         store.reap(settings.stale_seconds)
         result = store.get(job_id)
@@ -538,7 +618,13 @@ def create_app(settings=None):
             raise HTTPException(404, "SNMP job not found")
         return result
 
-    @app.get("/api/v1/snmp/walks/{job_id}/results", dependencies=authenticated, response_model=SnmpResults)
+    @app.get(
+        "/api/v1/snmp/walks/{job_id}/results",
+        dependencies=authenticated,
+        response_model=SnmpResults,
+        tags=["SNMP"],
+        summary="SNMP walk rows, paginated",
+    )
     def walk_results(
         job_id: str,
         after: int = Query(default=0, ge=0),
@@ -626,8 +712,45 @@ def create_app(settings=None):
     def credentials():
         return vault.list()
 
-    @app.put("/api/v1/credentials/{profile}", dependencies=authenticated, response_model=CredentialMetadata)
-    def credential(profile: Name, request: Credential):
+    @app.put(
+        "/api/v1/credentials/{profile}",
+        dependencies=authenticated,
+        response_model=CredentialMetadata,
+        summary="Create or replace a saved credential profile",
+        description="Full replacement: send every field, secrets included. Secrets are encrypted with "
+        "the credential keyring and never returned. SNMP profiles (`kind: snmp`) take `version` 1, 2c "
+        "(`community`) or 3 (`username`, `security_level`, `auth_protocol`, `priv_protocol`).",
+    )
+    def credential(
+        profile: Name,
+        request: Annotated[
+            Credential,
+            Body(
+                openapi_examples={
+                    "ssh": {
+                        "summary": "SSH",
+                        "value": {"kind": "ssh", "username": "netops", "password": "SECRET", "priority": 20},
+                    },
+                    "snmp_v3": {
+                        "summary": "SNMP v3",
+                        "value": {
+                            "kind": "snmp",
+                            "username": "reader",
+                            "security_level": "authPriv",
+                            "auth_protocol": "SHA256",
+                            "auth_password": "SECRET_AT_LEAST_8_BYTES",
+                            "priv_protocol": "AES256C",
+                            "priv_password": "SECRET_AT_LEAST_8_BYTES",
+                        },
+                    },
+                    "snmp_v2c": {
+                        "summary": "SNMP v2c community",
+                        "value": {"kind": "snmp", "version": "2c", "community": "SECRET_COMMUNITY"},
+                    },
+                }
+            ),
+        ],
+    ):
         return vault.put(profile, request)
 
     @app.post("/api/v1/credentials/rotate", dependencies=authenticated)
