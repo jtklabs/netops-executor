@@ -2734,7 +2734,9 @@ number.
 
 Vendor identity comes from ENTITY-MIB where the device fills it in, and from the
 vendor's own MIB otherwise. Discovery reads model, serial, version and platform
-for Cisco (IOS, IOS-XE, IOS-XR, NX-OS, ASA), Arista EOS, Juniper Junos
+for Cisco (IOS, IOS-XE, IOS-XR, NX-OS, ASA; IOS-XE written as `17.12.6` for
+standalone switches and every stack member alike, without the release-train name
+or zero padding that ENTITY-MIB reports, such as `Dublin 17.12.06`), Arista EOS, Juniper Junos
 (including SRX chassis-cluster primaries), Palo Alto PAN-OS, Fortinet FortiOS,
 FortiManager and FortiAnalyzer (version written as `7.4.11 build2829`), F5 TMOS,
 Check Point Gaia (version written as `R81.20 Take 89`), Infoblox NIOS, Blue Coat

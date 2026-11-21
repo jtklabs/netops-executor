@@ -521,7 +521,8 @@ def test_discovery_collects_identity_and_syncs(client, settings, store, monkeypa
     process(settings, store, store.claim("worker"), "worker")
     state = store.get(job["id"])
     assert state["status"] == expected
-    assert seen == [("Lab", "checkmk-us", "192.0.2.15", "lab-switch", "C9300-48P", serial, "17.09.05")]
+    # One Cisco form for every source: sysDescr's "17.09.05" is written 17.9.5.
+    assert seen == [("Lab", "checkmk-us", "192.0.2.15", "lab-switch", "C9300-48P", serial, "17.9.5")]
     assert state["result"]["discovery"]["missing"] == ([] if serial else ["serial"])
     assert state["result"]["discovery"]["netbox"] == {"status": "created", "device_id": 42}
     assert state["result"]["rows"] == 0
@@ -1012,6 +1013,53 @@ def test_cisco_stack_discovery_joins_member_chassis_and_excludes_provisioned_slo
             "software_version": "17.9.5",
         },
     ]
+
+
+@pytest.mark.parametrize("stacked", [True, False])
+def test_cisco_stack_and_standalone_report_one_version_form(client, settings, store, monkeypatch, stacked):
+    """A 9300 stack read "Dublin 17.12.06" from ENTITY-MIB; a standalone 9300 "17.12.6" from sysDescr."""
+    from netops_executor.snmp_identity import ENTITY, SYS_DESCR, SYS_NAME, SYS_OBJECT_ID
+    from netops_executor.snmp_stack import STACK_ENTRY
+
+    settings.netbox_url = "https://netbox.example"
+    settings.netbox_token = "x" * 40
+    settings.poller_instance = "lab"
+    octets, integer = rfc1902.OctetString, rfc1902.Integer32
+    values = {
+        SYS_NAME: octets("idf-switch"),
+        SYS_DESCR: octets(
+            "Cisco IOS Software [Dublin], Catalyst L3 Switch Software (CAT9K_IOSXE), "
+            "Version 17.12.6, RELEASE SOFTWARE (fc2)"
+        ),
+        SYS_OBJECT_ID: rfc1902.ObjectName("1.3.6.1.4.1.9.1.2494"),
+    }
+    members = ((1000, 1, 1, "FOC1"), (2000, 2, 4, "FOC2")) if stacked else ((1000, 1, 1, "FOC1"),)
+    for index, number, role, serial in members:
+        values.update(
+            {
+                f"{ENTITY}.5.{index}": integer(3),
+                f"{ENTITY}.10.{index}": octets("Dublin 17.12.06"),
+                f"{ENTITY}.11.{index}": octets(serial),
+                f"{ENTITY}.13.{index}": octets("C9300-48P"),
+            }
+        )
+        if stacked:
+            values.update(
+                {
+                    f"{STACK_ENTRY}.1.{index}": integer(number),
+                    f"{STACK_ENTRY}.3.{index}": integer(role),
+                    f"{STACK_ENTRY}.6.{index}": integer(4),
+                }
+            )
+    FakeAgent(monkeypatch, values)
+    monkeypatch.setattr(snmp, "sync_device", lambda *_: ("created", 42))
+    monkeypatch.setattr(snmp, "sync_licenses", lambda *args: {"status": "created", "assignment_id": 1})
+    response = client.post("/api/v1/snmp/walks", json={"device_ip": "192.0.2.16", "site": "Lab"})
+    process(settings, store, store.claim("worker"), "worker")
+    facts = store.get(response.json()["id"])["result"]["discovery"]
+    assert facts["software_version"] == "17.12.6"
+    if stacked:
+        assert [m["software_version"] for m in facts["stack_members"]] == ["17.12.6", "17.12.6"]
 
 
 def discover(client, settings, store, monkeypatch, values, **options):

@@ -148,6 +148,16 @@ def text(value):
     return "" if value.casefold() in {"n/a", "na", "none", "unknown", "not available"} else value
 
 
+def cisco_release(value):
+    """One form for a Cisco release, as sysDescr writes it: no release-train name and no zero
+    padding. ENTITY-MIB on a 9300 stack member reads "Dublin 17.12.06"; sysDescr says 17.12.6.
+    Classic IOS and NX-OS forms such as 15.2(7)E8 and 9.3(10) are unchanged."""
+    found = re.search(r"\d+\.\d+[\w.()-]*", value or "")
+    if not found:
+        return (value or "").strip()
+    return re.sub(r"(?<=\.)0+(?=\d)", "", found[0])
+
+
 def extract(pattern, description):
     match = re.search(pattern, description, re.IGNORECASE) if pattern else None
     return next((value.rstrip(",.") for value in match.groups() if value), "") if match else ""
@@ -224,5 +234,7 @@ async def collect_identity(get, chassis_index, first_value, system_values=None):
         "model": model,
         "platform": platform_for(vendor, description, model),
         "serial": serial,
-        "software_version": version or extract(VERSION, description) or chassis.get("software_version", ""),
+        "software_version": (cisco_release if vendor.manufacturer == "Cisco" else str.strip)(
+            version or extract(VERSION, description) or chassis.get("software_version", "")
+        ),
     }

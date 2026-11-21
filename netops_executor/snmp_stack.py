@@ -1,6 +1,6 @@
 """Read Cisco StackWise membership and join it to ENTITY-MIB chassis rows."""
 
-from .snmp_identity import ENTITY
+from .snmp_identity import ENTITY, cisco_release
 
 STACK_ENTRY = "1.3.6.1.4.1.9.9.500.1.2.1.1"
 STACK_NUMBER = f"{STACK_ENTRY}.1"
@@ -45,7 +45,8 @@ async def collect_stack(get, walk_column):
                 "role": role,
                 "model": row[model],
                 "serial": row.get(serial, ""),
-                "software_version": row.get(version, ""),
+                # The same form as a standalone switch: "Dublin 17.12.06" becomes 17.12.6.
+                "software_version": cisco_release(row.get(version, "")),
             }
         )
     serials = [member["serial"].casefold() for member in facts if member["serial"]]
