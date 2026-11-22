@@ -2501,10 +2501,25 @@ as a rejected or unanswered credential.
   request's credentials.
 - They are encrypted with the credential keyring (`NETOPS_CREDENTIAL_KEY_FILE`, or
   the request gets 409), held apart from the job, and erased when it finishes. The
-  stored request keeps only `credential_count`. Responses, events, webhooks and
-  email never include them.
-- `credential_usage` names them `request:1`, `request:2` and so on. They never get
-  the 60-second cooldown that a rejected saved profile does.
+  stored request keeps only `credential_count`.
+- The job result shows what was sent, with the community and passphrases masked to
+  their first three characters (one character for a secret shorter than eight, so
+  a short community is not given away), followed by a fixed `*****`:
+
+  ```json
+  "request_credentials": [
+    {"id": "request:1", "version": "2c", "community": "pub*****"},
+    {"id": "request:2", "version": "3", "username": "netops", "security_level": "authPriv",
+     "auth_protocol": "SHA256", "auth_password": "Aut*****",
+     "priv_protocol": "AES256C", "priv_password": "Pri*****"}
+  ]
+  ```
+
+  This is in the job record, so webhooks and the API show it too. The full values
+  never are.
+- `credential_usage` reports each one's outcome under the same `request:1`,
+  `request:2` IDs. They never get the 60-second cooldown that a rejected saved
+  profile does.
 - An `Idempotency-Key` replay with the same credentials returns the original job;
   different credentials return 409.
 - SNMPv1 has no GETBULK, so a v1 credential always walks with GETNEXT.

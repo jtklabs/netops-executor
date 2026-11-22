@@ -600,9 +600,11 @@ def create_app(settings=None):
         "`security_level`, `auth_protocol` MD5/SHA/SHA224/SHA256/SHA384/SHA512, `priv_protocol` "
         "DES/3DES/AES/AES192/AES256/AES192C/AES256C). For AES-192/256 on Cisco devices use "
         "AES192C/AES256C (Cisco's key extension). They require NETOPS_CREDENTIAL_KEY_FILE (409 "
-        "without it), are encrypted apart from the job and erased when it finishes, and never appear in "
-        "responses, events, webhooks or email: the job keeps only `credential_count`, and "
-        "`credential_usage` names them `request:1`, `request:2`. Poll `GET /api/v1/snmp/walks/{id}`.",
+        "without it), are encrypted apart from the job and erased when it finishes. The job's "
+        "`result.request_credentials` lists each one with every setting and its community and "
+        "passphrases masked (`abc*****`: the first three characters, or one for a secret shorter than "
+        "eight); `credential_usage` reports each one's outcome under the same `request:1`, `request:2` "
+        "IDs. Poll `GET /api/v1/snmp/walks/{id}`.",
     )
     def submit_walk(
         request: Annotated[

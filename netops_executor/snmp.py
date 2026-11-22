@@ -82,6 +82,28 @@ def usm(c):
     )
 
 
+def masked(secret):
+    """Enough of a secret to recognise it: the first three characters, or one for a secret
+    shorter than eight (a short community would otherwise show most of itself), then a fixed
+    run of stars so the length is not shown either."""
+    if not secret:
+        return None
+    return secret[: 3 if len(secret) >= 8 else 1] + "*****"
+
+
+def credential_summary(number, c):
+    """A request credential for the job result: every setting, secrets masked."""
+    fields = ("version", "community", "username", "security_level", "auth_protocol", "auth_password")
+    fields += ("priv_protocol", "priv_password", "context_name")
+    secrets = ("community", "auth_password", "priv_password")
+    summary = {"id": "request:" + str(number)}
+    for key in fields:
+        value = c.get(key)
+        if value not in (None, ""):
+            summary[key] = masked(value) if key in secrets else value
+    return summary
+
+
 def file_candidate(profile):
     """A configured snmp-profiles.json entry (secrets from the environment) as a credential."""
 
@@ -235,6 +257,11 @@ class SnmpRunner:
             raise WalkError("request SNMP credentials are unavailable; submit the job again") from None
         if not isinstance(values, list) or len(values) != self.request.credential_count:
             raise WalkError("request SNMP credentials are unavailable; submit the job again")
+        # Which credentials were sent, for the job's output; credential_usage uses the same IDs.
+        self.result["request_credentials"] = [
+            credential_summary(number, value) for number, value in enumerate(values, 1)
+        ]
+        self.record("snmp_request_credentials")
         return [
             {**value, "id": "request:" + str(number), "revision": 0, "transient": True}
             for number, value in enumerate(values, 1)

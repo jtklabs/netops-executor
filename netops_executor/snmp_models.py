@@ -160,7 +160,8 @@ class SnmpWalkRequest(ScheduledRequest):
         exclude=True,
         description="SNMP credentials to try first, in order, before any saved or configured "
         "profile. Held encrypted apart from the job (requires NETOPS_CREDENTIAL_KEY_FILE) and erased "
-        "when it finishes; never returned, logged or sent in webhooks.",
+        "when it finishes. The job's result.request_credentials shows them with secrets masked "
+        "to their first three characters.",
     )
     use_profiles: bool = Field(
         default=True,

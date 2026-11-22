@@ -102,6 +102,21 @@ def test_credentials_are_encrypted_apart_from_the_job_and_erased_when_it_finishe
     done = store.get(job["id"])
     assert done["status"] == "succeeded", done["result"]
     assert COMMUNITY not in json.dumps(done)
+    # What was sent is in the output, every setting shown and each secret masked.
+    assert done["result"]["request_credentials"] == [
+        {"id": "request:1", "version": "2c", "community": COMMUNITY[:3] + "*****"},
+        {
+            "id": "request:2",
+            "version": "3",
+            "username": "request-user",
+            "security_level": "authPriv",
+            "auth_protocol": "SHA512",
+            "auth_password": AUTH[:3] + "*****",
+            "priv_protocol": "AES256C",
+            "priv_password": PRIV[:3] + "*****",
+        },
+    ]
+    assert AUTH not in json.dumps(done) and PRIV not in json.dumps(done)
     with store.connect() as db:
         assert db.execute("SELECT secret FROM job_secrets WHERE job=?", (job["id"],)).fetchone()[0] == b""
 
@@ -296,3 +311,19 @@ def test_swagger_documents_request_credentials_with_valid_examples(api):
     ]
     for example in saved["examples"].values():
         Credential.model_validate(example["value"])
+
+
+def test_a_short_community_shows_only_its_first_character():
+    from netops_executor.snmp import credential_summary
+
+    assert credential_summary(1, {"version": "2c", "community": "ro"}) == {
+        "id": "request:1",
+        "version": "2c",
+        "community": "r*****",
+    }
+    assert credential_summary(2, {"version": "3", "username": "u", "security_level": "noAuthNoPriv"}) == {
+        "id": "request:2",
+        "version": "3",
+        "username": "u",
+        "security_level": "noAuthNoPriv",
+    }
