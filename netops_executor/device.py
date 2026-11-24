@@ -178,6 +178,14 @@ class BigIP:
             raise DeviceError("software status table does not match volume inventory")
         return result
 
+    def base_image(self, version):
+        """A verified base image of this release in the software catalog, or None."""
+        images = blocks(self.ssh.tmsh("list /sys software image"), "sys software image")
+        for filename, body in sorted(images.items()):
+            if field(body, "version") == version and field(body, "verified") == "yes":
+                return {"name": filename, "version": version, "build": field(body, "build")}
+        return None
+
     def verify_image(self, image):
         prefix = "sys software " + image.kind
         properties = "version verified" + (" build" if image.kind == "image" else "")

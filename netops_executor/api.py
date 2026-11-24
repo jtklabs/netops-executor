@@ -540,9 +540,61 @@ def create_app(settings=None):
     def plan(request: JobRequest):
         return planned(request)
 
-    @app.post("/api/v1/jobs", dependencies=authenticated, status_code=202, response_model=JobResponse)
+    @app.post(
+        "/api/v1/jobs",
+        dependencies=authenticated,
+        status_code=202,
+        response_model=JobResponse,
+        summary="Queue one F5 BIG-IP upgrade, engineering hotfix, backup or validation job",
+        description="For an engineering hotfix, send only the hotfix image (`kind: hotfix`): "
+        "`allowed_source_versions` defaults to its release, the job checks that the release's base image "
+        "is verified in /shared/images before changing anything, and a device already on the hotfix "
+        "build is left untouched (`result.already_running`).",
+    )
     def submit(
-        request: JobRequest,
+        request: Annotated[
+            JobRequest,
+            Body(
+                openapi_examples={
+                    "hotfix": {
+                        "summary": "Engineering hotfix on the running release",
+                        "value": {
+                            "device": "192.0.2.10",
+                            "install": True,
+                            "reboot": True,
+                            "images": [
+                                {
+                                    "name": "Hotfix-BIGIP-17.1.1.3.0.12.5-ENG.iso",
+                                    "kind": "hotfix",
+                                    "version": "17.1.1.3",
+                                    "build": "0.12.5",
+                                    "sha256": "0" * 64,
+                                }
+                            ],
+                            "backup_directory": "CHG-EHF",
+                        },
+                    },
+                    "upgrade": {
+                        "summary": "Full upgrade",
+                        "value": {
+                            "device": "192.0.2.10",
+                            "install": True,
+                            "reboot": True,
+                            "allowed_source_versions": ["16.1.5"],
+                            "images": [
+                                {
+                                    "name": "BIGIP-17.1.2-0.0.5.iso",
+                                    "kind": "image",
+                                    "version": "17.1.2",
+                                    "build": "0.0.5",
+                                    "sha256": "0" * 64,
+                                }
+                            ],
+                        },
+                    },
+                }
+            ),
+        ],
         idempotency_key: Annotated[str | None, Header(min_length=1, max_length=160)] = None,
     ):
         p = planned(request)

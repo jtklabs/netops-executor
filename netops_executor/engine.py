@@ -362,10 +362,29 @@ class Runner:
                     self.wait(5)
             self.event("image_verified", image=image.name)
 
+    def base_images(self, request):
+        """A hotfix needs its release's base image on the device to build the new volume. Check
+        before anything changes, unless the request brings that base image itself."""
+        bases = {}
+        brought = {i.version for i in request.images if i.kind == "image"}
+        for version in sorted({i.version for i in request.images if i.kind == "hotfix"} - brought):
+            base = self.device.base_image(version)
+            if base is None:
+                raise DeviceError(
+                    "hotfix needs the BIG-IP " + version + " base image in /shared/images; add it to "
+                    "images (kind image) or upload it to the device first"
+                )
+            bases[version] = base
+        if bases:
+            self.result["base_images"] = list(bases.values())
+            self.event("base_images_found", images=[b["name"] for b in bases.values()])
+        return bases
+
     def cleanup_images(self, request):
         from .device import blocks
 
-        keep = {i.name for i in request.images}
+        # Never delete a base image a requested hotfix is built on.
+        keep = {i.name for i in request.images} | {b["name"] for b in self.result.get("base_images", [])}
         for kind in ("hotfix", "image"):
             catalog = blocks(self.ssh.tmsh("list /sys software " + kind), "sys software " + kind)
             for filename in sorted(catalog):
@@ -906,6 +925,8 @@ class Runner:
         self.result["source"] = {key: active[key] for key in ("volume", "version", "build")}
         if r.allowed_source_versions and active["version"] not in r.allowed_source_versions:
             raise DeviceError("running version is outside allowed_source_versions")
+        # A staged hotfix is only installable with its base image: say so ahead of the window.
+        self.base_images(r)
         if r.approved_models and not set(self.device.platform()) & set(r.approved_models):
             raise DeviceError("hardware model is not approved")
         self.event("preload_checks_completed", **self.result["source"])
@@ -959,6 +980,12 @@ class Runner:
         self.result["pre_validation"] = before
         self.event("pre_validation_completed")
         active = before["active"]
+        if r.install and matches(active, r.expected_version, r.expected_build):
+            # Already running the requested version and build (a repeated batch, or a hotfix that
+            # is already in): nothing to install or reboot.
+            self.result["already_running"] = {key: active[key] for key in ("volume", "version", "build")}
+            self.event("target_already_running", **self.result["already_running"])
+            return
         if r.install or r.reboot:
             if active["version"] not in r.allowed_source_versions:
                 raise DeviceError("running version is outside allowed_source_versions")
@@ -976,6 +1003,8 @@ class Runner:
                 "from_build": r.expected_build,
             }
             self.event("rollback_recorded")
+            if r.install:
+                self.base_images(r)
             self.ha_health(r, before=True)
         if not (before_review and decision["decision"]["action"] == "accept"):
             self.check_admin_password(r, "before")

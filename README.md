@@ -545,14 +545,52 @@ Inventory/HTTP target defaults may restrict the eligible profiles for a target.
 | `install` | Implies UCS, transfer unless already on device, image checks, installation and configuration copy |
 | `reboot` | Implies UCS and configuration copy; verify new boot identity and exact volume/version/build |
 | `expected_version`, `expected_build` | Required for reboot-only; inferred from final image when installing |
-| `allowed_source_versions` | Required exact running-version allowlist for install/reboot |
+| `allowed_source_versions` | Required exact running-version allowlist for install/reboot; a hotfix-only install defaults to the hotfix's own release |
 | `approved_models` | Optional allowlist matching marketing name or platform ID |
 | `license_check_date` | Optional minimum license service-check date, `YYYY-MM-DD` |
 | `minimum_free_bytes` | Required free reserve on image filesystem; default 1,500,000,000 bytes |
-| `cleanup_images` | Opt-in deletion of catalogued old installers, excluding requested images, if space is insufficient |
+| `cleanup_images` | Opt-in deletion of catalogued old installers, excluding requested images and the base image a requested hotfix needs, if space is insufficient |
 | `install_timeout` | Per-image install and configuration-copy timeout; default 3600 seconds |
 | `reboot_timeout` | Verified reboot timeout; default 900 seconds |
 | `validation_timeout` | Bounded validation window; default 600, maximum 86400 seconds |
+
+### Engineering hotfixes
+
+An engineering hotfix (`Hotfix-BIGIP-<version>.<build>-ENG.iso`) patches the
+release a device already runs. Send only the hotfix, as `kind: hotfix`, with the
+version and build F5 lists for it:
+
+```json
+{
+  "device": "192.0.2.10",
+  "install": true,
+  "reboot": true,
+  "images": [{
+    "name": "Hotfix-BIGIP-17.1.1.3.0.12.5-ENG.iso",
+    "kind": "hotfix",
+    "version": "17.1.1.3",
+    "build": "0.12.5",
+    "sha256": "REPLACE_WITH_64_CHARACTER_SHA256"
+  }],
+  "backup_directory": "CHG-EHF"
+}
+```
+
+- It runs through the same job as an upgrade: UCS backup, HA checks and standby
+  first, drain, installation on the spare volume, reboot, and validation. The
+  previous volume stays as the rollback target.
+- `allowed_source_versions` defaults to the hotfix's release, so only a device
+  already running 17.1.1.3 is patched. Set it yourself to allow others.
+- BIG-IP builds the new volume from that release's base image
+  (`BIGIP-17.1.1.3-0.0.5.iso`), which must be verified in `/shared/images`. It
+  usually still is from the original install. The job checks before changing
+  anything, refuses with a clear message if the base image is missing, and records
+  it in `result.base_images`. If it is missing, add it to `images` first, as
+  `kind: image`, followed by the hotfix.
+- A device already running the hotfix's version and build is reported in
+  `result.already_running` and left untouched, so a batch can be re-run.
+- The same body works in `defaults` of an upgrade batch, and with `stage_only` to
+  upload the hotfix ahead of the window, which also checks for the base image.
 
 The installer reuses an exact final version/build when available. A target
 volume that already runs the final version/build skips the image transfer, image

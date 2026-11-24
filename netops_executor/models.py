@@ -252,6 +252,10 @@ class JobRequest(ScheduledRequest):
             raise ValueError("install and transfer require images with SHA-256, version and build")
         if len({i.name for i in self.images}) != len(self.images):
             raise ValueError("image names must be unique")
+        if self.install and self.hotfix_only and not self.allowed_source_versions:
+            # An engineering hotfix applies to the release it was built for: by default, only
+            # a device already running that release is patched.
+            self.allowed_source_versions = sorted({i.version for i in self.images})
         if self.install or self.reboot:
             if not self.allowed_source_versions:
                 raise ValueError("install/reboot require allowed_source_versions")
@@ -265,6 +269,12 @@ class JobRequest(ScheduledRequest):
         if self.reboot and (not self.expected_version or not self.expected_build):
             raise ValueError("reboot requires expected_version and expected_build")
         return self
+
+    @property
+    def hotfix_only(self):
+        """Only hotfixes (such as an engineering hotfix): BIG-IP builds the new volume from the
+        matching base image already in /shared/images."""
+        return bool(self.images) and all(i.kind == "hotfix" for i in self.images)
 
     def plan(self):
         if self.stage_only:
